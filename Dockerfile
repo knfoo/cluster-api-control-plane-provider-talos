@@ -30,10 +30,9 @@ RUN --mount=type=cache,target=/.cache go install k8s.io/code-generator/cmd/conve
 WORKDIR /src
 COPY ./go.mod ./
 COPY ./go.sum ./
-RUN --mount=type=cache,target=/.cache go mod download
-RUN --mount=type=cache,target=/.cache go mod verify
+COPY ./vendor ./vendor
 COPY ./ ./
-RUN --mount=type=cache,target=/.cache go list -mod=readonly all >/dev/null
+RUN --mount=type=cache,target=/.cache go list -mod=vendor all >/dev/null
 
 FROM build AS manifests-build
 ARG NAME
@@ -79,7 +78,7 @@ FROM build AS binary
 ARG GO_BUILDFLAGS
 ARG GO_LDFLAGS
 ARG TARGETARCH
-RUN --mount=type=cache,target=/.cache GOOS=linux GOARCH=${TARGETARCH} go build ${GO_BUILDFLAGS} -ldflags "${GO_LDFLAGS}" -o /manager
+RUN --mount=type=cache,target=/.cache GOOS=linux GOARCH=${TARGETARCH} go build -mod=vendor ${GO_BUILDFLAGS} -ldflags "${GO_LDFLAGS}" -o /manager
 RUN chmod +x /manager
 
 FROM build AS integration-test-build

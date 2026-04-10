@@ -168,7 +168,7 @@ func (r *TalosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		// Make TCP to requeue in case status is not ready, so we can check for node status without waiting for a full resync (by default 10 minutes).
 		// Only requeue if we are not going in exponential backoff due to error, or if we are not already re-queueing, or if the object has a deletion timestamp.
 		if reterr == nil && !res.Requeue && res.RequeueAfter <= 0 && tcp.ObjectMeta.DeletionTimestamp.IsZero() {
-			if !tcp.Status.Ready || tcp.Status.UnavailableReplicas > 0 {
+			if !tcp.Status.Ready || pointer.Int32Deref(tcp.Status.UnavailableReplicas, 0) > 0 {
 				res = ctrl.Result{RequeueAfter: 20 * time.Second}
 			}
 		}
@@ -208,28 +208,46 @@ func (r *TalosControlPlaneReconciler) reconcile(ctx context.Context, cluster *cl
 		return ctrl.Result{}, err
 	}
 
-	var conditionOptions = make([]*metav1.Condition, len(ownedMachines.Items))
-	for i, v := range ownedMachines.Items {
-		var getter conditions.Getter = &v
+	// Compute MachinesAllReady by inspecting the MachinesReady condition on each owned Machine.
+	{
+		allReady := true
+		anyUnknown := false
+		var notReadyMessages []string
 
-		condition := conditions.Get(getter, string(controlplanev1.MachinesReadyCondition))
-		conditionOptions[i] = condition
-	}
+		for _, m := range ownedMachines.Items {
+			var getter conditions.Getter = &m
+			condition := conditions.Get(getter, string(clusterv1.MachinesReadyCondition))
+			if condition == nil {
+				anyUnknown = true
+				notReadyMessages = append(notReadyMessages, fmt.Sprintf("Machine %s: MachinesReady condition not yet reported", m.Name))
+			} else if condition.Status != metav1.ConditionTrue {
+				allReady = false
+				notReadyMessages = append(notReadyMessages, fmt.Sprintf("Machine %s: %s", m.Name, condition.Message))
+			}
+		}
 
-	var conditionOptionTypes = make([]string, len(conditionOptions))
-	for i, v := range conditionOptions {
-		conditionOptionTypes[i] = v.Type
-	}
-
-	var summaryOptions conditions.ForConditionTypes = conditionOptionTypes
-	err = conditions.SetSummaryCondition(
-		tcp,
-		tcp,
-		string(controlplanev1.MachinesReadyCondition),
-		summaryOptions,
-	)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to set summary Machine Ready condition")
+		switch {
+		case allReady && !anyUnknown:
+			conditions.Set(tcp, metav1.Condition{
+				Type:   string(controlplanev1.MachinesAllReadyCondition),
+				Status: metav1.ConditionTrue,
+				Reason: "MachinesReady",
+			})
+		case anyUnknown:
+			conditions.Set(tcp, metav1.Condition{
+				Type:    string(controlplanev1.MachinesAllReadyCondition),
+				Status:  metav1.ConditionUnknown,
+				Reason:  "UnknownReported",
+				Message: strings.Join(notReadyMessages, "; "),
+			})
+		default:
+			conditions.Set(tcp, metav1.Condition{
+				Type:    string(controlplanev1.MachinesAllReadyCondition),
+				Status:  metav1.ConditionFalse,
+				Reason:  "MachinesNotReady",
+				Message: strings.Join(notReadyMessages, "; "),
+			})
+		}
 	}
 
 	var (
@@ -586,7 +604,7 @@ func (r *TalosControlPlaneReconciler) updateStatus(ctx context.Context, tcp *con
 	tcp.Status.Ready = false
 	tcp.Status.Replicas = replicas
 	tcp.Status.ReadyReplicas = 0
-	tcp.Status.UnavailableReplicas = replicas
+	tcp.Status.UnavailableReplicas = pointer.Int32(replicas)
 
 	// Return early if the deletion timestamp is set, we don't want to try to connect to the workload cluster.
 	if !tcp.DeletionTimestamp.IsZero() {
@@ -629,6 +647,7 @@ func (r *TalosControlPlaneReconciler) updateStatus(ctx context.Context, tcp *con
 	conditions.Set(tcp, metav1.Condition{
 		Type:   string(controlplanev1.AvailableCondition),
 		Status: metav1.ConditionTrue,
+		Reason: "Available",
 	})
 
 	for _, node := range nodes.Items {
@@ -642,7 +661,21 @@ func (r *TalosControlPlaneReconciler) updateStatus(ctx context.Context, tcp *con
 		tcp.Status.ReadyReplicas = tcp.Status.Replicas
 	}
 
-	tcp.Status.UnavailableReplicas = replicas - tcp.Status.ReadyReplicas
+	tcp.Status.UnavailableReplicas = pointer.Int32(replicas - tcp.Status.ReadyReplicas)
+
+	// Count available and up-to-date replicas from Machine conditions.
+	var availableCount, upToDateCount int32
+	for _, m := range ownedMachines.Items {
+		var getter conditions.Getter = &m
+		if c := conditions.Get(getter, string(clusterv1.MachineAvailableCondition)); c != nil && c.Status == metav1.ConditionTrue {
+			availableCount++
+		}
+		if c := conditions.Get(getter, string(clusterv1.MachineUpToDateCondition)); c != nil && c.Status == metav1.ConditionTrue {
+			upToDateCount++
+		}
+	}
+	tcp.Status.AvailableReplicas = &availableCount
+	tcp.Status.UpToDateReplicas = &upToDateCount
 
 	if tcp.Status.ReadyReplicas > 0 {
 		tcp.Status.Ready = true
@@ -749,6 +782,7 @@ func (r *TalosControlPlaneReconciler) reconcileEtcdMembers(ctx context.Context, 
 		conditions.Set(tcp, metav1.Condition{
 			Type:   string(controlplanev1.EtcdClusterHealthyCondition),
 			Status: metav1.ConditionTrue,
+			Reason: "EtcdClusterHealthy",
 		})
 	}
 
@@ -779,6 +813,7 @@ func (r *TalosControlPlaneReconciler) reconcileNodeHealth(ctx context.Context, c
 		conditions.Set(tcp, metav1.Condition{
 			Type:   string(controlplanev1.ControlPlaneComponentsHealthyCondition),
 			Status: metav1.ConditionTrue,
+			Reason: "ControlPlaneComponentsHealthy",
 		})
 	}
 
@@ -835,6 +870,7 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 			conditions.Set(tcp, metav1.Condition{
 				Type:   string(controlplanev1.MachinesSpecUpToDateCondition),
 				Status: metav1.ConditionTrue,
+				Reason: "SpecUpToDate",
 			})
 		}
 	}
@@ -864,14 +900,15 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 	default:
 		if !reflect.ValueOf(tcp.Spec.ControlPlaneConfig.InitConfig).IsZero() {
 			tcp.Status.Bootstrapped = true
+		}
 
+		if tcp.Status.Bootstrapped {
 			conditions.Set(tcp, metav1.Condition{
 				Type:   string(controlplanev1.MachinesBootstrapped),
 				Status: metav1.ConditionTrue,
+				Reason: "Bootstrapped",
 			})
-		}
-
-		if !tcp.Status.Bootstrapped {
+		} else if !tcp.Status.Bootstrapped {
 			if err := r.bootstrapCluster(ctx, tcp, machines.Items); err != nil {
 				conditions.Set(controlPlane.TCP, metav1.Condition{
 					Type:    string(controlplanev1.MachinesBootstrapped),
@@ -888,22 +925,73 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 			conditions.Set(tcp, metav1.Condition{
 				Type:   string(controlplanev1.MachinesBootstrapped),
 				Status: metav1.ConditionTrue,
+				Reason: "Bootstrapped",
 			})
 
 			tcp.Status.Bootstrapped = true
 		}
 
-		if conditions.Has(tcp, string(controlplanev1.MachinesReadyCondition)) {
+		if conditions.Has(tcp, string(controlplanev1.MachinesAllReadyCondition)) {
 			conditions.Set(tcp, metav1.Condition{
 				Type:   string(controlplanev1.ResizedCondition),
 				Status: metav1.ConditionTrue,
+				Reason: "Resized",
 			})
 		}
 
 		conditions.Set(tcp, metav1.Condition{
 			Type:   string(controlplanev1.MachinesCreatedCondition),
 			Status: metav1.ConditionTrue,
+			Reason: "MachinesCreated",
 		})
+	}
+
+	// Set UpToDate and MachinesReady conditions on each CP Machine.
+	// CAPI v1.12.x requires the control plane provider to set these on owned Machines.
+	for i := range machines.Items {
+		m := &machines.Items[i]
+		pHelper, err := patch.NewHelper(m, r.Client)
+		if err != nil {
+			logger.Error(err, "failed to create patch helper for machine", "machine", m.Name)
+			continue
+		}
+
+		changed := false
+
+		if !conditions.Has(m, string(clusterv1.MachineUpToDateCondition)) {
+			conditions.Set(m, metav1.Condition{
+				Type:   string(clusterv1.MachineUpToDateCondition),
+				Status: metav1.ConditionTrue,
+				Reason: "UpToDate",
+			})
+			changed = true
+		}
+
+		if !conditions.Has(m, string(clusterv1.MachinesReadyCondition)) {
+			if conditions.IsTrue(m, clusterv1.ReadyCondition) {
+				conditions.Set(m, metav1.Condition{
+					Type:   string(clusterv1.MachinesReadyCondition),
+					Status: metav1.ConditionTrue,
+					Reason: "Ready",
+				})
+			} else {
+				conditions.Set(m, metav1.Condition{
+					Type:   string(clusterv1.MachinesReadyCondition),
+					Status: metav1.ConditionFalse,
+					Reason: "NotReady",
+				})
+			}
+			changed = true
+		}
+
+		if changed {
+			if err := pHelper.Patch(ctx, m, patch.WithOwnedConditions{Conditions: []string{
+				string(clusterv1.MachineUpToDateCondition),
+				string(clusterv1.MachinesReadyCondition),
+			}}); err != nil {
+				logger.Error(err, "failed to patch machine conditions", "machine", m.Name)
+			}
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -918,7 +1006,7 @@ func patchTalosControlPlane(ctx context.Context, patchHelper *patch.Helper, tcp 
 		conditions.ForConditionTypes{
 			string(controlplanev1.MachinesCreatedCondition),
 			string(controlplanev1.ResizedCondition),
-			string(controlplanev1.MachinesReadyCondition),
+			string(controlplanev1.MachinesAllReadyCondition),
 			string(controlplanev1.AvailableCondition),
 			string(controlplanev1.MachinesBootstrapped),
 		},
@@ -932,7 +1020,7 @@ func patchTalosControlPlane(ctx context.Context, patchHelper *patch.Helper, tcp 
 			string(controlplanev1.MachinesCreatedCondition),
 			string(clusterv1.ReadyCondition),
 			string(controlplanev1.ResizedCondition),
-			string(controlplanev1.MachinesReadyCondition),
+			string(controlplanev1.MachinesAllReadyCondition),
 			string(controlplanev1.AvailableCondition),
 			string(controlplanev1.MachinesBootstrapped),
 		}},

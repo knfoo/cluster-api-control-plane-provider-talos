@@ -144,6 +144,7 @@ func main() {
 	clusterCache, err := clustercache.SetupWithManager(context.Background(), mgr, clustercache.Options{
 		SecretClient: secretCachingClient,
 		Client: clustercache.ClientOptions{
+			UserAgent: "cacppt-controller-manager",
 			Cache: clustercache.ClientCacheOptions{
 				DisableFor: []client.Object{
 					&corev1.ConfigMap{},

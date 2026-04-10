@@ -2,3 +2,4 @@ _out
 
 # Tilt build files
 .tiltbuild
+vendor/
