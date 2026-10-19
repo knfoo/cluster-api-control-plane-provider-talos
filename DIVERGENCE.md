@@ -48,6 +48,7 @@ the drop below.
 | 16 | `2e07fdc` | docs(phase0): update ADR-0001 to accepted with Day 4 evidence and go/no-go note | tooling | ADR-0001 |
 | 17 | `0b92f50` | fix(phase0): pin gh to our own repo, restore the GitHub App token for sync | tooling | ADR-0001 |
 | 18 | `d752b3a` | docs(phase0): accept ADR-0001 with dry-run and capi evidence | tooling | ADR-0001 |
+| 19 | `d353fef` | fix(phase0): kit review fixes (zero-test guard, tag, pin, touched files) | tooling | ADR-0001 |
 
 ## Dropped / absorbed upstream
 
