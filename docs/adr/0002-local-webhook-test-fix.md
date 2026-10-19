@@ -1,6 +1,7 @@
 # ADR 0002: Local fix for upstream's webhook envtest bug
 
-- **Status:** accepted (2026-10-19)
+- **Status:** superseded by ADR-0003 (2026-10-19). The patch was dropped when the
+  fork moved to siderolabs, whose `main` does not have this test.
 - **Context:** `TestTalosControlPlaneTemplateWebhookIntegration` fails on
   upstream code as shipped. The `invalid-template` fixture leaves
   `ControlPlaneConfig` empty, so CRD schema validation rejects

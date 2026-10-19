@@ -1,3 +1,7 @@
 # Tests that must actually PASS for a green baseline: not skip, not filtered out.
 # Add a test when it is load-bearing evidence; remove one only with an ADR.
-TestTalosControlPlaneTemplateWebhookIntegration   # ADR-0002: the fixed webhook envtest
+# Subtests, not the bare TestSuite: a testify suite passes even when no method ran.
+TestSuite/TestRollingUpdate                    # envtest: control plane rolling update
+TestSuite/TestReconcileInitializeControlPlane  # envtest: first control plane machine
+TestSuite/TestUppercaseHostnames               # envtest: TalosConfig generation
+TestEtcdMembershipVerify                       # etcd quorum safety

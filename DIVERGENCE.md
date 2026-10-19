@@ -1,12 +1,12 @@
 # Divergence Ledger — cluster-api-control-plane-provider-talos
 
 - **Repo:** knfoo/cluster-api-control-plane-provider-talos
-- **Provider upstream (`upstream` remote):** https://github.com/sidero-community/cluster-api-control-plane-provider-talos, branch `main`
+- **Provider upstream (`upstream` remote):** https://github.com/siderolabs/cluster-api-control-plane-provider-talos, branch `main` (sidero-community until ADR-0003)
 - **Contract upstream:** kubernetes-sigs/cluster-api (tracked by `hack/capi-watch.sh`)
 - **Upstream push:** disabled (`git remote set-url --push upstream no-push`)
 - **Baseline date:** 2026-10-19
-- **Measured at baseline:** 0 ahead / 52 behind → fast-forwarded to upstream/main
-- **Evidence:** ADR-0001, ADR-0002, `evidence/`
+- **Measured at baseline:** sidero-community: 0 ahead / 52 behind → fast-forwarded; siderolabs: tooling replayed onto `upstream/main` (ADR-0003)
+- **Evidence:** ADR-0001, ADR-0003, `evidence/`
 
 ## Standing rule (enforced by CI)
 
@@ -54,6 +54,7 @@ the drop below.
 
 | Patch | Superseded by upstream commit | Date |
 |---|---|---|
+| `3811324` webhook envtest fixture fix (local, ADR-0002) | none: test absent on siderolabs `main`, dropped with the move (ADR-0003) | 2026-10-19 |
 
 ## Categories
 
@@ -62,7 +63,7 @@ the drop below.
 - **carry** — unused in this project. It requires an upstream PR/issue link,
   and upstream contributions are out of scope.
 - **local** — deliberate fork-only behavior. Must state why it won't go upstream:
-  it can't (repo-specific), or contributing is out of scope (e.g. ADR-0002).
+  it can't (repo-specific), or contributing is out of scope.
   Be most suspicious of this category.
 - **revert** — an upstream change we temporarily refuse. Requires a revisit date.
 

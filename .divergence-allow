@@ -1,9 +1,2 @@
-80af87e tooling ADR-0001 # docs: record kit commits in divergence ledger
-e07eba7 tooling ADR-0001 # docs(phase0): add ADR-0001 (proposed)
-50d08b3 tooling ADR-0001 # chore(phase0): add fork-maintenance kit
-5689939 tooling ADR-0001 # chore(phase0): fix kit - baseline (add go test invocation)
-3811324 local   ADR-0002 # fix: make invalid-template fixture reach the webhook (test file only)
-47c1442 tooling ADR-0002 # fix(test): ADR-0002 + ledger row for the local fix (docs-only)
-a28f508 tooling ADR-0001 # docs: record kit commits in divergence ledger
-56a4e10 tooling ADR-0001 # chore(phase0): fix kit - baseline (duration_s + vacuous-green guard)
-bee62d1 tooling ADR-0001 # docs: audit ledger — 8/8 commits categorized (3811324 local/ADR-0002)
+# Pre-trailer commits (sha category ADR # title). Empty since the ADR-0003
+# re-baseline: every replayed commit carries a Divergence trailer.
