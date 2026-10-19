@@ -4,6 +4,8 @@
 # unless --no-issue. Writes _out/capi-watch.json. Never changes code.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+# gh defaults to a remote named `upstream`; pin it to our own repo (scope rule).
+export GH_REPO="${GH_REPO:-${GITHUB_REPOSITORY:-$(git remote get-url origin | sed -E 's#^.*github\.com[:/]##; s#\.git$##')}}"
 mkdir -p _out
 OPEN_ISSUE=1; [ "${1:-}" = "--no-issue" ] && OPEN_ISSUE=0
 
