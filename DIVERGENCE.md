@@ -24,6 +24,7 @@ file is out of date.
 | 1 | `80af87e` | phase0: fork-maintenance kit (hack/, workflows, DIVERGENCE.md) | ADR-0001 | tooling | n/a |
 | 2 | `e07eba7` | docs(phase0): add ADR-0001 (proposed) | ADR-0001 | tooling | n/a |
 | 3 | `50d08b3` | chore(phase0): add fork-maintenance kit (hack/, workflows) | ADR-0001 | tooling | n/a |
+| 4 | `3811324` | fix: webhook fixture passes CRD schema validation | ADR-0002 | carry | PR: <upstream PR url> |
 
 ## Categories
 
