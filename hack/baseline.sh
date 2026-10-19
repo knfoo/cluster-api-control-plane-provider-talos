@@ -14,6 +14,7 @@ UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 if ! command -v setup-envtest >/dev/null 2>&1; then
   go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 fi
+export PATH="$(go env GOPATH)/bin:$PATH"   # go install puts binaries in GOPATH/bin, which is not always on PATH
 export KUBEBUILDER_ASSETS="${KUBEBUILDER_ASSETS:-$(setup-envtest use "$ENVTEST_K8S_VERSION" -p path)}"
 
 UPSTREAM_TAG=$(git -c versionsort.suffix=- tag --sort=-v:refname --list 'v*' | head -1)
@@ -21,11 +22,8 @@ DIVERGENCE=$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD" 2>/dev/nul
 
 START=$(date -u +%FT%TZ)
 TEST_STATUS=green
-if make -n test >/dev/null 2>&1; then
-  make test || TEST_STATUS=failed
-else
-  go test ./... || TEST_STATUS=failed
-fi
+# -count=1 busts the go test cache: a "green twice" run must re-verify, not replay.
+# -skip '^TestIntegration
 END=$(date -u +%FT%TZ)
 
 cat > _out/baseline.json <<EOF
