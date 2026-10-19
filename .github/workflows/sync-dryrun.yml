@@ -3,21 +3,41 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Override base (forced day-4 exercise only); default origin/main"
+        required: false
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
+concurrency:
+  group: sync-dryrun
+  cancel-in-progress: false
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
       - name: add upstream remote
-        run: git remote add upstream "${{ vars.UPSTREAM_URL }}" && git fetch upstream --tags --prune
+        env: { UPSTREAM_URL: "${{ vars.UPSTREAM_URL }}" }
+        run: |
+          : "${UPSTREAM_URL:?set repo variable UPSTREAM_URL}"
+          git remote add upstream "$UPSTREAM_URL"
       - run: ./hack/sync-dryrun.sh
         env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM_REMOTE: upstream
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SYNC_TARGET: ${{ vars.SYNC_TARGET || 'upstream/main' }}
+          BASE_REF: ${{ inputs.base_ref || 'origin/main' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-outcome
+          path: _out/sync/
+          if-no-files-found: warn

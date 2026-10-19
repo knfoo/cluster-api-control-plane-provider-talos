@@ -2,6 +2,7 @@ name: baseline
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
@@ -13,12 +14,32 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
-      - name: add upstream remote
-        run: git remote add upstream "${{ vars.UPSTREAM_URL }}" && git fetch upstream --tags --prune
+      - name: fetch upstream
+        env: { UPSTREAM_URL: "${{ vars.UPSTREAM_URL }}" }
+        run: |
+          : "${UPSTREAM_URL:?set repo variable UPSTREAM_URL}"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --prune --no-tags \
+            '+refs/heads/*:refs/remotes/upstream/*' '+refs/tags/*:refs/tags/upstream/*'
+      - name: kit self-check
+        run: |
+          bash -n hack/*.sh
+          grep -q 'go test -count=1 -json -skip' hack/baseline.sh
+          grep -q 'merge-base --is-ancestor' hack/sync-dryrun.sh
+      - run: ./hack/ledger-check.sh
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/kubebuilder-envtest
+            _out/bin
+          key: envtest-${{ hashFiles('go.mod') }}
       - run: ./hack/baseline.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: baseline-${{ github.sha }}
-          path: _out/baseline.json
+          path: |
+            _out/baseline.json
+            _out/test.json
+            _out/test.log
           if-no-files-found: warn

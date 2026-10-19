@@ -1,0 +1,24 @@
+name: capi-watch
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: ./hack/capi-watch.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIBLING_REPO: ${{ vars.SIBLING_REPO }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: capi-watch
+          path: _out/capi-watch.json

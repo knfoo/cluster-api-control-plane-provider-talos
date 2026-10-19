@@ -1,51 +1,95 @@
 #!/usr/bin/env bash
-# Nightly dry-run sync: merge the latest upstream tag and open a PR (clean) or
-# an issue (conflicts). NEVER merges, never promotes. Phase 0/1 tool only.
+# Dry-run provider sync: merge SYNC_TARGET (default upstream/main) into BASE_REF on a
+# throwaway branch, then open a draft PR (clean), an issue (conflicts), or record a
+# no-op. NEVER merges into main, never promotes. Phase 0/1 tool only.
 set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
 
 UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
 BASE_BRANCH="${BASE_BRANCH:-main}"
-BODY=/tmp/sync-dryrun-body.md
+BASE_REF="${BASE_REF:-origin/$BASE_BRANCH}"       # override only for the forced day-4 exercise
+SYNC_TARGET="${SYNC_TARGET:-$UPSTREAM_REMOTE/main}"
+OUT=_out/sync; mkdir -p "$OUT"
 
-git fetch "$UPSTREAM_REMOTE" --tags --prune
-UPSTREAM_TAG=$(git -c versionsort.suffix=- tag --sort=-v:refname --list 'v*' | head -1)
-BRANCH="sync/$(date +%F)-${UPSTREAM_TAG}"
+# identity via env only, never `git config`, so a local run can't rewrite your clone
+export GIT_AUTHOR_NAME=sync-bot GIT_COMMITTER_NAME=sync-bot
+export GIT_AUTHOR_EMAIL=sync-bot@users.noreply.github.com GIT_COMMITTER_EMAIL=sync-bot@users.noreply.github.com
 
-if git ls-remote --heads origin "$BRANCH" | grep -q .; then
-  echo "sync branch $BRANCH already exists; nothing to do"; exit 0
+ORIG=$(git symbolic-ref -q --short HEAD || git rev-parse HEAD)
+trap 'git merge --abort >/dev/null 2>&1 || true; git checkout -q "$ORIG" 2>/dev/null || true' EXIT
+
+git fetch origin --prune
+git fetch "$UPSTREAM_REMOTE" --prune --no-tags \
+  "+refs/heads/*:refs/remotes/$UPSTREAM_REMOTE/*" "+refs/tags/*:refs/tags/$UPSTREAM_REMOTE/*"
+
+TARGET_SHA=$(git rev-parse --verify "$SYNC_TARGET^{commit}")
+BASE_SHA=$(git rev-parse --verify "$BASE_REF^{commit}")
+SHORT=${TARGET_SHA:0:12}
+BRANCH="sync/$SHORT"
+UPSTREAM_COMMITS=$(git rev-list --count "$BASE_SHA..$TARGET_SHA")
+capi_at() { git show "$1:go.mod" | awk '{for(i=1;i<NF;i++) if($i=="sigs.k8s.io/cluster-api"){print $(i+1); exit}}'; }
+
+outcome() {  # $1=result, $2=newline-separated conflict files, $3=url
+  local touched workflows
+  touched=$(git diff --name-only "$BASE_SHA" "$TARGET_SHA" | jq -R . | jq -s .)
+  workflows=$(git diff --name-only "$BASE_SHA" "$TARGET_SHA" -- .github/workflows | jq -R . | jq -s .)
+  jq -n --arg repo "$(basename "$PWD")" --arg date "$(date -u +%FT%TZ)" \
+    --arg base_ref "$BASE_REF" --arg base_sha "$BASE_SHA" \
+    --arg target_ref "$SYNC_TARGET" --arg target_sha "$TARGET_SHA" \
+    --argjson upstream_commits "$UPSTREAM_COMMITS" --arg result "$1" --arg url "${3:-}" \
+    --arg capi_before "$(capi_at "$BASE_SHA")" --arg capi_after "$(capi_at "$TARGET_SHA")" \
+    --argjson conflict_files "$(printf '%s' "${2:-}" | jq -R . | jq -s 'map(select(length>0))')" \
+    --argjson files_touched "$touched" --argjson workflow_files_touched "$workflows" \
+    '{kind:"sync-dryrun", phase:"0"} + $ARGS.named' > "$OUT/outcome.json"
+  cat "$OUT/outcome.json"
+}
+
+# 1. no-op: target already contained in base (the tag-based v1 script crashed here)
+if git merge-base --is-ancestor "$TARGET_SHA" "$BASE_SHA"; then
+  echo "$BASE_REF already contains $SYNC_TARGET ($SHORT); nothing to sync"
+  outcome noop; exit 0
 fi
 
-git config user.name "sync-bot"
-git config user.email "sync-bot@users.noreply.github.com"
-git checkout -B "$BRANCH" "origin/$BASE_BRANCH"
+# 2. dedupe on upstream SHA, not on date
+if [ -n "$(gh pr list --state open --head "$BRANCH" --json number -q '.[].number')" ] || \
+   [ -n "$(gh issue list --state open --label sync-dryrun --search "$SHORT in:title" --json number -q '.[].number')" ]; then
+  echo "open PR/issue already exists for $SHORT; nothing to do"
+  outcome duplicate; exit 0
+fi
 
-CONFLICTED=0
-if ! git merge --no-ff --no-commit "$UPSTREAM_TAG" >/tmp/merge.log 2>&1; then
-  CONFLICTED=1
-  git status --porcelain > /tmp/sync-conflicts.txt || true
+# 3. trial merge
+git checkout -q -B "$BRANCH" "$BASE_SHA"
+set +e
+git merge --no-ff --no-commit "$TARGET_SHA" > "$OUT/merge.log" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 0 ]; then
+  CONFLICTS=$(git diff --name-only --diff-filter=U)
   git merge --abort
+  git checkout -q "$ORIG"; git branch -D "$BRANCH"
+  if [ -z "$CONFLICTS" ]; then
+    echo "merge failed for a non-conflict reason:" >&2; cat "$OUT/merge.log" >&2; exit 1
+  fi
+  {
+    echo "Dry-run sync of \`$SYNC_TARGET\` (\`$SHORT\`, $UPSTREAM_COMMITS upstream commits) hit conflicts."
+    echo "Expected until AVO (Phase 3). Conflicted files:"
+    echo; echo '```'; echo "$CONFLICTS"; echo '```'
+    echo; echo "If a conflicted file is covered by a \`local\` ADR, apply that ADR's revisit rule."
+    echo "Informational only; no branch was created."
+  } > "$OUT/body.md"
+  URL=$(gh issue create --title "sync dry-run conflicts: $SHORT" --body-file "$OUT/body.md" --label sync-dryrun)
+  outcome conflicts "$CONFLICTS" "$URL"; exit 0
 fi
 
-if [ "$CONFLICTED" -eq 0 ]; then
-  git commit -m "sync: merge upstream ${UPSTREAM_TAG} (dry-run)"
-  {
-    echo "Dry-run sync from upstream **${UPSTREAM_TAG}** — clean merge."
-    echo; echo '```'; git diff --stat "origin/${BASE_BRANCH}"..HEAD; echo '```'
-    echo; echo "**DO NOT MERGE**: Phase 0/1 dry run. Promotion gates arrive in Phase 2."
-  } > "$BODY"
-  git push origin "$BRANCH"
-  command -v gh >/dev/null 2>&1 && \
-    gh pr create --title "sync dry-run: ${UPSTREAM_TAG}" --body-file "$BODY" \
-      --label sync-dryrun --base "$BASE_BRANCH" || echo "PR already exists"
-else
-  {
-    echo "Dry-run sync to upstream **${UPSTREAM_TAG}** hit conflicts. Expected until AVO (Phase 3). Files:"
-    echo; echo '```'; cat /tmp/sync-conflicts.txt; echo '```'
-    echo; echo "Informational only — no branch was created."
-  } > "$BODY"
-  git checkout "$BASE_BRANCH"
-  git branch -D "$BRANCH"
-  command -v gh >/dev/null 2>&1 && \
-    gh issue create --title "sync dry-run conflicts: ${UPSTREAM_TAG}" \
-      --body-file "$BODY" --label sync-dryrun || true
-fi
+git commit -q -m "sync: merge $SYNC_TARGET ($SHORT) (dry-run)"
+{
+  echo "Dry-run sync of \`$SYNC_TARGET\` (\`$SHORT\`, $UPSTREAM_COMMITS upstream commits): clean merge."
+  echo; echo '```'; git diff --stat "$BASE_SHA"..HEAD; echo '```'
+  echo; echo "CAPI: \`$(capi_at "$BASE_SHA")\` \u2192 \`$(capi_at "$TARGET_SHA")\`"
+  echo; echo "**DO NOT MERGE.** Phase 0/1 dry run. Promotion gates arrive in Phase 2."
+} > "$OUT/body.md"
+git push -q origin "$BRANCH"
+URL=$(gh pr create --draft --title "sync dry-run: $SHORT" --body-file "$OUT/body.md" \
+  --label sync-dryrun --base "$BASE_BRANCH" --head "$BRANCH")
+outcome clean "" "$URL"
