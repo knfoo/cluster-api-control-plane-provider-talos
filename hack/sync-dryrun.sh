@@ -35,8 +35,9 @@ capi_at() { git show "$1:go.mod" | awk '{for(i=1;i<NF;i++) if($i=="sigs.k8s.io/c
 
 outcome() {  # $1=result, $2=newline-separated conflict files, $3=url
   local touched workflows
-  touched=$(git diff --name-only "$BASE_SHA" "$TARGET_SHA" | jq -R . | jq -s .)
-  workflows=$(git diff --name-only "$BASE_SHA" "$TARGET_SHA" -- .github/workflows | jq -R . | jq -s .)
+  # three dots: what upstream changed since the merge base, not our own divergence
+  touched=$(git diff --name-only "$BASE_SHA...$TARGET_SHA" | jq -R . | jq -s .)
+  workflows=$(git diff --name-only "$BASE_SHA...$TARGET_SHA" -- .github/workflows | jq -R . | jq -s .)
   jq -n --arg repo "$(basename "$PWD")" --arg date "$(date -u +%FT%TZ)" \
     --arg base_ref "$BASE_REF" --arg base_sha "$BASE_SHA" \
     --arg target_ref "$SYNC_TARGET" --arg target_sha "$TARGET_SHA" \

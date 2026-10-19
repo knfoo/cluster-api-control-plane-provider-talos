@@ -21,7 +21,9 @@ GO_MOD_GO=$(awk '/^go /{print $2}' go.mod)
 CLIENT_GO=$(modver k8s.io/client-go)
 CAPI_VERSION=$(modver sigs.k8s.io/cluster-api)
 CR_VERSION=$(modver sigs.k8s.io/controller-runtime)
-CABPT_PIN=$(modver github.com/siderolabs/cluster-api-bootstrap-provider-talos)  # empty in CABPT itself
+# a replace directive wins over the require version, so record what is actually built
+CABPT_PIN=$(go list -m -f '{{with .Replace}}{{.Path}}@{{.Version}}{{else}}{{.Version}}{{end}}' \
+  github.com/siderolabs/cluster-api-bootstrap-provider-talos 2>/dev/null || echo "absent")  # empty in CABPT itself
 
 # --- envtest: K8s version from client-go, setup-envtest pinned to controller-runtime
 # Called by absolute path, so GOPATH/bin on PATH no longer matters (day-2 lesson 1).
@@ -36,6 +38,12 @@ if [ ! -x "$ENVTEST_BIN/setup-envtest" ]; then
 fi
 if [ -z "${KUBEBUILDER_ASSETS:-}" ]; then
   KUBEBUILDER_ASSETS=$("$ENVTEST_BIN/setup-envtest" use "$ENVTEST_K8S_VERSION" -p path)
+else
+  # a value left over in the shell can be for another K8s minor (day-4 finding)
+  case "$KUBEBUILDER_ASSETS" in
+    */"${ENVTEST_K8S_VERSION%.x}".*) ;;
+    *) echo "warning: preset KUBEBUILDER_ASSETS is not envtest $ENVTEST_K8S_VERSION: $KUBEBUILDER_ASSETS" >&2 ;;
+  esac
 fi
 if [ -z "$KUBEBUILDER_ASSETS" ] || [ ! -d "$KUBEBUILDER_ASSETS" ]; then
   echo "KUBEBUILDER_ASSETS empty or missing: '$KUBEBUILDER_ASSETS'" >&2; exit 2
@@ -47,7 +55,10 @@ HEAD_SHA=$(git rev-parse HEAD)
 UPSTREAM_SHA=$(git rev-parse --verify -q "$UPSTREAM_REF" || echo "unknown")
 AHEAD=$(git rev-list --count "$UPSTREAM_REF..HEAD" 2>/dev/null || echo "unknown")
 BEHIND=$(git rev-list --count "HEAD..$UPSTREAM_REF" 2>/dev/null || echo "unknown")
-NEAREST_TAG=$(git describe --tags --abbrev=0 --match 'upstream/v*' HEAD 2>/dev/null || echo "none")
+# not `git describe`: it prints garbage for annotated tags fetched under upstream/*
+# ("externally known as v0.9.0"). versionsort.suffix sorts v1.0.0-rc below v1.0.0.
+NEAREST_TAG=$(git -c versionsort.suffix=- tag --merged HEAD --sort=-v:refname -l 'upstream/v*' | sed -n 1p)
+NEAREST_TAG=${NEAREST_TAG:-none}
 
 # --- tests -----------------------------------------------------------------
 # -count=1 busts the go test cache: a "green twice" run must re-verify, not replay.
@@ -65,12 +76,13 @@ set -e
 END=$(date -u +%FT%TZ); END_EPOCH=$(date +%s)
 DURATION=$((END_EPOCH - START_EPOCH))
 
-jq -cR 'fromjson? | objects' _out/test.raw > _out/test.json
+jq -cR 'fromjson? | objects' _out/test.raw > _out/test.json         # drop any non-JSON lines
 jq -rj 'select(.Action=="output") | .Output // ""' _out/test.json > _out/test.log
 [ -s _out/test.stderr ] && cat _out/test.stderr >&2
 
 echo "--- packages ---"
-jq -r 'select(.Test==null and (.Action=="pass" or .Action=="fail" or .Action=="skip")) | "\(.Action)\t\(.Elapsed // 0)s\t\(.Package)"' _out/test.json
+jq -r 'select(.Test==null and (.Action=="pass" or .Action=="fail" or .Action=="skip"))
+       | "\(.Action)\t\(.Elapsed // 0)s\t\(.Package)"' _out/test.json
 jq -r 'select(.Test!=null and .Action=="fail") | "FAIL\t\(.Package)\t\(.Test)"' _out/test.json
 
 count() { jq -s "$1" _out/test.json; }
@@ -87,6 +99,9 @@ fail() { TEST_STATUS=failed; REASONS="${REASONS}${REASONS:+; }$1"; echo "GUARD: 
 
 if [ "$RC" -ne 0 ]; then fail "go test exited $RC"; fi
 if [ "$PKGS_OK" -eq 0 ]; then fail "no package passed"; fi
+# a package passes even when every test in it is skipped (day-4: CABPT on siderolabs)
+if [ "$TESTS_PASSED" -eq 0 ]; then fail "no test passed"; fi
+# day-2 lesson 4: a sub-floor green means the suite never ran
 if [ "$DURATION" -lt "$MIN_DURATION_S" ]; then fail "suite finished in ${DURATION}s (< ${MIN_DURATION_S}s floor)"; fi
 
 # day-2 lesson 6: named load-bearing tests must actually PASS (not skip, not be filtered)

@@ -13,10 +13,12 @@
   category: **local**. The fix is upstreamable in principle, but upstream
   contributions (PRs/issues) are out of scope for this project.
 - **Evidence:** suite green in a real ~10s run (anchored `-skip '^TestIntegration$'`,
-  `-count=1`), after the failure was first reproduced and diagnosed.
+  `-count=1`), after the failure was first reproduced and diagnosed. The test is
+  listed in `hack/must-run.txt`, so every baseline proves it actually passed.
 - **Consequences:** The suite is green for the right reason, not by skipping.
-  The row stays in DIVERGENCE.md and rebases with the fork.
+  The patch stays ledgered and travels with every sync.
 - **Revisit rule:** If upstream ever changes this test, prefer upstream's
-  version and drop this patch — a rebase conflict on this file is a signal to
-  re-evaluate, not to force ours. Delete the ledger row when upstream fixes
-  the test independently.
+  version and drop this patch. A conflict on this file in a dry-run sync is a
+  signal to re-evaluate, not to force ours. (This only works because the sync
+  targets `upstream/main`; a tag-based sync would never surface it.) Drop the
+  patch when upstream fixes the test independently.
