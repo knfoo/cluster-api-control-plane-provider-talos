@@ -1,0 +1,12 @@
+{
+  "kind": "capi-watch",
+  "phase": "0",
+  "repo": "cluster-api-control-plane-provider-talos",
+  "date": "2026-10-19T14:22:06Z",
+  "capi_current": "v1.14.2",
+  "capi_latest": "v1.14.3",
+  "sibling_repo": "",
+  "capi_sibling": "",
+  "minor_lag": false,
+  "sibling_mismatch": false
+}
