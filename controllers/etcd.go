@@ -20,14 +20,7 @@ func (r *TalosControlPlaneReconciler) etcdHealthcheck(ctx context.Context, tcp *
 	ctx, cancel := context.WithTimeout(ctx, time.Second*5)
 	defer cancel()
 
-	machines := []clusterv1.Machine{}
-
-	for _, machine := range ownedMachines {
-		if machine.ObjectMeta.DeletionTimestamp.IsZero() &&
-			machine.Annotations[etcdLeavingAnnotation] != "true" {
-			machines = append(machines, machine)
-		}
-	}
+	machines := healthCheckable(ownedMachines)
 
 	params := make([]any, 0, len(machines)*2)
 	for _, machine := range machines {
@@ -103,41 +96,6 @@ func (r *TalosControlPlaneReconciler) etcdHealthcheck(ctx context.Context, tcp *
 			return nil
 		}(); err != nil {
 			return fmt.Errorf("error checking etcd health on machine %q: %w", machines[i].Name, err)
-		}
-	}
-
-	return nil
-}
-
-// gracefulEtcdLeave removes a given machine from the etcd cluster by forfeiting leadership
-// and issuing a "leave" request from the machine itself.
-func (r *TalosControlPlaneReconciler) gracefulEtcdLeave(ctx context.Context, c etcdCalls, machineToLeave clusterv1.Machine) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Second*5)
-
-	defer cancel()
-
-	r.Log.Info("verifying etcd status", "machine", machineToLeave.Name, "node", machineToLeave.Status.NodeRef.Name)
-
-	svcs, err := c.ServiceInfo(ctx, "etcd")
-	if err != nil {
-		return err
-	}
-
-	for _, svc := range svcs {
-		if svc.Service.State != "Finished" {
-			r.Log.Info("forfeiting leadership", "machine", machineToLeave.Status.NodeRef.Name)
-
-			_, err = c.EtcdForfeitLeadership(ctx, &machineapi.EtcdForfeitLeadershipRequest{})
-			if err != nil {
-				return err
-			}
-
-			r.Log.Info("leaving etcd", "machine", machineToLeave.Name, "node", machineToLeave.Status.NodeRef.Name)
-
-			err = c.EtcdLeaveCluster(ctx, &machineapi.EtcdLeaveClusterRequest{})
-			if err != nil {
-				return err
-			}
 		}
 	}
 

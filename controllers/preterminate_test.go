@@ -38,16 +38,33 @@ type fakeEtcdCalls struct {
 	memberListErr  error
 	services       []talosclient.ServiceInfo
 	serviceInfoErr error
+	serviceList    *machineapi.ServiceListResponse
+	serviceListErr error
 	forfeitErr     error
 	leaveErr       error
 	removeErr      error
 
 	serviceInfoCalls int
+	serviceListCalls int
 	memberListCalls  int
 	forfeitCalls     int
 	leaveCalls       int
 	removedIDs       []uint64
 	closed           bool
+}
+
+func (f *fakeEtcdCalls) ServiceList(_ context.Context, _ ...grpc.CallOption) (*machineapi.ServiceListResponse, error) {
+	f.serviceListCalls++
+
+	if f.serviceListErr != nil {
+		return nil, f.serviceListErr
+	}
+
+	if f.serviceList == nil {
+		return &machineapi.ServiceListResponse{}, nil
+	}
+
+	return f.serviceList, nil
 }
 
 func (f *fakeEtcdCalls) ServiceInfo(_ context.Context, _ string, _ ...grpc.CallOption) ([]talosclient.ServiceInfo, error) {
@@ -147,7 +164,7 @@ func (d *fakeEtcdDialer) totalEtcdCalls() int {
 	total := 0
 
 	for _, c := range d.clients {
-		total += c.serviceInfoCalls + c.memberListCalls + c.forfeitCalls + c.leaveCalls + len(c.removedIDs)
+		total += c.serviceInfoCalls + c.serviceListCalls + c.memberListCalls + c.forfeitCalls + c.leaveCalls + len(c.removedIDs)
 	}
 
 	return total
@@ -298,14 +315,13 @@ func newPreTerminateFixtureWithTCP(t *testing.T, tcp *controlplanev1.TalosContro
 
 	return &preTerminateFixture{
 		r: &TalosControlPlaneReconciler{
-			Client:                        cl,
-			APIReader:                     cl,
-			Log:                           ctrl.Log.WithName("test"),
-			Scheme:                        scheme,
-			Recorder:                      recorder,
-			EnableMachinePreTerminateHook: true,
-			EtcdCleanupTimeout:            2 * time.Minute,
-			etcdDialer:                    dialer.dial,
+			Client:             cl,
+			APIReader:          cl,
+			Log:                ctrl.Log.WithName("test"),
+			Scheme:             scheme,
+			Recorder:           recorder,
+			EtcdCleanupTimeout: 2 * time.Minute,
+			etcdDialer:         dialer.dial,
 		},
 		cluster:  cluster,
 		tcp:      tcp,
@@ -350,28 +366,45 @@ func (f *preTerminateFixture) events() []string {
 	}
 }
 
+// runningEtcd is what a machine whose etcd is up and healthy reports for ServiceInfo("etcd").
 func runningEtcd() []talosclient.ServiceInfo {
 	return []talosclient.ServiceInfo{
-		{Service: &machineapi.ServiceInfo{Id: "etcd", State: "Running"}},
+		{Service: &machineapi.ServiceInfo{Id: "etcd", State: "Running", Health: &machineapi.ServiceHealth{Healthy: true}}},
 	}
+}
+
+// unhealthyEtcd is what a machine whose etcd is up but failing its health check reports.
+func unhealthyEtcd() []talosclient.ServiceInfo {
+	return []talosclient.ServiceInfo{
+		{Service: &machineapi.ServiceInfo{Id: "etcd", State: "Running", Health: &machineapi.ServiceHealth{Healthy: false}}},
+	}
+}
+
+// healthyServices is what a control plane node with every service healthy reports.
+func healthyServices() *machineapi.ServiceListResponse {
+	return &machineapi.ServiceListResponse{Messages: []*machineapi.ServiceList{{Services: []*machineapi.ServiceInfo{
+		{Id: "etcd", State: "Running", Health: &machineapi.ServiceHealth{Healthy: true}},
+		{Id: "kubelet", State: "Running", Health: &machineapi.ServiceHealth{Healthy: true}},
+	}}}}
+}
+
+// unhealthyServices is what a control plane node with a failed kubelet reports.
+func unhealthyServices() *machineapi.ServiceListResponse {
+	return &machineapi.ServiceListResponse{Messages: []*machineapi.ServiceList{{Services: []*machineapi.ServiceInfo{
+		{Id: "etcd", State: "Running", Health: &machineapi.ServiceHealth{Healthy: true}},
+		{Id: "kubelet", State: "Failed", Health: &machineapi.ServiceHealth{Healthy: false}},
+	}}}}
 }
 
 // --- 1H.1: stamping --------------------------------------------------------
 
-func TestDesiredMachineAnnotations_StampsHookWhenEnabled(t *testing.T) {
+func TestDesiredMachineAnnotations_AlwaysStampsHook(t *testing.T) {
 	f := newPreTerminateFixture(t)
 
 	annotations := f.r.desiredMachineAnnotations(f.tcp)
 
 	assert.Contains(t, annotations, PreTerminateHookCleanupAnnotation)
 	assert.Equal(t, "", annotations[PreTerminateHookCleanupAnnotation])
-}
-
-func TestDesiredMachineAnnotations_NoStampWhenDisabled(t *testing.T) {
-	f := newPreTerminateFixture(t)
-	f.r.EnableMachinePreTerminateHook = false
-
-	assert.NotContains(t, f.r.desiredMachineAnnotations(f.tcp), PreTerminateHookCleanupAnnotation)
 }
 
 func TestDesiredMachineAnnotations_KeepsTemplateAnnotations(t *testing.T) {
@@ -393,16 +426,6 @@ func TestPreTerminateHook_StampsAdoptedMachines(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.True(t, f.hasHook(t, "adopted"))
-}
-
-func TestPreTerminateHook_NoStampWhenFlagOff(t *testing.T) {
-	f := newPreTerminateFixture(t, newPTMachine(newPreTerminateTCP(), "cp-1"))
-	f.r.EnableMachinePreTerminateHook = false
-
-	_, err := f.run(context.Background())
-	require.NoError(t, err)
-
-	assert.False(t, f.hasHook(t, "cp-1"))
 }
 
 func TestPreTerminateHook_NoStampOnDeletingMachine(t *testing.T) {
@@ -501,6 +524,7 @@ func TestPreTerminateHook_GracefulLeaveFromVictim(t *testing.T) {
 			{Id: 1, Hostname: "cp-1"},
 			{Id: 2, Hostname: "cp-2"},
 		},
+		services: runningEtcd(),
 	}
 	f.dialer.clients["cp-1"] = &fakeEtcdCalls{name: "cp-1", services: runningEtcd()}
 
@@ -529,6 +553,7 @@ func TestPreTerminateHook_RemovesViaPeerWhenVictimUnreachable(t *testing.T) {
 			{Id: 1, Hostname: "cp-1"},
 			{Id: 2, Hostname: "cp-2"},
 		},
+		services: runningEtcd(),
 	}
 	f.dialer.dialErrs["cp-1"] = fmt.Errorf("connection refused")
 
@@ -547,8 +572,9 @@ func TestPreTerminateHook_RemovesViaPeerWhenLeaveFails(t *testing.T) {
 
 	f := newPreTerminateFixture(t, victim, peer)
 	f.dialer.clients["cp-2"] = &fakeEtcdCalls{
-		name:    "cp-2",
-		members: []*machineapi.EtcdMember{{Id: 1, Hostname: "cp-1"}, {Id: 2, Hostname: "cp-2"}},
+		name:     "cp-2",
+		members:  []*machineapi.EtcdMember{{Id: 1, Hostname: "cp-1"}, {Id: 2, Hostname: "cp-2"}},
+		services: runningEtcd(),
 	}
 	f.dialer.clients["cp-1"] = &fakeEtcdCalls{
 		name:     "cp-1",
@@ -574,6 +600,7 @@ func TestPreTerminateHook_RetainsHookBeforeDeadline(t *testing.T) {
 	f.dialer.clients["cp-2"] = &fakeEtcdCalls{
 		name:      "cp-2",
 		members:   []*machineapi.EtcdMember{{Id: 1, Hostname: "cp-1"}, {Id: 2, Hostname: "cp-2"}},
+		services:  runningEtcd(),
 		removeErr: fmt.Errorf("etcd unavailable"),
 	}
 	f.dialer.dialErrs["cp-1"] = fmt.Errorf("connection refused")
@@ -600,6 +627,7 @@ func TestPreTerminateHook_FailsOpenPastDeadline(t *testing.T) {
 	f.dialer.clients["cp-2"] = &fakeEtcdCalls{
 		name:      "cp-2",
 		members:   []*machineapi.EtcdMember{{Id: 1, Hostname: "cp-1"}, {Id: 2, Hostname: "cp-2"}},
+		services:  runningEtcd(),
 		removeErr: fmt.Errorf("etcd unavailable"),
 	}
 	f.dialer.dialErrs["cp-1"] = fmt.Errorf("connection refused")
@@ -632,6 +660,7 @@ func TestPreTerminateHook_ProcessesOnlyTheOldestDeletingMachine(t *testing.T) {
 			{Id: 2, Hostname: "cp-newer"},
 			{Id: 3, Hostname: "cp-peer"},
 		},
+		services: runningEtcd(),
 	}
 	f.dialer.clients["cp-older"] = &fakeEtcdCalls{name: "cp-older", services: runningEtcd()}
 	f.dialer.clients["cp-newer"] = &fakeEtcdCalls{name: "cp-newer", services: runningEtcd()}
@@ -755,86 +784,6 @@ func TestPreTerminateHook_SkipsLeaveForLastMember(t *testing.T) {
 	assert.Contains(t, strings.Join(f.events(), "\n"), "EtcdCleanupSkipped")
 }
 
-// --- 1H.10: scale down -----------------------------------------------------
-
-func TestDeleteControlPlaneMachine_HookedVictimSkipsInlineLeave(t *testing.T) {
-	tcp := newPreTerminateTCP()
-	victim := newPTMachine(tcp, "cp-1", ptHooked)
-
-	f := newPreTerminateFixture(t, victim)
-
-	workload := fake.NewClientBuilder().WithScheme(preTerminateScheme(t)).Build()
-
-	_, err := f.r.deleteControlPlaneMachine(context.Background(), workload, f.tcp, victim)
-	require.NoError(t, err)
-
-	assert.Empty(t, f.dialer.dialed, "the deletion pipeline owns etcd cleanup for hooked machines")
-
-	var remaining clusterv1.MachineList
-	require.NoError(t, f.r.Client.List(context.Background(), &remaining))
-	assert.Empty(t, remaining.Items)
-}
-
-func TestDeleteControlPlaneMachine_UnhookedVictimLeavesInline(t *testing.T) {
-	tcp := newPreTerminateTCP()
-	victim := newPTMachine(tcp, "cp-1")
-
-	f := newPreTerminateFixture(t, victim)
-	f.dialer.clients["cp-1"] = &fakeEtcdCalls{name: "cp-1", services: runningEtcd()}
-
-	workload := fake.NewClientBuilder().WithScheme(preTerminateScheme(t)).Build()
-
-	_, err := f.r.deleteControlPlaneMachine(context.Background(), workload, f.tcp, victim)
-	require.NoError(t, err)
-
-	assert.Equal(t, []string{"cp-1"}, f.dialer.dialed)
-	assert.Equal(t, 1, f.dialer.clients["cp-1"].leaveCalls)
-}
-
-func TestDeleteControlPlaneMachine_UnhookedVictimPropagatesLeaveFailure(t *testing.T) {
-	tcp := newPreTerminateTCP()
-	victim := newPTMachine(tcp, "cp-1")
-
-	f := newPreTerminateFixture(t, victim)
-	f.dialer.clients["cp-1"] = &fakeEtcdCalls{
-		name:     "cp-1",
-		services: runningEtcd(),
-		leaveErr: fmt.Errorf("etcd refused the leave"),
-	}
-
-	workload := fake.NewClientBuilder().WithScheme(preTerminateScheme(t)).Build()
-
-	_, err := f.r.deleteControlPlaneMachine(context.Background(), workload, f.tcp, victim)
-	require.Error(t, err, "a failed inline leave must not be swallowed")
-	assert.Contains(t, err.Error(), "etcd refused the leave")
-
-	// The machine is still deleted: the delete request precedes the error return today and
-	// that behaviour is unchanged.
-	var remaining clusterv1.MachineList
-	require.NoError(t, f.r.Client.List(context.Background(), &remaining))
-	assert.Empty(t, remaining.Items)
-}
-
-// Losing the Talos connection must not delete the machine out from under a member that is still
-// in the etcd cluster: the legacy path aborts before the delete request, as it always has.
-func TestDeleteControlPlaneMachine_UnhookedVictimAbortsWhenTalosIsUnreachable(t *testing.T) {
-	tcp := newPreTerminateTCP()
-	victim := newPTMachine(tcp, "cp-1")
-
-	f := newPreTerminateFixture(t, victim)
-	f.dialer.dialErrs["cp-1"] = fmt.Errorf("talosconfig secret is missing")
-
-	workload := fake.NewClientBuilder().WithScheme(preTerminateScheme(t)).Build()
-
-	res, err := f.r.deleteControlPlaneMachine(context.Background(), workload, f.tcp, victim)
-	require.Error(t, err)
-	assert.Positive(t, res.RequeueAfter)
-
-	var remaining clusterv1.MachineList
-	require.NoError(t, f.r.Client.List(context.Background(), &remaining))
-	assert.Len(t, remaining.Items, 1)
-}
-
 // The handler is wired ahead of every gate that can park the reconcile: a cluster that has not
 // published a control plane endpoint yet must still be able to finish a machine deletion.
 func TestReconcile_ServicesHooksBeforeTheControlPlaneEndpointGate(t *testing.T) {
@@ -880,4 +829,111 @@ func TestReconcile_ServicesHooksWhenTheInfraTemplateIsMissing(t *testing.T) {
 	require.Error(t, err, "the unresolvable template is still reported")
 
 	assert.False(t, f.hasHook(t, "cp-1"), "the deletion is serviced before the template gate")
+}
+
+// --- quorum safeguard ------------------------------------------------------
+
+// threeMemberFixture is a three-member control plane with cp-1 waiting at the pre-terminate
+// phase, cp-2 the peer that lists the members, and cp-3 as given (nil: not configured, so a
+// dial error can be set instead).
+func threeMemberFixture(t *testing.T, third *fakeEtcdCalls, victimMutators ...func(*clusterv1.Machine)) *preTerminateFixture {
+	t.Helper()
+
+	tcp := newPreTerminateTCP()
+
+	mutators := append([]func(*clusterv1.Machine){
+		ptHooked,
+		ptDeleting(time.Now(), clusterv1.MachineDeletingWaitingForPreTerminateHookReason),
+	}, victimMutators...)
+	victim := newPTMachine(tcp, "cp-1", mutators...)
+
+	f := newPreTerminateFixture(t, victim, newPTMachine(tcp, "cp-2", ptHooked), newPTMachine(tcp, "cp-3", ptHooked))
+
+	f.dialer.clients["cp-2"] = &fakeEtcdCalls{
+		name:     "cp-2",
+		members:  []*machineapi.EtcdMember{{Id: 1, Hostname: "cp-1"}, {Id: 2, Hostname: "cp-2"}, {Id: 3, Hostname: "cp-3"}},
+		services: runningEtcd(),
+	}
+	f.dialer.clients["cp-1"] = &fakeEtcdCalls{name: "cp-1", services: runningEtcd()}
+
+	if third != nil {
+		f.dialer.clients["cp-3"] = third
+	}
+
+	return f
+}
+
+func TestPreTerminateHook_HoldsWhenRemovalWouldLoseQuorum(t *testing.T) {
+	f := threeMemberFixture(t, &fakeEtcdCalls{name: "cp-3", services: unhealthyEtcd()})
+
+	res, err := f.run(context.Background())
+	require.NoError(t, err, "a quorum hold is not a failure")
+
+	assert.Equal(t, preTerminateRequeueAfter, res.RequeueAfter)
+	assert.True(t, f.hasHook(t, "cp-1"), "the member stays until a majority would survive its removal")
+	assert.Zero(t, f.dialer.clients["cp-1"].leaveCalls)
+	assert.Empty(t, f.dialer.clients["cp-2"].removedIDs)
+
+	events := strings.Join(f.events(), "\n")
+	assert.Contains(t, events, etcdQuorumAtRiskEvent)
+	assert.Contains(t, events, "1 healthy members of 2, below the quorum of 2")
+
+	_, anchored := f.get(t, "cp-1").Annotations[etcdCleanupObservedAtAnnotation]
+	assert.False(t, anchored, "the fail-open clock does not run during a quorum hold")
+}
+
+func TestPreTerminateHook_UnreachablePeerCountsAgainstQuorum(t *testing.T) {
+	f := threeMemberFixture(t, nil)
+	f.dialer.dialErrs["cp-3"] = fmt.Errorf("connection refused")
+
+	_, err := f.run(context.Background())
+	require.NoError(t, err)
+
+	assert.True(t, f.hasHook(t, "cp-1"))
+	assert.Zero(t, f.dialer.clients["cp-1"].leaveCalls)
+}
+
+func TestPreTerminateHook_QuorumHoldIgnoresTheDeadline(t *testing.T) {
+	f := threeMemberFixture(t, &fakeEtcdCalls{name: "cp-3", services: unhealthyEtcd()}, ptObservedAt(time.Now().Add(-time.Hour)))
+
+	_, err := f.run(context.Background())
+	require.NoError(t, err)
+
+	assert.True(t, f.hasHook(t, "cp-1"), "quorum loss never fails open")
+	assert.NotContains(t, strings.Join(f.events(), "\n"), etcdCleanupOrphanedEvent)
+}
+
+func TestPreTerminateHook_ProceedsWhenQuorumIsKept(t *testing.T) {
+	f := threeMemberFixture(t, &fakeEtcdCalls{name: "cp-3", services: runningEtcd()})
+
+	_, err := f.run(context.Background())
+	require.NoError(t, err)
+
+	assert.False(t, f.hasHook(t, "cp-1"))
+	assert.Equal(t, 1, f.dialer.clients["cp-1"].leaveCalls)
+}
+
+// A peer that is itself deleting but whose etcd is still running is still a voting member.
+func TestPreTerminateHook_CountsADeletingPeerWithRunningEtcd(t *testing.T) {
+	tcp := newPreTerminateTCP()
+	now := time.Now()
+
+	victim := newPTMachine(tcp, "cp-1", ptHooked, ptDeleting(now, clusterv1.MachineDeletingWaitingForPreTerminateHookReason))
+	peer := newPTMachine(tcp, "cp-2", ptHooked)
+	alsoDeleting := newPTMachine(tcp, "cp-3", ptHooked, ptDeleting(now.Add(time.Minute), clusterv1.MachineDeletingDrainingNodeReason))
+
+	f := newPreTerminateFixture(t, victim, peer, alsoDeleting)
+	f.dialer.clients["cp-2"] = &fakeEtcdCalls{
+		name:     "cp-2",
+		members:  []*machineapi.EtcdMember{{Id: 1, Hostname: "cp-1"}, {Id: 2, Hostname: "cp-2"}, {Id: 3, Hostname: "cp-3"}},
+		services: runningEtcd(),
+	}
+	f.dialer.clients["cp-1"] = &fakeEtcdCalls{name: "cp-1", services: runningEtcd()}
+	f.dialer.clients["cp-3"] = &fakeEtcdCalls{name: "cp-3", services: runningEtcd()}
+
+	_, err := f.run(context.Background())
+	require.NoError(t, err)
+
+	assert.False(t, f.hasHook(t, "cp-1"), "cp-2 and cp-3 both still vote, so cp-1 may leave")
+	assert.True(t, f.hasHook(t, "cp-3"), "one membership change at a time")
 }
