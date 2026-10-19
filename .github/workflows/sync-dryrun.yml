@@ -8,7 +8,9 @@ on:
         description: "Override base (forced day-4 exercise only); default origin/main"
         required: false
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+  issues: write
 concurrency:
   group: sync-dryrun
   cancel-in-progress: false
@@ -16,15 +18,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - id: app
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.SYNC_APP_ID }}
-          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ steps.app.outputs.token }}
+          token: ${{ github.token }}
       - name: add upstream remote
         env: { UPSTREAM_URL: "${{ vars.UPSTREAM_URL }}" }
         run: |
@@ -32,7 +29,7 @@ jobs:
           git remote add upstream "$UPSTREAM_URL"
       - run: ./hack/sync-dryrun.sh
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           SYNC_TARGET: ${{ vars.SYNC_TARGET || 'upstream/main' }}
           BASE_REF: ${{ inputs.base_ref || 'origin/main' }}
       - uses: actions/upload-artifact@v4
