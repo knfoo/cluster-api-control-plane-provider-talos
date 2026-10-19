@@ -11,6 +11,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  metadata: read
 concurrency:
   group: sync-dryrun
   cancel-in-progress: false
