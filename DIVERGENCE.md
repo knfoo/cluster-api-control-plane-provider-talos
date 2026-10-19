@@ -30,25 +30,27 @@ the drop below.
 
 | # | Patch | Title | Category | ADR |
 |---|---|---|---|---|
-| 1 | `80af87e` | docs: record kit commits in divergence ledger | tooling | ADR-0001 |
-| 2 | `e07eba7` | docs(phase0): add ADR-0001 (proposed) | tooling | ADR-0001 |
-| 3 | `50d08b3` | chore(phase0): add fork-maintenance kit (baseline, sync dry-run, workflows) | tooling | ADR-0001 |
-| 4 | `a28f508` | docs: record kit commits in divergence ledger | tooling | ADR-0001 |
-| 5 | `5689939` | chore(phase0): fix fork-maintenance kit - baseline | tooling | ADR-0001 |
-| 6 | `3811324` | fix: make invalid-template webhook fixture pass CRD schema validation | local | ADR-0002 |
-| 7 | `47c1442` | fix(test): reach the webhook in invalid-template fixture (ADR-0002, local) | tooling | ADR-0002 |
-| 8 | `56a4e10` | chore(phase0): fix fork-maintenance kit - baseline | tooling | ADR-0001 |
-| 9 | `bee62d1` | docs: audit ledger — 8/8 commits categorized (3811324 local/ADR-0002) | tooling | ADR-0001 |
-| 10 | `b85eea6` | chore(phase0): kit v3 (json guards, sync on main, capi-watch, ledger-check) | tooling | ADR-0001 |
-| 11 | `2823e95` | docs(phase0): baseline evidence (kit v3) | tooling | ADR-0001 |
-| 12 | `75f1c25` | chore(phase0): fix sync-dryrun workflow to use GITHUB_TOKEN | tooling | ADR-0001 |
-| 13 | `e9799e8` | chore(phase0): handle label errors gracefully in sync-dryrun | tooling | ADR-0001 |
-| 14 | `79ca8ef` | chore(phase0): update workflow permissions | tooling | ADR-0001 |
-| 15 | `865dc0c` | chore(phase0): fix workflow permissions | tooling | ADR-0001 |
-| 16 | `2e07fdc` | docs(phase0): update ADR-0001 to accepted with Day 4 evidence and go/no-go note | tooling | ADR-0001 |
-| 17 | `0b92f50` | fix(phase0): pin gh to our own repo, restore the GitHub App token for sync | tooling | ADR-0001 |
-| 18 | `d752b3a` | docs(phase0): accept ADR-0001 with dry-run and capi evidence | tooling | ADR-0001 |
-| 19 | `d353fef` | fix(phase0): kit review fixes (zero-test guard, tag, pin, touched files) | tooling | ADR-0001 |
+| 1 | `8b46438` | docs: record kit commits in divergence ledger | tooling | ADR-0001 |
+| 2 | `d1b8b26` | docs(phase0): add ADR-0001 (proposed) | tooling | ADR-0001 |
+| 3 | `af65033` | chore(phase0): add fork-maintenance kit (baseline, sync dry-run, workflows) | tooling | ADR-0001 |
+| 4 | `6fc0bdd` | docs: record kit commits in divergence ledger | tooling | ADR-0001 |
+| 5 | `fe645d9` | chore(phase0): fix fork-maintenance kit - baseline | tooling | ADR-0001 |
+| 6 | `c3a21e2` | fix(test): reach the webhook in invalid-template fixture (ADR-0002, local) | tooling | ADR-0002 |
+| 7 | `994ace0` | chore(phase0): fix fork-maintenance kit - baseline | tooling | ADR-0001 |
+| 8 | `a6239c3` | docs: audit ledger — 8/8 commits categorized (3811324 local/ADR-0002) | tooling | ADR-0001 |
+| 9 | `68bf355` | chore(phase0): kit v3 (json guards, sync on main, capi-watch, ledger-check) | tooling | ADR-0001 |
+| 10 | `c123297` | docs(phase0): baseline evidence (kit v3) | tooling | ADR-0001 |
+| 11 | `b5447d0` | chore(phase0): fix sync-dryrun workflow to use GITHUB_TOKEN | tooling | ADR-0001 |
+| 12 | `e8c72e3` | chore(phase0): handle label errors gracefully in sync-dryrun | tooling | ADR-0001 |
+| 13 | `322e1b3` | chore(phase0): update workflow permissions | tooling | ADR-0001 |
+| 14 | `31e7aab` | chore(phase0): fix workflow permissions | tooling | ADR-0001 |
+| 15 | `4ec7db5` | docs(phase0): update ADR-0001 to accepted with Day 4 evidence and go/no-go note | tooling | ADR-0001 |
+| 16 | `2a84a41` | fix(phase0): pin gh to our own repo, restore the GitHub App token for sync | tooling | ADR-0001 |
+| 17 | `85b7637` | docs(phase0): accept ADR-0001 with dry-run and capi evidence | tooling | ADR-0001 |
+| 18 | `504a031` | fix(phase0): kit review fixes (zero-test guard, tag, pin, touched files) | tooling | ADR-0001 |
+| 19 | `3517ccc` | docs(phase0): baseline evidence after kit review fixes | tooling | ADR-0001 |
+| 20 | `a0a87fa` | feat(phase0): known-red baselines via KNOWN_RED_ALLOW | tooling | ADR-0001 |
+| 21 | `e8781c1` | docs(phase0): re-baseline on siderolabs CACPPT (ADR-0003) | tooling | ADR-0003 |
 
 ## Dropped / absorbed upstream
 
