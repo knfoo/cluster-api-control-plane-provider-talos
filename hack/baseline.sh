@@ -14,6 +14,7 @@ MIN_DURATION_S="${MIN_DURATION_S:-2}"
 MUST_RUN_FILE="${MUST_RUN_FILE:-hack/must-run.txt}"
 PREV_BASELINE="${PREV_BASELINE:-evidence/baseline/baseline.json}"
 RATCHET_ALLOW="${RATCHET_ALLOW:-}"       # set to an ADR id to accept a lower test count
+KNOWN_RED_ALLOW="${KNOWN_RED_ALLOW:-}"   # set to an ADR id to accept zero passing tests as known-red
 
 # --- toolchain, derived from go.mod ----------------------------------------
 modver() { go list -m -f '{{.Version}}' "$1" 2>/dev/null || echo "absent"; }
@@ -100,7 +101,14 @@ fail() { TEST_STATUS=failed; REASONS="${REASONS}${REASONS:+; }$1"; echo "GUARD: 
 if [ "$RC" -ne 0 ]; then fail "go test exited $RC"; fi
 if [ "$PKGS_OK" -eq 0 ]; then fail "no package passed"; fi
 # a package passes even when every test in it is skipped (day-4: CABPT on siderolabs)
-if [ "$TESTS_PASSED" -eq 0 ]; then fail "no test passed"; fi
+KNOWN_RED=0
+if [ "$TESTS_PASSED" -eq 0 ]; then
+  if [ -n "$KNOWN_RED_ALLOW" ]; then
+    KNOWN_RED=1; echo "known-red: no test passed, accepted per $KNOWN_RED_ALLOW" >&2
+  else
+    fail "no test passed"
+  fi
+fi
 # day-2 lesson 4: a sub-floor green means the suite never ran
 if [ "$DURATION" -lt "$MIN_DURATION_S" ]; then fail "suite finished in ${DURATION}s (< ${MIN_DURATION_S}s floor)"; fi
 
@@ -129,6 +137,9 @@ if [ -n "$PREV_PASSED" ] && [ "$TESTS_PASSED" -lt "$PREV_PASSED" ]; then
   fi
 fi
 
+# a known-red run passed every other guard; record it as such, never as green
+if [ "$TEST_STATUS" = green ] && [ "$KNOWN_RED" -eq 1 ]; then TEST_STATUS=known-red; fi
+
 # --- evidence ----------------------------------------------------------------
 jq -n \
   --arg repo "$(basename "$PWD")" --arg started "$START" --arg date "$END" \
@@ -143,8 +154,9 @@ jq -n \
   --argjson tests_passed "$TESTS_PASSED" --argjson tests_failed "$TESTS_FAILED" \
   --argjson tests_skipped "$TESTS_SKIPPED" --arg prev_tests_passed "$PREV_PASSED" \
   --arg must_run_missing "$MUST_RUN_MISSING" --arg ratchet_allow "$RATCHET_ALLOW" \
+  --arg known_red_allow "$KNOWN_RED_ALLOW" \
   --arg tests "$TEST_STATUS" --arg guard_reasons "$REASONS" \
   '{kind:"baseline", phase:"0"} + $ARGS.named' > _out/baseline.json
 
 cat _out/baseline.json
-test "$TEST_STATUS" = green
+[ "$TEST_STATUS" = green ] || [ "$TEST_STATUS" = known-red ]
