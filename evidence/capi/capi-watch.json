@@ -2,11 +2,11 @@
   "kind": "capi-watch",
   "phase": "0",
   "repo": "cluster-api-control-plane-provider-talos",
-  "date": "2026-10-19T17:01:54Z",
-  "capi_current": "v1.14.2",
+  "date": "2026-10-19T18:03:32Z",
+  "capi_current": "v1.10.9",
   "capi_latest": "v1.14.3",
   "sibling_repo": "knfoo/cluster-api-bootstrap-provider-talos",
-  "capi_sibling": "v1.14.2",
-  "minor_lag": false,
-  "sibling_mismatch": false
+  "capi_sibling": "v1.12.11",
+  "minor_lag": true,
+  "sibling_mismatch": true
 }
