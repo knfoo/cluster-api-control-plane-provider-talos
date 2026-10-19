@@ -1,0 +1,24 @@
+name: baseline
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: add upstream remote
+        run: git remote add upstream "${{ vars.UPSTREAM_URL }}" && git fetch upstream --tags --prune
+      - run: ./hack/baseline.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-${{ github.sha }}
+          path: _out/baseline.json
+          if-no-files-found: warn

@@ -1,0 +1,23 @@
+name: sync-dryrun
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: add upstream remote
+        run: git remote add upstream "${{ vars.UPSTREAM_URL }}" && git fetch upstream --tags --prune
+      - run: ./hack/sync-dryrun.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REMOTE: upstream
