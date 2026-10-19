@@ -78,7 +78,9 @@ if [ "$RC" -ne 0 ]; then
     echo; echo "If a conflicted file is covered by a \`local\` ADR, apply that ADR's revisit rule."
     echo "Informational only; no branch was created."
   } > "$OUT/body.md"
-  URL=$(gh issue create --title "sync dry-run conflicts: $SHORT" --body-file "$OUT/body.md" --label sync-dryrun)
+  URL=$(gh issue create --title "sync dry-run conflicts: $SHORT" --body-file "$OUT/body.md")
+  # Try to add the label; don't fail if it doesn't work (workflow token permissions)
+  gh issue edit "$URL" --add-label sync-dryrun 2>/dev/null || true
   outcome conflicts "$CONFLICTS" "$URL"; exit 0
 fi
 
@@ -91,5 +93,7 @@ git commit -q -m "sync: merge $SYNC_TARGET ($SHORT) (dry-run)"
 } > "$OUT/body.md"
 git push -q origin "$BRANCH"
 URL=$(gh pr create --draft --title "sync dry-run: $SHORT" --body-file "$OUT/body.md" \
-  --label sync-dryrun --base "$BASE_BRANCH" --head "$BRANCH")
+  --base "$BASE_BRANCH" --head "$BRANCH")
+# Try to add the label; don't fail if it doesn't work (workflow token permissions)
+gh pr edit "$URL" --add-label sync-dryrun 2>/dev/null || true
 outcome clean "" "$URL"
