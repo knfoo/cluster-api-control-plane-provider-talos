@@ -10,19 +10,16 @@ import (
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	runtime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 // SetupWebhookWithManager implements webhook methods.
 func (r *TalosControlPlane) SetupWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(r).
+	return ctrl.NewWebhookManagedBy(mgr, r).
 		WithDefaulter(r).
 		WithValidator(r).
 		Complete()
@@ -32,15 +29,13 @@ func (r *TalosControlPlane) SetupWebhookWithManager(mgr ctrl.Manager) error {
 //+kubebuilder:webhook:verbs=create;update;delete,path=/validate-controlplane-cluster-x-k8s-io-v1alpha3-taloscontrolplane,mutating=false,failurePolicy=fail,groups=controlplane.cluster.x-k8s.io,resources=taloscontrolplanes,versions=v1alpha3,name=validate.taloscontrolplane.controlplane.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1
 
 var (
-	_ webhook.CustomDefaulter = &TalosControlPlane{}
-	_ webhook.CustomValidator = &TalosControlPlane{}
+	_ admission.Defaulter[*TalosControlPlane] = &TalosControlPlane{}
+	_ admission.Validator[*TalosControlPlane] = &TalosControlPlane{}
 )
 
 // Default implements webhook.Defaulter so a webhook will be registered for the type.
-func (r *TalosControlPlane) Default(ctx context.Context, obj runtime.Object) error {
-	r = obj.(*TalosControlPlane)
-
-	defaultTalosControlPlaneSpec(&r.Spec, r.Namespace)
+func (r *TalosControlPlane) Default(ctx context.Context, obj *TalosControlPlane) error {
+	defaultTalosControlPlaneSpec(&obj.Spec, obj.Namespace)
 
 	return nil
 }
@@ -86,21 +81,17 @@ func defaultRolloutStrategy(rolloutStrategy *RolloutStrategy) *RolloutStrategy {
 }
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
-func (r *TalosControlPlane) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	r = obj.(*TalosControlPlane)
-
+func (r *TalosControlPlane) ValidateCreate(ctx context.Context, obj *TalosControlPlane) (admission.Warnings, error) {
 	return r.validate()
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (r *TalosControlPlane) ValidateUpdate(ctx context.Context, oldObj runtime.Object, newObj runtime.Object) (admission.Warnings, error) {
-	r = newObj.(*TalosControlPlane)
-
-	return r.validate()
+func (r *TalosControlPlane) ValidateUpdate(ctx context.Context, oldObj, newObj *TalosControlPlane) (admission.Warnings, error) {
+	return newObj.validate()
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type
-func (r *TalosControlPlane) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+func (r *TalosControlPlane) ValidateDelete(ctx context.Context, obj *TalosControlPlane) (admission.Warnings, error) {
 	return nil, nil
 }
 
