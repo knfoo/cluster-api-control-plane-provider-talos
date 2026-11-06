@@ -12,12 +12,16 @@ import (
 	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1alpha3"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/collections"
-	"sigs.k8s.io/cluster-api/util/conditions"
-	"sigs.k8s.io/cluster-api/util/patch"
+	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions"
+	v1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+	conditions "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions"
+	"sigs.k8s.io/cluster-api/util/deprecated/v1beta1/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -28,7 +32,7 @@ func (r *TalosControlPlaneReconciler) scaleUpControlPlane(ctx context.Context, c
 	numMachines := len(controlPlane.Machines)
 	desiredReplicas := tcp.Spec.GetReplicas()
 
-	conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingUpReason, clusterv1.ConditionSeverityWarning,
+	conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingUpReason, clusterv1beta1.ConditionSeverityWarning,
 		"Scaling up control plane to %d replicas (actual %d)",
 		desiredReplicas, numMachines)
 
@@ -49,17 +53,17 @@ func (r *TalosControlPlaneReconciler) scaleDownControlPlane(
 	desiredReplicas := tcp.Spec.GetReplicas()
 
 	if unhealthy := controlPlane.UnhealthyMachines(); unhealthy.Len() > 0 {
-		conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingDownReason, clusterv1.ConditionSeverityWarning,
+		conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingDownReason, clusterv1beta1.ConditionSeverityWarning,
 			"Remediating unhealthy control plane machines %v (%d replicas, %d desired)",
 			unhealthy.Names(), numMachines, desiredReplicas)
 	} else {
-		conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingDownReason, clusterv1.ConditionSeverityWarning,
+		conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingDownReason, clusterv1beta1.ConditionSeverityWarning,
 			"Scaling down control plane to %d replicas (actual %d)",
 			desiredReplicas, numMachines)
 	}
 
 	if numMachines == 1 {
-		conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingDownReason, clusterv1.ConditionSeverityError,
+		conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, controlplanev1.ScalingDownReason, clusterv1beta1.ConditionSeverityError,
 			"Cannot scale down control plane nodes to 0")
 
 		return ctrl.Result{}, nil
@@ -85,7 +89,7 @@ func (r *TalosControlPlaneReconciler) scaleDownControlPlane(
 
 	r.Log.Info("scaling down control plane", "Desired", desiredReplicas, "Existing", numMachines)
 
-	client, err := r.Tracker.GetClient(ctx, util.ObjectKey(cluster))
+	client, err := r.ClusterCache.GetClient(ctx, util.ObjectKey(cluster))
 	if err != nil {
 		return ctrl.Result{RequeueAfter: 20 * time.Second}, err
 	}
@@ -102,7 +106,7 @@ func (r *TalosControlPlaneReconciler) scaleDownControlPlane(
 	for _, machine := range controlPlane.Machines {
 		// do not allow scaling down until all nodes have nodeRefs, except for a machine flagged for
 		// remediation: it may never get one (e.g. it failed to boot), and it is removed first anyway
-		if machine.Status.NodeRef == nil {
+		if !machine.Status.NodeRef.IsDefined() {
 			if needsRemediation(machine) {
 				continue
 			}
@@ -144,7 +148,13 @@ func (r *TalosControlPlaneReconciler) scaleDownControlPlane(
 
 	if needsRemediation(deleteMachine) {
 		// surface to the MachineHealthCheck controller that the owner picked the machine up for remediation
-		conditions.MarkFalse(deleteMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.RemediationInProgressReason, clusterv1.ConditionSeverityWarning, "")
+		v1beta2conditions.Set(deleteMachine, metav1.Condition{
+			Type:   clusterv1.MachineOwnerRemediatedCondition,
+			Status: metav1.ConditionFalse,
+			Reason: clusterv1.RemediationInProgressV1Beta1Reason,
+		})
+		v1beta1conditions.MarkFalse(deleteMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition,
+			clusterv1.RemediationInProgressV1Beta1Reason, clusterv1.ConditionSeverityWarning, "")
 	}
 
 	if err := patchHelper.Patch(ctx, deleteMachine); err != nil {
@@ -155,7 +165,7 @@ func (r *TalosControlPlaneReconciler) scaleDownControlPlane(
 	// registered a node, so there is nothing to drain or delete in the workload cluster, and it
 	// might not even be reachable to leave etcd gracefully: if it did join etcd, auditEtcd removes
 	// the member as an orphan once the machine is gone.
-	if deleteMachine.Status.NodeRef == nil {
+	if !deleteMachine.Status.NodeRef.IsDefined() {
 		if err := r.Client.Delete(ctx, deleteMachine); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -196,7 +206,7 @@ func (r *TalosControlPlaneReconciler) scaleDownControlPlane(
 
 // nodeName returns the name of the node the machine registered, or an empty string if it has none yet.
 func nodeName(machine *clusterv1.Machine) string {
-	if machine.Status.NodeRef == nil {
+	if !machine.Status.NodeRef.IsDefined() {
 		return ""
 	}
 
@@ -206,7 +216,7 @@ func nodeName(machine *clusterv1.Machine) string {
 func (r *TalosControlPlaneReconciler) deleteNode(ctx context.Context, client client.Client, machine *clusterv1.Machine) (ctrl.Result, error) {
 	var node v1.Node
 
-	name := types.NamespacedName{Name: machine.Status.NodeRef.Name, Namespace: machine.Status.NodeRef.Namespace}
+	name := types.NamespacedName{Name: machine.Status.NodeRef.Name}
 
 	err := client.Get(ctx, name, &node)
 	if err != nil {
