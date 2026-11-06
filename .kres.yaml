@@ -16,6 +16,7 @@ spec:
         - _string.go
         - _enumer.go
         - _string_linux.go
+        - zz_generated.conversion.go
         - zz_generated.deepcopy.go
       header: |
         // This Source Code Form is subject to the terms of the Mozilla Public
@@ -43,6 +44,9 @@ spec:
       buildxOptions:
         enabled: true
       runnerGroup: generic
+      # covers the build, the e2e suite (E2E_TEST_TIMEOUT in hack/test/e2e-aws.sh) and the bounded
+      # workload cluster deletion on failure, so that CAPA can always deprovision the AWS resources
+      timeoutMinutes: 120
       conditions:
         - on-pull-request
       steps:
