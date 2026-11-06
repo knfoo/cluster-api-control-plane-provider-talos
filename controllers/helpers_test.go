@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/gobuffalo/flect"
+	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 	bootstrapv1alpha3 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	"github.com/siderolabs/crypto/tls"
@@ -37,6 +38,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -45,12 +47,13 @@ import (
 	"k8s.io/utils/pointer"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1alpha3"
+	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
 	"github.com/siderolabs/cluster-api-control-plane-provider-talos/controllers"
 )
 
@@ -70,7 +73,7 @@ func withCluster(key types.NamespacedName) reconcilerOption {
 	}
 }
 
-func newReconciler(client client.Client, opts ...reconcilerOption) *controllers.TalosControlPlaneReconciler {
+func newReconciler(controllerClient client.Client, opts ...reconcilerOption) *controllers.TalosControlPlaneReconciler {
 	logger := zap.New(zap.WriteTo(os.Stdout))
 	logf.SetLogger(logger)
 
@@ -80,15 +83,19 @@ func newReconciler(client client.Client, opts ...reconcilerOption) *controllers.
 		opt(&options)
 	}
 
-	var clusterCache clustercache.ClusterCache
+	clusterKey := client.ObjectKey{}
 	if options.cluster != nil {
-		clusterCache = clustercache.NewFakeClusterCache(client, *options.cluster)
+		clusterKey = client.ObjectKey{
+			Namespace: options.cluster.Namespace,
+			Name:      options.cluster.Name,
+		}
 	}
+	clusterCache := clustercache.NewFakeClusterCache(controllerClient, clusterKey)
 
 	return &controllers.TalosControlPlaneReconciler{
-		Client:       client,
+		Client:       controllerClient,
 		Log:          logger,
-		APIReader:    client,
+		APIReader:    controllerClient,
 		ClusterCache: clusterCache,
 	}
 }
@@ -96,7 +103,6 @@ func newReconciler(client client.Client, opts ...reconcilerOption) *controllers.
 func newFakeClient(initObjs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithObjects(initObjs...).
-		WithObjects(GenericInfrastructureMachineCRD).
 		WithScheme(fakeScheme).
 		WithStatusSubresource(
 			&clusterv1.Cluster{},
@@ -173,15 +179,19 @@ func createMachineNodePair(name string, cluster *clusterv1.Cluster, tcp *control
 		Spec: clusterv1.MachineSpec{
 			ClusterName: cluster.Name,
 			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
-				APIGroup: InfrastructureGroupVersion.Group,
-				Kind:     GenericInfrastructureMachineKind,
-				Name:     GenericInfrastructureMachineCRD.Name,
+				Kind:     GenericInfrastructureMachineCRD.Spec.Names.Kind,
+				APIGroup: GenericInfrastructureMachineCRD.Spec.Group,
+				Name:     name + "-infra",
 			},
-			Deletion: clusterv1.MachineDeletionSpec{NodeDeletionTimeoutSeconds: pointer.Int32(10)},
-			Version:  "v1.16.6",
+			Deletion: clusterv1.MachineDeletionSpec{
+				NodeDrainTimeoutSeconds: pointer.Int32(10),
+			},
+			Version: "v1.16.6",
 		},
 		Status: clusterv1.MachineStatus{
-			NodeRef: clusterv1.MachineNodeReference{Name: name},
+			NodeRef: clusterv1.MachineNodeReference{
+				Name: name,
+			},
 			Addresses: clusterv1.MachineAddresses{
 				{
 					Type:    clusterv1.MachineInternalIP,
@@ -191,7 +201,38 @@ func createMachineNodePair(name string, cluster *clusterv1.Cluster, tcp *control
 		},
 	}
 
+	if ready {
+		setMachineReadyAndAvailable(machine)
+	}
+
 	return machine, createNode(machine, ready)
+}
+
+// setMachineReadyAndAvailable sets the Ready and Available conditions that the Cluster API Machine controller
+// would set on a healthy Machine.
+func setMachineReadyAndAvailable(machine *clusterv1.Machine) {
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:   clusterv1.MachineReadyCondition,
+		Status: metav1.ConditionTrue,
+		Reason: clusterv1.MachineReadyReason,
+	})
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:   clusterv1.MachineAvailableCondition,
+		Status: metav1.ConditionTrue,
+		Reason: clusterv1.MachineAvailableReason,
+	})
+}
+
+// expectCondition checks the status and reason of a condition on obj.
+func expectCondition(g Gomega, obj conditions.Getter, conditionType string, status metav1.ConditionStatus, reason string) {
+	condition := conditions.Get(obj, conditionType)
+	g.Expect(condition).NotTo(BeNil(), "condition %s is not set", conditionType)
+	g.Expect(condition.Status).To(Equal(status), "condition %s: %s", conditionType, condition.Message)
+	g.Expect(condition.Reason).To(Equal(reason), "condition %s: %s", conditionType, condition.Message)
+}
+
+func machineNames(machines []clusterv1.Machine) []string {
+	return xslices.Map(machines, func(m clusterv1.Machine) string { return m.Name })
 }
 
 func createNode(machine *clusterv1.Machine, ready bool) *corev1.Node {
@@ -263,7 +304,7 @@ func MustFormatValue(str string) string {
 
 var (
 	// InfrastructureGroupVersion is group version used for infrastructure objects.
-	InfrastructureGroupVersion = schema.GroupVersion{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta1"}
+	InfrastructureGroupVersion = schema.GroupVersion{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2"}
 
 	// GenericInfrastructureMachineKind is the Kind for the GenericInfrastructureMachine.
 	GenericInfrastructureMachineKind = "GenericInfrastructureMachine"
@@ -294,7 +335,7 @@ func generateCRD(gvk schema.GroupVersionKind, properties map[string]apiextension
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("%s.%s", flect.Pluralize(strings.ToLower(gvk.Kind)), gvk.Group),
 			Labels: map[string]string{
-				clusterv1.GroupVersion.String(): "v1beta1",
+				clusterv1.GroupVersion.String(): "v1beta2",
 			},
 		},
 		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
@@ -404,6 +445,14 @@ type machineService struct {
 
 	requestsMu               sync.Mutex
 	etcdRemoveMemberRequests []*machine.EtcdRemoveMemberByIDRequest
+	etcdLeaveClusterRequests int
+}
+
+func (ms *machineService) getEtcdLeaveClusterRequests() int {
+	ms.requestsMu.Lock()
+	defer ms.requestsMu.Unlock()
+
+	return ms.etcdLeaveClusterRequests
 }
 
 func (ms *machineService) getEtcdRemoveMemberRequests() map[uint64]any {
@@ -511,6 +560,11 @@ func (ms *machineService) EtcdRemoveMemberByID(ctx context.Context, req *machine
 }
 
 func (ms *machineService) EtcdLeaveCluster(ctx context.Context, req *machine.EtcdLeaveClusterRequest) (*machine.EtcdLeaveClusterResponse, error) {
+	ms.requestsMu.Lock()
+	defer ms.requestsMu.Unlock()
+
+	ms.etcdLeaveClusterRequests++
+
 	return &machine.EtcdLeaveClusterResponse{}, nil
 }
 
