@@ -72,6 +72,10 @@ type TalosControlPlaneReconciler struct {
 	Scheme       *runtime.Scheme
 	ClusterCache clustercache.ClusterCache
 
+	// RuntimeClient is Cluster API's Runtime SDK client, the source of the in-place update extensions.
+	// It is only consulted when the InPlaceUpdates feature gate is enabled, which is off by default.
+	RuntimeClient RuntimeClient
+
 	// etcd runs etcd operations on individual machines; nil means through the Talos API.
 	etcd etcdMemberManager
 

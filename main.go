@@ -25,6 +25,7 @@ import (
 	logsv1 "k8s.io/component-base/logs/api/v1"
 	"k8s.io/klog/v2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	runtimev1beta2 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache" // for remote cluster client builder
 	"sigs.k8s.io/cluster-api/controllers/remote"
 	"sigs.k8s.io/cluster-api/util/flags"
@@ -56,6 +57,7 @@ func init() {
 	_ = bootstrapv1alpha3.AddToScheme(scheme)
 	_ = controlplanev1alpha3.AddToScheme(scheme)
 	_ = controlplanev1beta1.AddToScheme(scheme)
+	_ = runtimev1beta2.AddToScheme(scheme)
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -166,12 +168,18 @@ func main() {
 		setupLog.Error(err, "unable to create cluster cache")
 		os.Exit(1)
 	}
+	// The Runtime SDK client behind the in-place update decision. KubeadmControlPlane wires its runtime
+	// client into the reconciler the same way; Cluster API's own client lives in internal/ packages a
+	// provider cannot import, so controllers.NewRuntimeClient mirrors its extension lookup. It is only
+	// consulted while the InPlaceUpdates feature gate is enabled, which stays off by default.
+	runtimeClient := controllers.NewRuntimeClient(mgr.GetClient())
 	if err = (&controllers.TalosControlPlaneReconciler{
-		Client:       mgr.GetClient(),
-		APIReader:    mgr.GetAPIReader(),
-		Log:          ctrl.Log.WithName("controllers").WithName("TalosControlPlane"),
-		Scheme:       mgr.GetScheme(),
-		ClusterCache: clusterCache,
+		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
+		Log:           ctrl.Log.WithName("controllers").WithName("TalosControlPlane"),
+		Scheme:        mgr.GetScheme(),
+		ClusterCache:  clusterCache,
+		RuntimeClient: runtimeClient,
 	}).SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: 10}); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TalosControlPlane")
 		os.Exit(1)
