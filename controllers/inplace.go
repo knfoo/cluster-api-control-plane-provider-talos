@@ -9,9 +9,11 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimecatalog "sigs.k8s.io/cluster-api/api/runtime/catalog"
@@ -93,6 +95,10 @@ func (c *extensionRuntimeClient) namespaceMatches(ctx context.Context, selector 
 // hook call and the trigger come in the next stage, so a registered extension still falls back to a
 // rollout. Nothing calls this while the InPlaceUpdates feature gate is off, which is the default.
 func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, machine *clusterv1.Machine) (bool, error) {
+	if overrideCanUpdateMachine != nil {
+		return overrideCanUpdateMachine(ctx, machine)
+	}
+
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", klog.KObj(machine))
 
 	// Machine cannot be updated in-place if the feature gate is not enabled (inplace_canupdatemachine.go:52).
@@ -120,4 +126,67 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 	log.Info("Machine cannot be updated in-place yet: the CanUpdateMachine hook is not implemented", "extension", extensionHandlers[0])
 
 	return false, nil
+}
+
+// UpToDateResult carries the current and desired objects of one control plane Machine that is not up
+// to date, the fork's counterpart of the UpToDateResult KubeadmControlPlane builds before it decides
+// between an in-place update and a rollout (inplace.go:44-53, inplace_trigger.go:81-84).
+//
+// A nil DesiredInfraMachine or DesiredTalosConfig means the objects the in-place update would write
+// could not be computed, which makes the Machine roll out like today.
+type UpToDateResult struct {
+	DesiredMachine      *clusterv1.Machine
+	CurrentInfraMachine *unstructured.Unstructured
+	DesiredInfraMachine *unstructured.Unstructured
+	CurrentTalosConfig  *cabptv1.TalosConfig
+	DesiredTalosConfig  *cabptv1.TalosConfig
+}
+
+// Test seams for the in-place update path. KubeadmControlPlane keeps the equivalent fields on its
+// Reconciler (inplace.go:39-41), used by its tests (inplace_test.go:40-66); the reconciler struct of
+// this fork belongs to stage L2, so the seams are package level here. They are nil unless a test sets
+// them, so the production path always runs canUpdateMachine and triggerInPlaceUpdate.
+var (
+	overrideTryInPlaceUpdate     func(ctx context.Context, controlPlane *ControlPlane, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) (bool, error)
+	overrideCanUpdateMachine     func(ctx context.Context, machine *clusterv1.Machine) (bool, error)
+	overrideTriggerInPlaceUpdate func(ctx context.Context, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) error
+)
+
+// tryInPlaceUpdate decides between an in-place update and the scale down that rolls a Machine out,
+// following tryInPlaceUpdate in inplace.go:44-53.
+//
+// It returns fallbackToScaleDown, which tells the caller to delete the Machine as today. Once the
+// UpdateInProgressAnnotation is written the in-place update is in progress and the Machine is never
+// rolled out for that change: canUpdateMachine is only called again if writing the annotation or the
+// scale down itself fails.
+func (r *TalosControlPlaneReconciler) tryInPlaceUpdate(
+	ctx context.Context,
+	controlPlane *ControlPlane,
+	machineToInPlaceUpdate *clusterv1.Machine,
+	machineUpToDateResult UpToDateResult,
+) (bool, error) {
+	if overrideTryInPlaceUpdate != nil {
+		return overrideTryInPlaceUpdate(ctx, controlPlane, machineToInPlaceUpdate, machineUpToDateResult)
+	}
+
+	// A Machine cannot be updated in-place when one of the objects the update would write is missing,
+	// e.g. when the InfraMachine or the TalosConfig was deleted (inplace_canupdatemachine.go:58-63).
+	if machineUpToDateResult.DesiredMachine == nil ||
+		machineUpToDateResult.CurrentInfraMachine == nil ||
+		machineUpToDateResult.DesiredInfraMachine == nil ||
+		machineUpToDateResult.CurrentTalosConfig == nil ||
+		machineUpToDateResult.DesiredTalosConfig == nil {
+		return true, nil
+	}
+
+	canUpdate, err := r.canUpdateMachine(ctx, machineToInPlaceUpdate)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to determine if Machine %s can be updated in-place", machineToInPlaceUpdate.Name)
+	}
+
+	if !canUpdate {
+		return true, nil
+	}
+
+	return false, r.triggerInPlaceUpdate(ctx, machineToInPlaceUpdate, machineUpToDateResult)
 }

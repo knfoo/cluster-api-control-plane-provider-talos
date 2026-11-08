@@ -8,9 +8,11 @@ import (
 	"context"
 
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/collections"
 
 	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
@@ -38,7 +40,37 @@ func (r *TalosControlPlaneReconciler) upgradeControlPlane(
 			return r.scaleUpControlPlane(ctx, cluster, tcp, controlPlane)
 		}
 
-		return r.scaleDownControlPlane(ctx, cluster, tcp, controlPlane, machinesRequireUpgrade)
+		// Without the feature gate, which is off by default, a Machine that is not up to date is
+		// rolled out exactly as before (inplace.go:44-53).
+		if !feature.Gates.Enabled(feature.InPlaceUpdates) {
+			return r.scaleDownControlPlane(ctx, cluster, tcp, controlPlane, machinesRequireUpgrade)
+		}
+
+		// The Machine that would be deleted by the rollout is the one the in-place update is tried
+		// on first.
+		deleteMachine, err := selectMachineForScaleDown(ctx, controlPlane, machinesRequireUpgrade)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "failed to pick Control Plane Machine to scale down")
+		}
+
+		machineUpToDateResult, err := controlPlane.inPlaceUpdateResult(deleteMachine)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "failed to compute the in-place update for Machine %s", klog.KObj(deleteMachine))
+		}
+
+		fallbackToScaleDown, err := r.tryInPlaceUpdate(ctx, controlPlane, deleteMachine, machineUpToDateResult)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "failed to try an in-place update for Machine %s", klog.KObj(deleteMachine))
+		}
+		if !fallbackToScaleDown {
+			// The UpdateInProgressAnnotation and the pending UpdateMachine hook are written: the
+			// Machine is kept and the Machine controller performs the update, so no Machine is
+			// deleted here.
+			logger.Info("Machine is being updated in-place", "Machine", klog.KObj(deleteMachine))
+			return ctrl.Result{}, nil
+		}
+
+		return r.scaleDownControlPlane(ctx, cluster, tcp, controlPlane, collections.Machines{deleteMachine.Name: deleteMachine})
 	case controlplanev1.OnDeleteStrategyType:
 		// nothing to do, scale up handler will take care of creating machines with the new spec
 		return ctrl.Result{}, nil

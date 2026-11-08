@@ -6,6 +6,7 @@ package controllers
 
 import (
 	"context"
+	"maps"
 	"reflect"
 	"slices"
 
@@ -14,7 +15,9 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2/klogr"
@@ -305,4 +308,56 @@ func MatchesControlPlaneConfig(talosConfigs map[string]*cabptv1.TalosConfig, tcp
 
 		return reflect.DeepEqual(tcp.Spec.ControlPlaneConfig.ControlPlaneConfig, talosConfig.Spec)
 	}
+}
+
+// inPlaceUpdateResult computes the objects an in-place update of one Machine would write, the way
+// KubeadmControlPlane builds its UpToDateResult before calling tryInPlaceUpdate (inplace.go:44-53):
+// the desired Machine from the machine template, the desired InfraMachine cloned from the
+// infrastructure template and the desired TalosConfig carrying the control plane configuration.
+//
+// A nil desired object means the update cannot be computed, which makes the Machine roll out as today:
+// that happens when the InfraMachine or the TalosConfig of the Machine is gone, or when the control
+// plane does not have an infrastructure template to clone.
+func (c *ControlPlane) inPlaceUpdateResult(machine *clusterv1.Machine) (UpToDateResult, error) {
+	result := UpToDateResult{
+		DesiredMachine:      computeDesiredMachine(c.TCP, c.Cluster, machine),
+		CurrentInfraMachine: c.infraObjects[machine.Name],
+		CurrentTalosConfig:  c.talosConfigs[machine.Name],
+	}
+
+	if c.infraTemplate == nil || result.CurrentInfraMachine == nil || result.CurrentTalosConfig == nil {
+		return result, nil
+	}
+
+	desiredInfraMachine, err := external.GenerateTemplate(&external.GenerateTemplateInput{
+		Template: c.infraTemplate,
+		TemplateRef: &corev1.ObjectReference{
+			APIVersion: c.infraTemplate.GetAPIVersion(),
+			Kind:       c.infraTemplate.GetKind(),
+			Name:       c.infraTemplate.GetName(),
+			Namespace:  c.infraTemplate.GetNamespace(),
+		},
+		Namespace:   machine.Namespace,
+		Name:        machine.Name,
+		ClusterName: c.Cluster.Name,
+		OwnerRef: &metav1.OwnerReference{
+			APIVersion: controlplanev1.GroupVersion.String(),
+			Kind:       "TalosControlPlane",
+			Name:       c.TCP.Name,
+			UID:        c.TCP.UID,
+		},
+		Labels:      controlPlaneMachineLabelsForCluster(c.TCP, c.Cluster.Name),
+		Annotations: maps.Clone(c.TCP.Spec.MachineTemplate.ObjectMeta.Annotations),
+	})
+	if err != nil {
+		return result, errors.Wrapf(err, "failed to compute the desired infra obj for machine %q", machine.Name)
+	}
+
+	result.DesiredInfraMachine = desiredInfraMachine
+
+	desiredTalosConfig := result.CurrentTalosConfig.DeepCopy()
+	desiredTalosConfig.Spec = c.TCP.Spec.ControlPlaneConfig.ControlPlaneConfig
+	result.DesiredTalosConfig = desiredTalosConfig
+
+	return result, nil
 }

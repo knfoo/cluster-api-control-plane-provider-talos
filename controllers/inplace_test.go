@@ -10,8 +10,10 @@ import (
 
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
+	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	utilfeature "k8s.io/component-base/featuregate/testing"
@@ -56,14 +58,14 @@ func TestCanUpdateMachine(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                   string
-		enableInPlaceUpdates   bool
-		getAllExtensions       map[string][]string
-		getAllExtensionsErr    error
-		wantCanUpdateMachine   bool
-		wantError              bool
-		wantErrorMessage       string
-		wantGetAllExtensions   int
+		name                 string
+		enableInPlaceUpdates bool
+		getAllExtensions     map[string][]string
+		getAllExtensionsErr  error
+		wantCanUpdateMachine bool
+		wantError            bool
+		wantErrorMessage     string
+		wantGetAllExtensions int
 	}{
 		{
 			name:                 "Return false if the feature gate is not enabled",
@@ -222,4 +224,125 @@ func TestRuntimeClientGetAllExtensions(t *testing.T) {
 	})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(handlers).To(ConsistOf("can-update-machine.talos-updater"))
+}
+
+// fullUpToDateResult is an UpToDateResult whose objects are all present, so tryInPlaceUpdate gets to
+// ask canUpdateMachine.
+func fullUpToDateResult() UpToDateResult {
+	return UpToDateResult{
+		DesiredMachine:      &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-to-in-place-update"}},
+		CurrentInfraMachine: &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}},
+		DesiredInfraMachine: &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}},
+		CurrentTalosConfig:  &cabptv1.TalosConfig{ObjectMeta: metav1.ObjectMeta{Name: "machine-to-in-place-update"}},
+		DesiredTalosConfig:  &cabptv1.TalosConfig{ObjectMeta: metav1.ObjectMeta{Name: "machine-to-in-place-update"}},
+	}
+}
+
+// Test_tryInPlaceUpdate mirrors the tryInPlaceUpdate test of KubeadmControlPlane (inplace_test.go:40-66):
+// the decision and the trigger are overridden, and the test checks that a Machine that cannot be
+// updated in place falls back to the scale down that rolls it out, while one that can is triggered.
+func Test_tryInPlaceUpdate(t *testing.T) {
+	machineToInPlaceUpdate := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "machine-to-in-place-update",
+		},
+	}
+
+	tests := []struct {
+		name                           string
+		canUpdateMachineFunc           func(ctx context.Context, machine *clusterv1.Machine) (bool, error)
+		machineUpToDateResult          UpToDateResult
+		wantCanUpdateMachineCalled     bool
+		wantTriggerInPlaceUpdateCalled bool
+		wantFallbackToScaleDown        bool
+		wantError                      bool
+		wantErrorMessage               string
+	}{
+		{
+			name: "Return error if canUpdateMachine returns an error",
+			canUpdateMachineFunc: func(_ context.Context, _ *clusterv1.Machine) (bool, error) {
+				return false, errors.New("canUpdateMachine error")
+			},
+			machineUpToDateResult:      fullUpToDateResult(),
+			wantCanUpdateMachineCalled: true,
+			wantError:                  true,
+			wantErrorMessage:           "failed to determine if Machine machine-to-in-place-update can be updated in-place: canUpdateMachine error",
+		},
+		{
+			name: "Fallback to scale down if canUpdateMachine returns false",
+			canUpdateMachineFunc: func(_ context.Context, _ *clusterv1.Machine) (bool, error) {
+				return false, nil
+			},
+			machineUpToDateResult:      fullUpToDateResult(),
+			wantCanUpdateMachineCalled: true,
+			wantFallbackToScaleDown:    true,
+		},
+		{
+			name: "Trigger in-place update if canUpdateMachine returns true",
+			canUpdateMachineFunc: func(_ context.Context, _ *clusterv1.Machine) (bool, error) {
+				return true, nil
+			},
+			machineUpToDateResult:          fullUpToDateResult(),
+			wantCanUpdateMachineCalled:     true,
+			wantTriggerInPlaceUpdateCalled: true,
+			wantFallbackToScaleDown:        false,
+		},
+		{
+			name: "Fallback to scale down if the desired InfraMachine is missing",
+			machineUpToDateResult: func() UpToDateResult {
+				result := fullUpToDateResult()
+				result.DesiredInfraMachine = nil
+				return result
+			}(),
+			wantFallbackToScaleDown: true,
+		},
+		{
+			name: "Fallback to scale down if the desired TalosConfig is missing",
+			machineUpToDateResult: func() UpToDateResult {
+				result := fullUpToDateResult()
+				result.DesiredTalosConfig = nil
+				return result
+			}(),
+			wantFallbackToScaleDown: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			var canUpdateMachineCalled bool
+			var triggerInPlaceUpdateCalled bool
+
+			overrideCanUpdateMachine = func(ctx context.Context, machine *clusterv1.Machine) (bool, error) {
+				canUpdateMachineCalled = true
+				if tt.canUpdateMachineFunc == nil {
+					return false, nil
+				}
+				return tt.canUpdateMachineFunc(ctx, machine)
+			}
+			overrideTriggerInPlaceUpdate = func(_ context.Context, _ *clusterv1.Machine, _ UpToDateResult) error {
+				triggerInPlaceUpdateCalled = true
+				return nil
+			}
+			defer func() {
+				overrideCanUpdateMachine = nil
+				overrideTriggerInPlaceUpdate = nil
+			}()
+
+			r := &TalosControlPlaneReconciler{}
+
+			fallbackToScaleDown, err := r.tryInPlaceUpdate(context.Background(), nil, machineToInPlaceUpdate, tt.machineUpToDateResult)
+			if tt.wantError {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(Equal(tt.wantErrorMessage))
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			g.Expect(fallbackToScaleDown).To(Equal(tt.wantFallbackToScaleDown))
+			g.Expect(canUpdateMachineCalled).To(Equal(tt.wantCanUpdateMachineCalled), "canUpdateMachineCalled: actual: %t expected: %t", canUpdateMachineCalled, tt.wantCanUpdateMachineCalled)
+			g.Expect(triggerInPlaceUpdateCalled).To(Equal(tt.wantTriggerInPlaceUpdateCalled), "triggerInPlaceUpdateCalled: actual: %t expected: %t", triggerInPlaceUpdateCalled, tt.wantTriggerInPlaceUpdateCalled)
+		})
+	}
 }
