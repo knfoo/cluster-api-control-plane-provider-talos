@@ -7,20 +7,67 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"reflect"
+	"strings"
 
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
-	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1alpha3"
+	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	talosconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// talosEndpoint returns the address to use as a Talos API endpoint, and false if the address can't be one.
+//
+// Link-local addresses are skipped: they are only reachable on the link of the node, and an IPv6 link-local address
+// carries a zone (e.g. "fe80::1%eth0") that is not valid in the gRPC target the Talos client builds from its
+// endpoints, so a single one of them breaks the client for every endpoint. Infrastructure providers such as Metal3
+// report them in the Machine addresses. Addresses that are not IPs (host names) are kept as they are.
+func talosEndpoint(address string) (string, bool) {
+	if address == "" {
+		return "", false
+	}
+
+	ip, err := netip.ParseAddr(address)
+	if err != nil {
+		return address, true
+	}
+
+	if ip.IsLinkLocalUnicast() {
+		return "", false
+	}
+
+	return ip.WithZone("").String(), true
+}
+
+// talosEndpoints converts the addresses with talosEndpoint, and also returns the non-empty addresses it skipped.
+func talosEndpoints(addresses []string) (endpoints, skipped []string) {
+	for _, address := range addresses {
+		if endpoint, ok := talosEndpoint(address); ok {
+			endpoints = append(endpoints, endpoint)
+		} else if address != "" {
+			skipped = append(skipped, address)
+		}
+	}
+
+	return endpoints, skipped
+}
+
+// noEndpointsError explains why the object kind/name has no Talos API endpoint, given the addresses skipped by talosEndpoints.
+func noEndpointsError(kind, name string, skipped []string) error {
+	if len(skipped) > 0 {
+		return fmt.Errorf("%s %q has no address usable as a Talos API endpoint (link-local addresses are skipped): %s", kind, name, strings.Join(skipped, ", "))
+	}
+
+	return fmt.Errorf("%s %q doesn't have any InternalIP or ExternalIP address yet", kind, name)
+}
 
 // talosconfigForMachine will generate a talosconfig that uses *all* found addresses as the endpoints.
 //
@@ -80,15 +127,20 @@ func (r *TalosControlPlaneReconciler) talosconfigForMachines(ctx context.Context
 	}
 
 	for _, machine := range machines {
+		var addresses []string
+
 		for _, addr := range machine.Status.Addresses {
 			if addr.Type == clusterv1.MachineExternalIP || addr.Type == clusterv1.MachineInternalIP {
-				addrList = append(addrList, addr.Address)
+				addresses = append(addresses, addr.Address)
 			}
 		}
 
-		if len(addrList) == 0 {
-			return nil, fmt.Errorf("no addresses were found for node %q", machine.Name)
+		endpoints, skipped := talosEndpoints(addresses)
+		if len(endpoints) == 0 {
+			return nil, noEndpointsError("machine", machine.Name, skipped)
 		}
+
+		addrList = append(addrList, endpoints...)
 	}
 
 	// we don't need to set endpoints in general here, as endpoints were already pre-populated by the CABPT controller
@@ -109,7 +161,7 @@ func (r *TalosControlPlaneReconciler) talosconfigFromWorkloadCluster(ctx context
 		return nil, fmt.Errorf("at least one machine should be provided")
 	}
 
-	c, err := r.Tracker.GetClient(ctx, cluster)
+	c, err := r.ClusterCache.GetClient(ctx, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -119,27 +171,32 @@ func (r *TalosControlPlaneReconciler) talosconfigFromWorkloadCluster(ctx context
 	var t *talosconfig.Config
 
 	for _, machine := range machines {
-		if machine.Status.NodeRef == nil {
+		if !machine.Status.NodeRef.IsDefined() {
 			return nil, fmt.Errorf("%q machine does not have a nodeRef", machine.Name)
 		}
 
 		var node v1.Node
 
 		// grab all addresses as endpoints
-		err := c.Get(ctx, types.NamespacedName{Name: machine.Status.NodeRef.Name, Namespace: machine.Status.NodeRef.Namespace}, &node)
+		err := c.Get(ctx, types.NamespacedName{Name: machine.Status.NodeRef.Name}, &node)
 		if err != nil {
 			return nil, err
 		}
 
+		var addresses []string
+
 		for _, addr := range node.Status.Addresses {
 			if addr.Type == corev1.NodeExternalIP || addr.Type == corev1.NodeInternalIP {
-				addrList = append(addrList, addr.Address)
+				addresses = append(addresses, addr.Address)
 			}
 		}
 
-		if len(addrList) == 0 {
-			return nil, fmt.Errorf("no addresses were found for node %q", node.Name)
+		endpoints, skipped := talosEndpoints(addresses)
+		if len(endpoints) == 0 {
+			return nil, noEndpointsError("node", node.Name, skipped)
 		}
+
+		addrList = append(addrList, endpoints...)
 
 		if t == nil {
 			var (
