@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"reflect"
 	"slices"
 	"sort"
@@ -25,23 +26,27 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
+	utilcache "k8s.io/apimachinery/pkg/util/cache"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/utils/pointer"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/controllers/external"
-	"sigs.k8s.io/cluster-api/controllers/remote"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/certs"
 	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
+	"sigs.k8s.io/cluster-api/util/labels/format"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/paused"
 	"sigs.k8s.io/cluster-api/util/secret"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,21 +54,39 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 
-	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1alpha3"
+	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
 )
 
 const requeueDuration = 30 * time.Second
 
+// remoteConnectionGracePeriod is how long the Available condition keeps its last known state while the workload
+// cluster can't be reached, e.g. right after a controller restart, before it is set to Unknown. It is the default
+// remote conditions grace period of KubeadmControlPlane.
+const remoteConnectionGracePeriod = 5 * time.Minute
+
 // TalosControlPlaneReconciler reconciles a TalosControlPlane object
 type TalosControlPlaneReconciler struct {
 	client.Client
-	APIReader client.Reader
-	Log       logr.Logger
-	Scheme    *runtime.Scheme
-	Tracker   *remote.ClusterCacheTracker
+	APIReader    client.Reader
+	Log          logr.Logger
+	Scheme       *runtime.Scheme
+	ClusterCache clustercache.ClusterCache
+
+	// etcd runs etcd operations on individual machines; nil means through the Talos API.
+	etcd etcdMemberManager
+
+	// machineApplyCache remembers the Machine applies that changed nothing, so they are not sent again; nil disables it.
+	machineApplyCache *utilcache.Expiring
+
+	// classicManager is the field manager of the updates the controller makes without server-side apply, whose
+	// managed fields are handed over when a Machine is adopted for server-side apply.
+	classicManager string
 }
 
 func (r *TalosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
+	r.machineApplyCache = utilcache.NewExpiring()
+	r.classicManager = classicManagerName(mgr.GetConfig().UserAgent)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&controlplanev1.TalosControlPlane{}).
 		Owns(&clusterv1.Machine{}).
@@ -71,6 +94,10 @@ func (r *TalosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, options
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.ClusterToTalosControlPlane),
 		).
+		// Enqueue the TalosControlPlane when the connection to the workload cluster goes up or down.
+		// Also enqueue it when the health probe keeps failing, so that Available goes Unknown once the grace period expired.
+		WatchesRawSource(r.ClusterCache.GetClusterSource("taloscontrolplane", r.ClusterToTalosControlPlane,
+			clustercache.WatchForProbeFailure(remoteConnectionGracePeriod))).
 		WithOptions(options).
 		Complete(r)
 }
@@ -83,6 +110,7 @@ func (r *TalosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, options
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io;bootstrap.cluster.x-k8s.io;controlplane.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;machines/status,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 func (r *TalosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reterr error) {
 	logger := r.Log.WithValues("namespace", req.Namespace, "talosControlPlane", req.Name)
@@ -93,7 +121,7 @@ func (r *TalosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, err
 	}
 
 	// Fetch the Cluster.
@@ -110,33 +138,50 @@ func (r *TalosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	if cluster == nil {
 		logger.Info("cluster Controller has not yet set OwnerRef")
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
 	}
 	logger = logger.WithValues("cluster", cluster.Name)
 
-	if annotations.IsPaused(cluster, tcp) {
-		logger.Info("reconciliation is paused for this object")
-		return ctrl.Result{Requeue: true}, nil
+	// Persist the fixed-up condition reasons before any other status patch. The patch helper applies condition
+	// changes on top of the stored conditions, so as long as a stored condition has an empty reason, every status
+	// patch, starting with the Paused condition below, would be rejected.
+	if hasEmptyConditionReason(tcp) {
+		patchHelper, err := patch.NewHelper(tcp, r.Client)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		sanitizeConditionReasons(tcp)
+
+		if err := patchHelper.Patch(ctx, tcp); err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "failed to fix up empty condition reasons")
+		}
 	}
 
-	// Wait for the cluster infrastructure to be ready before creating machines
-	if !cluster.Status.InfrastructureReady {
-		logger.Info("cluster infra not ready")
-
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// Initialize the patch helper.
+	// Initialize the patch helper before the Paused condition is surfaced: when only the observed generation of the
+	// condition changed, EnsurePausedCondition sets it without patching, leaving it to the patch at the end of the
+	// reconcile, which only sends what changed since the helper was created.
 	patchHelper, err := patch.NewHelper(tcp, r.Client)
 	if err != nil {
 		logger.Error(err, "failed to configure the patch helper")
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, err
+	}
+
+	// Surface the Paused condition. When the condition was just patched, reconciliation continues
+	// right away with the updated object instead of requeueing.
+	isPaused, _, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, tcp)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if isPaused {
+		// The Cluster and TalosControlPlane watches enqueue the object again once it is unpaused.
+		logger.Info("reconciliation is paused for this object")
+		return ctrl.Result{}, nil
 	}
 
 	// Add finalizer first if not exist to avoid the race condition between init and delete
-	if !controllerutil.ContainsFinalizer(tcp, controlplanev1.TalosControlPlaneFinalizer) {
-		controllerutil.AddFinalizer(tcp, controlplanev1.TalosControlPlaneFinalizer)
-
+	if ensureTalosControlPlaneFinalizer(tcp) {
 		// patch and return right away instead of reusing the main defer,
 		// because the main defer may take too much time to get cluster status
 
@@ -148,11 +193,14 @@ func (r *TalosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, nil
 	}
 
+	// The ControlPlane built by reconcile, reused by the status update; nil if reconcile did not build it.
+	var controlPlane *ControlPlane
+
 	defer func() {
 		r.Log.Info("attempting to set control plane status")
 
 		// Always attempt to update status.
-		if err := r.updateStatus(ctx, tcp, cluster); err != nil {
+		if err := r.updateStatus(ctx, tcp, cluster, controlPlane); err != nil {
 			logger.Error(err, "failed to update TalosControlPlane Status")
 
 			reterr = kerrors.NewAggregate([]error{reterr, err})
@@ -167,8 +215,9 @@ func (r *TalosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		// TODO: remove this as soon as we have a proper remote cluster cache in place.
 		// Make TCP to requeue in case status is not ready, so we can check for node status without waiting for a full resync (by default 10 minutes).
 		// Only requeue if we are not going in exponential backoff due to error, or if we are not already re-queueing, or if the object has a deletion timestamp.
-		if reterr == nil && !res.Requeue && res.RequeueAfter <= 0 && tcp.ObjectMeta.DeletionTimestamp.IsZero() {
-			if !tcp.Status.Ready || tcp.Status.UnavailableReplicas > 0 {
+		if reterr == nil && res.IsZero() && tcp.ObjectMeta.DeletionTimestamp.IsZero() {
+			deprecated := tcp.V1Beta1DeprecatedStatus()
+			if !deprecated.Ready || deprecated.UnavailableReplicas > 0 {
 				res = ctrl.Result{RequeueAfter: 20 * time.Second}
 			}
 		}
@@ -181,23 +230,58 @@ func (r *TalosControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return r.reconcileDelete(ctx, cluster, tcp)
 	}
 
-	return r.reconcile(ctx, cluster, tcp)
+	res, controlPlane, reterr = r.reconcile(ctx, cluster, tcp)
+
+	return res, reterr
 }
 
-func (r *TalosControlPlaneReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane) (res ctrl.Result, err error) {
+// reconcile runs the reconcile steps of a TalosControlPlane that is not being deleted. It also returns the
+// ControlPlane it built, if any, so that the status update reuses it instead of fetching the same objects again.
+func (r *TalosControlPlaneReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane) (res ctrl.Result, _ *ControlPlane, reterr error) {
 	logger := ctrl.LoggerFrom(ctx, "cluster", cluster.Name)
 	logger.Info("reconcile TalosControlPlane")
 
-	// Update ownerrefs on infra templates
-	if err := r.reconcileExternalReference(ctx, tcp.Spec.InfrastructureTemplate, cluster); err != nil {
-		return ctrl.Result{}, err
+	// Wait for the cluster infrastructure to be provisioned before creating machines.
+	// This is the contract field, which is never reset once set, unlike the InfrastructureReady condition
+	// that mirrors the live state of the InfraCluster.
+	if !ptr.Deref(cluster.Status.Initialization.InfrastructureProvisioned, false) {
+		logger.Info("cluster infrastructure is not provisioned yet")
+
+		return ctrl.Result{}, nil, nil
+	}
+
+	// Resolve the infrastructure template once: it is cloned for new Machines, and owned by the Cluster.
+	var infraTemplate *unstructured.Unstructured
+
+	if strings.HasSuffix(tcp.Spec.MachineTemplate.Spec.InfrastructureRef.Kind, clusterv1.TemplateSuffix) {
+		var err error
+
+		if infraTemplate, err = r.getInfrastructureTemplate(ctx, tcp); err != nil {
+			// Only creating Machines needs the template: the other steps, such as remediation, scale down and the
+			// propagation of the machine template, still run. The failure is reported once they ran, as the
+			// Machines are marked created when the control plane has all its replicas.
+			logger.Info("failed to resolve the infrastructure template, no Machine can be created", "error", err)
+
+			defer func() {
+				templateRes, templateErr := infrastructureTemplateFailed(tcp, err)
+
+				res = util.LowestNonZeroResult(res, templateRes)
+				reterr = kerrors.NewAggregate([]error{reterr, templateErr})
+
+				if reterr != nil {
+					res = ctrl.Result{}
+				}
+			}()
+		} else if err := r.reconcileExternalReference(ctx, infraTemplate, cluster); err != nil {
+			return ctrl.Result{}, nil, err
+		}
 	}
 
 	// If ControlPlaneEndpoint is not set, return early
 	if !cluster.Spec.ControlPlaneEndpoint.IsValid() {
 		logger.Info("cluster does not yet have a ControlPlaneEndpoint defined")
 
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, nil, nil
 	}
 
 	// TODO: handle proper adoption of Machines
@@ -205,30 +289,68 @@ func (r *TalosControlPlaneReconciler) reconcile(ctx context.Context, cluster *cl
 	if err != nil {
 		logger.Error(err, "failed to retrieve control plane machines for cluster")
 
-		return ctrl.Result{}, err
+		return ctrl.Result{}, nil, err
 	}
 
-	conditionGetters := make([]conditions.Getter, len(ownedMachines.Items))
+	// A Machine being deleted that fails to sync doesn't hold back the other steps: the error is reported with theirs.
+	deletingErr := r.syncDeletingMachines(ctx, tcp, &ownedMachines)
 
-	for i, v := range ownedMachines.Items {
-		conditionGetters[i] = &v
+	if err := r.reconcileMachineTemplateState(ctx, cluster, tcp, &ownedMachines); err != nil {
+		return ctrl.Result{}, nil, kerrors.NewAggregate([]error{deletingErr, err})
 	}
 
-	conditions.SetAggregate(tcp, controlplanev1.MachinesReadyCondition, conditionGetters, conditions.AddSourceRef(), conditions.WithStepCounterIf(false))
+	getters := make([]*clusterv1.Machine, len(ownedMachines.Items))
+	for i := range ownedMachines.Items {
+		getters[i] = &ownedMachines.Items[i]
+	}
+
+	// Aggregate the Ready condition of each Machine into the MachinesAllReady condition of the TalosControlPlane.
+	if err := conditions.SetAggregateCondition(
+		getters,
+		tcp,
+		string(clusterv1.ReadyCondition),
+		conditions.TargetConditionType(string(controlplanev1.MachinesAllReadyCondition)),
+	); err != nil {
+		logger.V(4).Info("Failed to set aggregate condition", "error", err)
+	}
+
+	// Build the ControlPlane once: the rollout and the status update both need the infrastructure machines and
+	// TalosConfigs of the Machines. If it fails, the steps that don't need it still run, and the steps that do
+	// try again.
+	controlPlane, err := newControlPlane(ctx, r.Client, cluster, tcp, collections.FromMachineList(&ownedMachines))
+	if err != nil {
+		logger.Info("failed to build the control plane", "error", err)
+
+		controlPlane = nil
+	} else {
+		controlPlane.infraTemplate = infraTemplate
+	}
 
 	var (
-		errs        error
+		errs        = deletingErr
 		result      ctrl.Result
 		phaseResult ctrl.Result
+
+		// etcdStatuses is what the etcd health check observed, so that remediation doesn't inspect etcd again.
+		etcdStatuses map[string]etcdMachineStatus
 	)
 
 	// run all similar reconcile steps in the loop and pick the lowest RetryAfter, aggregate errors and check the requeue flags.
+	// Remediation and scaling both delete Machines, so they run together as the last step, which deletes at most one Machine.
 	for _, phase := range []func(context.Context, *clusterv1.Cluster, *controlplanev1.TalosControlPlane, *clusterv1.MachineList) (ctrl.Result, error){
-		r.reconcileEtcdMembers,
+		func(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) (ctrl.Result, error) {
+			var result ctrl.Result
+
+			result, etcdStatuses, err = r.reconcileEtcdMembers(ctx, cluster, tcp, machines)
+
+			return result, err
+		},
 		r.reconcileNodeHealth,
 		r.reconcileConditions,
 		r.reconcileKubeconfig,
-		r.reconcileMachines,
+		func(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) (ctrl.Result, error) {
+			return r.reconcileRemediationAndMachines(ctx, cluster, tcp, machines, controlPlane, etcdStatuses)
+		},
 	} {
 		phaseResult, err = phase(ctx, cluster, tcp, &ownedMachines)
 		if err != nil {
@@ -238,15 +360,146 @@ func (r *TalosControlPlaneReconciler) reconcile(ctx context.Context, cluster *cl
 		result = util.LowestNonZeroResult(result, phaseResult)
 	}
 
-	if result.RequeueAfter != 0 {
-		if err != nil {
-			r.Log.Error(err, "reconcile failed", "requeue after", result.RequeueAfter.String(), "error", err.Error())
-		}
-
-		return result, nil
+	// The ClusterCache source enqueues the TalosControlPlane again once the workload cluster is reachable,
+	// so a lost connection doesn't need to go through the error backoff.
+	if errs != nil && errors.Is(errs, clustercache.ErrClusterNotConnected) {
+		result = util.LowestNonZeroResult(result, ctrl.Result{RequeueAfter: requeueDuration})
 	}
 
-	return result, errs
+	if result.RequeueAfter != 0 {
+		if errs != nil {
+			r.Log.Error(errs, "reconcile failed", "requeue after", result.RequeueAfter.String())
+		}
+
+		return result, controlPlane, nil
+	}
+
+	return result, controlPlane, errs
+}
+
+// reconcileMachineTemplateState propagates the in-place mutable fields of the TalosControlPlane to its Machines,
+// without rolling them out. The Machines are applied with server-side apply, like KubeadmControlPlane does, so
+// that the labels, annotations and readiness gates removed from the machine template are removed from them too.
+//
+// Only the Machines the TalosControlPlane controls are applied: the apply sets the TalosControlPlane as their
+// controller, which would adopt a Machine without one, and fail for a Machine with another one.
+//
+// A Machine that is being deleted is skipped: it only gets the deletion timeouts, see syncDeletingMachines.
+func (r *TalosControlPlaneReconciler) reconcileMachineTemplateState(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) error {
+	for i := range machines.Items {
+		machine := &machines.Items[i]
+		if !metav1.IsControlledBy(machine, tcp) || !machine.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		if err := r.adoptMachineForServerSideApply(ctx, tcp, machine); err != nil {
+			return err
+		}
+
+		desired := computeDesiredMachine(tcp, cluster, machine)
+
+		if err := r.applyMachine(ctx, desired, machine); err != nil {
+			return errors.Wrapf(err, "failed to sync machine %s with the machine template", machine.Name)
+		}
+
+		*machine = *desired
+	}
+
+	return nil
+}
+
+// syncDeletingMachines propagates the deletion timeouts of the TalosControlPlane to the Machines it controls that are
+// being deleted, see syncDeletingMachine. A Machine that fails to sync doesn't stop the others: the errors are
+// aggregated.
+func (r *TalosControlPlaneReconciler) syncDeletingMachines(ctx context.Context, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) error {
+	var errs []error
+
+	for i := range machines.Items {
+		machine := &machines.Items[i]
+		if machine.DeletionTimestamp.IsZero() || !metav1.IsControlledBy(machine, tcp) {
+			continue
+		}
+
+		if err := r.syncDeletingMachine(ctx, tcp, machine); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return kerrors.NewAggregate(errs)
+}
+
+// syncDeletingMachine propagates the deletion timeouts of the TalosControlPlane to a Machine that is being deleted,
+// the way KubeadmControlPlane does: the timeouts are the only fields that still matter for such a Machine, and
+// setting them on the TalosControlPlane lets a drain blocked by a PodDisruptionBudget, or a volume detach or Node
+// deletion that never completes, end without patching the Machine by hand.
+//
+// Only the timeouts the TalosControlPlane sets are propagated: an unset one leaves the Machine as it is, so that a
+// timeout set on the Machine by hand, or defaulted by the Machine webhook, is kept. The Machine is patched rather
+// than applied, so that the apply does not take over the other fields of a Machine that is going away. The Machine
+// is only updated in memory once the patch succeeds.
+func (r *TalosControlPlaneReconciler) syncDeletingMachine(ctx context.Context, tcp *controlplanev1.TalosControlPlane, machine *clusterv1.Machine) error {
+	desired := tcp.Spec.MachineTemplate.Spec.Deletion
+	patched := machine.DeepCopy()
+
+	changed := syncTimeout(&patched.Spec.Deletion.NodeDrainTimeoutSeconds, desired.NodeDrainTimeoutSeconds)
+	changed = syncTimeout(&patched.Spec.Deletion.NodeVolumeDetachTimeoutSeconds, desired.NodeVolumeDetachTimeoutSeconds) || changed
+	changed = syncTimeout(&patched.Spec.Deletion.NodeDeletionTimeoutSeconds, desired.NodeDeletionTimeoutSeconds) || changed
+
+	if !changed {
+		return nil
+	}
+
+	if err := r.Client.Patch(ctx, patched, client.MergeFrom(machine), client.FieldOwner(r.classicManager)); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		return errors.Wrapf(err, "failed to sync the deletion timeouts of deleting machine %s", machine.Name)
+	}
+
+	*machine = *patched
+
+	return nil
+}
+
+// syncTimeout sets the timeout to the desired one if that is set and differs, and reports whether it changed it.
+func syncTimeout(timeout **int32, desired *int32) bool {
+	if desired == nil || ptr.Equal(*timeout, desired) {
+		return false
+	}
+
+	*timeout = ptr.To(*desired)
+
+	return true
+}
+
+func controlPlaneMachineLabelsForCluster(tcp *controlplanev1.TalosControlPlane, clusterName string) map[string]string {
+	labels := maps.Clone(tcp.Spec.MachineTemplate.ObjectMeta.Labels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+
+	labels[clusterv1.ClusterNameLabel] = clusterName
+	labels[clusterv1.MachineControlPlaneLabel] = ""
+	labels[clusterv1.MachineControlPlaneNameLabel] = format.MustFormatValue(tcp.Name)
+
+	return labels
+}
+
+func buildMachineDeletionSpec(deletion controlplanev1.TalosControlPlaneMachineTemplateDeletionSpec) clusterv1.MachineDeletionSpec {
+	return clusterv1.MachineDeletionSpec{
+		NodeDrainTimeoutSeconds:        copyInt32(deletion.NodeDrainTimeoutSeconds),
+		NodeVolumeDetachTimeoutSeconds: copyInt32(deletion.NodeVolumeDetachTimeoutSeconds),
+		NodeDeletionTimeoutSeconds:     copyInt32(deletion.NodeDeletionTimeoutSeconds),
+	}
+}
+
+func copyInt32(v *int32) *int32 {
+	if v == nil {
+		return nil
+	}
+
+	return ptr.To(*v)
 }
 
 // ClusterToTalosControlPlane is a handler.ToRequestsFunc to be used to enqueue requests for reconciliation
@@ -259,8 +512,10 @@ func (r *TalosControlPlaneReconciler) ClusterToTalosControlPlane(_ context.Conte
 	}
 
 	controlPlaneRef := c.Spec.ControlPlaneRef
-	if controlPlaneRef != nil && controlPlaneRef.Kind == "TalosControlPlane" {
-		return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: controlPlaneRef.Namespace, Name: controlPlaneRef.Name}}}
+	if controlPlaneRef.IsDefined() &&
+		controlPlaneRef.APIGroup == controlplanev1.GroupVersion.Group &&
+		controlPlaneRef.Kind == "TalosControlPlane" {
+		return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: c.Namespace, Name: controlPlaneRef.Name}}}
 	}
 
 	return nil
@@ -275,11 +530,17 @@ func (r *TalosControlPlaneReconciler) reconcileDelete(ctx context.Context, clust
 		return ctrl.Result{}, err
 	}
 
-	// If no control plane machines remain, remove the finalizer
+	// If no control plane machines remain, remove the finalizer.
+	// The deferred patch persists it: updating the object here would delete it before that patch runs, which then fails.
 	if len(ownedMachines.Items) == 0 {
 		controllerutil.RemoveFinalizer(tcp, controlplanev1.TalosControlPlaneFinalizer)
-		return ctrl.Result{}, r.Client.Update(ctx, tcp)
+		return ctrl.Result{}, nil
 	}
+
+	// The Machines already being deleted still get the deletion timeouts, so that setting them on the
+	// TalosControlPlane ends a drain that blocks the teardown. A failure doesn't stop the other Machines from being
+	// deleted.
+	syncErr := r.syncDeletingMachines(ctx, tcp, &ownedMachines)
 
 	for _, ownedMachine := range ownedMachines.Items {
 		// Already deleting this machine
@@ -293,7 +554,17 @@ func (r *TalosControlPlaneReconciler) reconcileDelete(ctx context.Context, clust
 		}
 	}
 
-	conditions.MarkFalse(tcp, controlplanev1.ResizedCondition, clusterv1.DeletingReason, clusterv1.ConditionSeverityInfo, "")
+	apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+		Type:    string(controlplanev1.ResizedCondition),
+		Status:  metav1.ConditionFalse,
+		Reason:  clusterv1.DeletingReason,
+		Message: "Deleting TalosControlPlane-owned control plane machines",
+	})
+
+	if syncErr != nil {
+		return ctrl.Result{}, syncErr
+	}
+
 	// Requeue the deletion so we can check to make sure machines got cleaned up
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
@@ -317,66 +588,53 @@ func (r *TalosControlPlaneReconciler) getControlPlaneMachinesForCluster(ctx cont
 	return machineList, nil
 }
 
-// getFailureDomain will return a slice of failure domains from the cluster status.
+// ensureTalosControlPlaneFinalizer adds the finalizer to the TalosControlPlane, and reports whether it was added.
+// The API server rejects new finalizers on an object that is being deleted, so none is added to one.
+func ensureTalosControlPlaneFinalizer(tcp *controlplanev1.TalosControlPlane) bool {
+	if !tcp.DeletionTimestamp.IsZero() {
+		return false
+	}
+
+	return controllerutil.AddFinalizer(tcp, controlplanev1.TalosControlPlaneFinalizer)
+}
+
+// logFailureDomainSelection reports where a new control plane machine is about to be placed, and
+// whether the cluster offers enough failure domains to spread the control plane at all.
 //
-// Only returns domains where ControlPlane is true, and falls back to all domains if none are explicitly marked for control plane.
-func (r *TalosControlPlaneReconciler) getFailureDomain(_ context.Context, cluster *clusterv1.Cluster) []string {
-	if cluster.Status.FailureDomains == nil {
-		return nil
+// A control plane which cannot be spread comes from how the infrastructure provider populates the
+// cluster failure domains rather than from this controller, and it is next to impossible to
+// diagnose from the outside, so it is worth a log line on every machine creation.
+func (r *TalosControlPlaneReconciler) logFailureDomainSelection(tcp *controlplanev1.TalosControlPlane, controlPlane *ControlPlane, machine *clusterv1.Machine) {
+	logger := r.Log.WithValues("namespace", tcp.Namespace, "talosControlPlane", tcp.Name, "machine", machine.Name)
+
+	if machine.Spec.FailureDomain == "" {
+		logger.Info("cluster reports no failure domains, control plane machines will not be spread")
+
+		return
 	}
 
-	var retList []string
+	eligible := failureDomainNames(controlPlane.FailureDomains())
 
-	for key, fd := range cluster.Status.FailureDomains {
-		if fd.ControlPlane {
-			retList = append(retList, key)
-		}
+	logger = logger.WithValues("failureDomain", machine.Spec.FailureDomain, "eligibleFailureDomains", eligible)
+
+	logger.Info("picked failure domain for the new control plane machine")
+
+	markedForControlPlane := slices.ContainsFunc(controlPlane.Cluster.Status.FailureDomains, func(failureDomain clusterv1.FailureDomain) bool {
+		return ptr.Deref(failureDomain.ControlPlane, false)
+	})
+	if !markedForControlPlane {
+		logger.Info("no failure domain is marked for the control plane, falling back to all cluster failure domains")
 	}
 
-	if len(retList) == 0 {
-		// pick all failure domains if none are explicitly marked for control plane
-		for key := range cluster.Status.FailureDomains {
-			retList = append(retList, key)
-		}
+	if desiredReplicas := int(tcp.Spec.GetReplicas()); len(eligible) < desiredReplicas {
+		logger.Info("fewer control plane failure domains than desired replicas, the control plane cannot be fully spread",
+			"desiredReplicas", desiredReplicas)
 	}
-
-	slices.Sort(retList)
-
-	return retList
 }
 
-// pickFailureDomain selects the failure domain with the fewest existing machines.
-// This ensures control plane nodes are spread evenly across availability zones.
-func pickFailureDomain(failureDomains []string, existingMachines []clusterv1.Machine) string {
-	if len(failureDomains) == 0 {
-		return ""
-	}
-
-	// Count existing machines per failure domain.
-	counts := make(map[string]int, len(failureDomains))
-	for _, fd := range failureDomains {
-		counts[fd] = 0
-	}
-
-	for i := range existingMachines {
-		if existingMachines[i].Spec.FailureDomain != nil && existingMachines[i].DeletionTimestamp.IsZero() {
-			counts[*existingMachines[i].Spec.FailureDomain]++
-		}
-	}
-
-	// Pick the domain with the fewest machines (first in sorted order for determinism).
-	best := failureDomains[0]
-
-	for _, fd := range failureDomains[1:] {
-		if counts[fd] < counts[best] {
-			best = fd
-		}
-	}
-
-	return best
-}
-
-func (r *TalosControlPlaneReconciler) bootControlPlane(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, first bool) (ctrl.Result, error) {
+func (r *TalosControlPlaneReconciler) bootControlPlane(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane,
+	controlPlane *ControlPlane, first bool,
+) (ctrl.Result, error) {
 	// Since the cloned resource should eventually have a controller ref for the Machine, we create an
 	// OwnerReference here without the Controller field set
 	infraCloneOwner := &metav1.OwnerReference{
@@ -386,20 +644,70 @@ func (r *TalosControlPlaneReconciler) bootControlPlane(ctx context.Context, clus
 		UID:        tcp.UID,
 	}
 
-	// Clone the infrastructure template
-	infraRef, err := external.CreateFromTemplate(ctx, &external.CreateFromTemplateInput{
-		Client:      r.Client,
-		TemplateRef: &tcp.Spec.InfrastructureTemplate,
+	machineName, err := tcp.Spec.GenerateMachineName(cluster.Name, tcp.Name)
+	if err != nil {
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesCreatedCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.MachineGenerationFailedReason,
+			Message: fmt.Sprintf("Failed to generate machine name: %v", err),
+		})
+
+		return ctrl.Result{}, err
+	}
+
+	// The Machine is created with server-side apply, which would take over an existing Machine with the same name:
+	// treat it as a conflict instead, a new name is generated on the next attempt. The check reads from the API server,
+	// as a Machine that was just created may not be in the cache yet.
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: tcp.Namespace, Name: machineName}, &clusterv1.Machine{}); err == nil {
+		err = errors.Errorf("machine %s already exists", machineName)
+
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesCreatedCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.MachineGenerationFailedReason,
+			Message: fmt.Sprintf("Failed to generate machine name: %v", err),
+		})
+
+		return ctrl.Result{}, err
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, errors.Wrapf(err, "failed to check for an existing machine %s", machineName)
+	}
+
+	// Clone the infrastructure template the reconcile resolved, unless the ControlPlane was built without it.
+	infraTemplate := controlPlane.infraTemplate
+	if infraTemplate == nil {
+		if infraTemplate, err = r.getInfrastructureTemplate(ctx, tcp); err != nil {
+			return infrastructureTemplateFailed(tcp, err)
+		}
+	}
+
+	infraMachine, err := external.GenerateTemplate(&external.GenerateTemplateInput{
+		Template: infraTemplate,
+		TemplateRef: &corev1.ObjectReference{
+			APIVersion: infraTemplate.GetAPIVersion(),
+			Kind:       infraTemplate.GetKind(),
+			Name:       infraTemplate.GetName(),
+			Namespace:  infraTemplate.GetNamespace(),
+		},
 		Namespace:   tcp.Namespace,
+		Name:        machineName,
 		OwnerRef:    infraCloneOwner,
 		ClusterName: cluster.Name,
-		Labels: map[string]string{
-			clusterv1.MachineControlPlaneLabel: "",
-		},
+		Labels:      controlPlaneMachineLabelsForCluster(tcp, cluster.Name),
+		Annotations: maps.Clone(tcp.Spec.MachineTemplate.ObjectMeta.Annotations),
 	})
+	if err == nil {
+		err = r.Client.Create(ctx, infraMachine)
+	}
+
 	if err != nil {
-		conditions.MarkFalse(tcp, controlplanev1.MachinesCreatedCondition, controlplanev1.InfrastructureTemplateCloningFailedReason,
-			clusterv1.ConditionSeverityError, "%s", err.Error())
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesCreatedCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.InfrastructureTemplateCloningFailedReason,
+			Message: fmt.Sprintf("Failed to clone infrastructure template: %v", err),
+		})
 
 		return ctrl.Result{}, err
 	}
@@ -410,55 +718,64 @@ func (r *TalosControlPlaneReconciler) bootControlPlane(ctx context.Context, clus
 	}
 
 	// Clone the bootstrap configuration
-	bootstrapRef, err := r.generateTalosConfig(ctx, tcp, bootstrapConfig)
+	bootstrapRef, err := r.generateTalosConfig(ctx, tcp, cluster.Name, machineName, bootstrapConfig)
 	if err != nil {
-		conditions.MarkFalse(tcp, controlplanev1.MachinesCreatedCondition, controlplanev1.BootstrapTemplateCloningFailedReason,
-			clusterv1.ConditionSeverityError, "%s", err.Error())
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesCreatedCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.BootstrapTemplateCloningFailedReason,
+			Message: fmt.Sprintf("Failed to create bootstrap configuration: %v", err),
+		})
 
-		return ctrl.Result{}, err
+		return ctrl.Result{}, kerrors.NewAggregate([]error{err, r.cleanupFromGeneration(ctx, infraMachine)})
 	}
 
-	machine := &clusterv1.Machine{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      names.SimpleNameGenerator.GenerateName(tcp.Name + "-"),
-			Namespace: tcp.Namespace,
-			Labels: map[string]string{
-				clusterv1.ClusterNameLabel:         cluster.Name,
-				clusterv1.MachineControlPlaneLabel: "",
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(tcp, controlplanev1.GroupVersion.WithKind("TalosControlPlane")),
-			},
-		},
-		Spec: clusterv1.MachineSpec{
-			ClusterName:       cluster.Name,
-			Version:           &tcp.Spec.Version,
-			InfrastructureRef: *infraRef,
-			Bootstrap: clusterv1.Bootstrap{
-				ConfigRef: bootstrapRef,
-			},
-		},
+	machine := computeDesiredMachine(tcp, cluster, nil)
+	machine.Name = machineName
+	machine.Spec.InfrastructureRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: infraMachine.GroupVersionKind().Group,
+		Kind:     infraMachine.GetKind(),
+		Name:     infraMachine.GetName(),
 	}
+	machine.Spec.Bootstrap.ConfigRef = *bootstrapRef
+	machine.Spec.FailureDomain = controlPlane.NextFailureDomainForScaleUp(ctx)
 
-	failureDomains := r.getFailureDomain(ctx, cluster)
-	if len(failureDomains) > 0 {
-		// Fetch existing CP machines to determine least-used failure domain.
-		existingMachines, err := r.getControlPlaneMachinesForCluster(ctx, util.ObjectKey(cluster))
-		if err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "failed to get existing machines for failure domain selection")
+	r.logFailureDomainSelection(tcp, controlPlane, machine)
+
+	if err := r.applyMachine(ctx, machine, nil); err != nil {
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesCreatedCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.MachineGenerationFailedReason,
+			Message: fmt.Sprintf("Failed to create machine: %v", err),
+		})
+
+		talosConfig := &cabptv1.TalosConfig{
+			TypeMeta:   metav1.TypeMeta{APIVersion: cabptv1.GroupVersion.String(), Kind: "TalosConfig"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: tcp.Namespace, Name: bootstrapRef.Name},
 		}
-		fd := pickFailureDomain(failureDomains, existingMachines.Items)
-		machine.Spec.FailureDomain = &fd
+
+		return ctrl.Result{}, kerrors.NewAggregate([]error{
+			errors.Wrap(err, "Failed to create machine"),
+			r.cleanupFromGeneration(ctx, infraMachine, talosConfig),
+		})
 	}
 
-	if err := r.Client.Create(ctx, machine); err != nil {
-		conditions.MarkFalse(tcp, controlplanev1.MachinesCreatedCondition, controlplanev1.MachineGenerationFailedReason,
-			clusterv1.ConditionSeverityError, "%s", err.Error())
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
 
-		return ctrl.Result{}, errors.Wrap(err, "Failed to create machine")
+// cleanupFromGeneration deletes the objects cloned for a Machine that could not be created, like KubeadmControlPlane
+// does, so that each failed attempt does not leave them behind: the next attempt clones them under a new name.
+func (r *TalosControlPlaneReconciler) cleanupFromGeneration(ctx context.Context, objects ...client.Object) error {
+	var errs []error
+
+	for _, obj := range objects {
+		if err := r.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, errors.Wrapf(err, "failed to clean up %s %s after a failed machine creation", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName()))
+		}
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return kerrors.NewAggregate(errs)
 }
 
 func (r *TalosControlPlaneReconciler) bootstrapCluster(ctx context.Context, tcp *controlplanev1.TalosControlPlane, machines []clusterv1.Machine) error {
@@ -475,29 +792,28 @@ func (r *TalosControlPlaneReconciler) bootstrapCluster(ctx context.Context, tcp 
 
 	addresses := []string{}
 	for _, machine := range machines {
-		found := false
+		var (
+			found   bool
+			skipped []string
+		)
 
 		// Prefer finding an InternalIP address for the machine first.
-		for _, addr := range machine.Status.Addresses {
-			if addr.Type == clusterv1.MachineInternalIP {
-				addresses = append(addresses, addr.Address)
-
-				found = true
-
-				break
-			}
-		}
-
-		if found {
-			continue
-		}
-
 		// Fallback to finding an ExternalIP address for the machine
 		// if no InternalIP is found.
-		for _, addr := range machine.Status.Addresses {
-			if addr.Type == clusterv1.MachineExternalIP {
-				addresses = append(addresses, addr.Address)
+		for _, addrType := range []clusterv1.MachineAddressType{clusterv1.MachineInternalIP, clusterv1.MachineExternalIP} {
+			var candidates []string
 
+			for _, addr := range machine.Status.Addresses {
+				if addr.Type == addrType {
+					candidates = append(candidates, addr.Address)
+				}
+			}
+
+			endpoints, skippedOfType := talosEndpoints(candidates)
+			skipped = append(skipped, skippedOfType...)
+
+			if len(endpoints) > 0 {
+				addresses = append(addresses, endpoints[0])
 				found = true
 
 				break
@@ -505,7 +821,7 @@ func (r *TalosControlPlaneReconciler) bootstrapCluster(ctx context.Context, tcp 
 		}
 
 		if !found {
-			return fmt.Errorf("machine %q doesn't have an any InternalIP or ExternalIP address yet", machine.Name)
+			return noEndpointsError("machine", machine.Name, skipped)
 		}
 	}
 
@@ -546,7 +862,9 @@ func (r *TalosControlPlaneReconciler) bootstrapCluster(ctx context.Context, tcp 
 	return nil
 }
 
-func (r *TalosControlPlaneReconciler) generateTalosConfig(ctx context.Context, tcp *controlplanev1.TalosControlPlane, spec *cabptv1.TalosConfigSpec) (*corev1.ObjectReference, error) {
+// generateTalosConfig creates the TalosConfig of a new Machine, with the labels and annotations of the Machine,
+// like the infrastructure machine.
+func (r *TalosControlPlaneReconciler) generateTalosConfig(ctx context.Context, tcp *controlplanev1.TalosControlPlane, clusterName, name string, spec *cabptv1.TalosConfigSpec) (*clusterv1.ContractVersionedObjectReference, error) {
 	owner := metav1.OwnerReference{
 		APIVersion:         controlplanev1.GroupVersion.String(),
 		Kind:               "TalosControlPlane",
@@ -557,8 +875,10 @@ func (r *TalosControlPlaneReconciler) generateTalosConfig(ctx context.Context, t
 
 	bootstrapConfig := &cabptv1.TalosConfig{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            names.SimpleNameGenerator.GenerateName(tcp.Name + "-"),
+			Name:            name,
 			Namespace:       tcp.Namespace,
+			Labels:          controlPlaneMachineLabelsForCluster(tcp, clusterName),
+			Annotations:     maps.Clone(tcp.Spec.MachineTemplate.ObjectMeta.Annotations),
 			OwnerReferences: []metav1.OwnerReference{owner},
 		},
 		Spec: *spec,
@@ -568,18 +888,18 @@ func (r *TalosControlPlaneReconciler) generateTalosConfig(ctx context.Context, t
 		return nil, errors.Wrap(err, "Failed to create bootstrap configuration")
 	}
 
-	bootstrapRef := &corev1.ObjectReference{
-		APIVersion: cabptv1.GroupVersion.String(),
-		Kind:       "TalosConfig",
-		Name:       bootstrapConfig.GetName(),
-		Namespace:  bootstrapConfig.GetNamespace(),
-		UID:        bootstrapConfig.GetUID(),
+	bootstrapRef := &clusterv1.ContractVersionedObjectReference{
+		APIGroup: cabptv1.GroupVersion.Group,
+		Kind:     "TalosConfig",
+		Name:     bootstrapConfig.GetName(),
 	}
 
 	return bootstrapRef, nil
 }
 
-func (r *TalosControlPlaneReconciler) updateStatus(ctx context.Context, tcp *controlplanev1.TalosControlPlane, cluster *clusterv1.Cluster) error {
+// updateStatus computes the status of the TalosControlPlane. controlPlane is the ControlPlane built by the reconcile,
+// or nil if it built none.
+func (r *TalosControlPlaneReconciler) updateStatus(ctx context.Context, tcp *controlplanev1.TalosControlPlane, cluster *clusterv1.Cluster, controlPlane *ControlPlane) error {
 	clusterSelector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{
 			clusterv1.ClusterNameLabel:         cluster.Name,
@@ -601,29 +921,88 @@ func (r *TalosControlPlaneReconciler) updateStatus(ctx context.Context, tcp *con
 		return err
 	}
 
-	replicas := int32(len(ownedMachines.Items))
+	machines := collections.FromMachineList(&ownedMachines)
 
-	// set basic data that does not require interacting with the workload cluster
-	tcp.Status.Ready = false
-	tcp.Status.Replicas = replicas
-	tcp.Status.ReadyReplicas = 0
-	tcp.Status.UnavailableReplicas = replicas
-
-	// Return early if the deletion timestamp is set, we don't want to try to connect to the workload cluster.
-	if !tcp.DeletionTimestamp.IsZero() {
-		return nil
+	lowestVersion := machines.LowestVersion()
+	if lowestVersion != "" {
+		tcp.Status.Version = &lowestVersion
 	}
 
-	lowestVersion := collections.FromMachineList(&ownedMachines).LowestVersion()
-	if lowestVersion != nil {
-		tcp.Status.Version = lowestVersion
+	// Everything up to the workload cluster access below only uses the Machines in the management cluster,
+	// so it stays accurate when the workload cluster is unreachable or the TalosControlPlane is being deleted.
+	var errs []error
+
+	// While the TalosControlPlane is being deleted, its Machines are not rolled out anymore, so their UpToDate
+	// condition is left as is, rather than fetching infrastructure machines that may be gone or going.
+	if tcp.DeletionTimestamp.IsZero() {
+		if err := r.reconcileMachineUpToDateConditions(ctx, cluster, tcp, machines, controlPlane); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	c, err := r.Tracker.GetClient(ctx, util.ObjectKey(cluster))
+	var readyReplicas, availableReplicas, upToDateReplicas, machinesWithNode int32
+
+	for _, machine := range machines {
+		if machine.Status.NodeRef.IsDefined() {
+			machinesWithNode++
+		}
+
+		if conditions.IsTrue(machine, clusterv1.MachineReadyCondition) {
+			readyReplicas++
+		}
+
+		if conditions.IsTrue(machine, clusterv1.MachineAvailableCondition) {
+			availableReplicas++
+		}
+
+		if conditions.IsTrue(machine, clusterv1.MachineUpToDateCondition) {
+			upToDateReplicas++
+		}
+	}
+
+	replicas := int32(len(machines))
+
+	tcp.Status.Replicas = ptr.To(replicas)
+	tcp.Status.ReadyReplicas = ptr.To(readyReplicas)
+	tcp.Status.AvailableReplicas = ptr.To(availableReplicas)
+	tcp.Status.UpToDateReplicas = ptr.To(upToDateReplicas)
+
+	// v1beta1 contract fields, derived from the same counts.
+	deprecated := tcp.V1Beta1DeprecatedStatus()
+	deprecated.UnavailableReplicas = replicas - readyReplicas
+	deprecated.UpdatedReplicas = upToDateReplicas
+	deprecated.Ready = readyReplicas > 0
+
+	// The controller does not maintain v1beta1 conditions: the ones converted from a TalosControlPlane stored before
+	// the upgrade describe its state at that time, so they are dropped instead of being reported as current.
+	deprecated.Conditions = nil
+
+	setMachinesReadyCondition(tcp, readyReplicas)
+	setMachinesUpToDateCondition(tcp, replicas, upToDateReplicas)
+
+	// Don't connect to the workload cluster while the TalosControlPlane is being deleted.
+	var workloadErr error
+
+	if tcp.DeletionTimestamp.IsZero() {
+		workloadErr = r.reconcileControlPlaneInitialized(ctx, tcp, cluster)
+		if workloadErr != nil {
+			r.Log.Info("failed to reach the workload cluster", "error", workloadErr)
+		}
+	}
+
+	setAvailableCondition(tcp, machinesWithNode, workloadErr, workloadErr != nil && r.withinRemoteConnectionGracePeriod(ctx, cluster))
+
+	r.Log.Info("ready replicas", "count", readyReplicas)
+
+	return kerrors.NewAggregate(errs)
+}
+
+// reconcileControlPlaneInitialized marks the control plane as initialized once the workload cluster API
+// can be reached. It returns an error if the workload cluster can't be reached.
+func (r *TalosControlPlaneReconciler) reconcileControlPlaneInitialized(ctx context.Context, tcp *controlplanev1.TalosControlPlane, cluster *clusterv1.Cluster) error {
+	c, err := r.ClusterCache.GetClient(ctx, util.ObjectKey(cluster))
 	if err != nil {
-		r.Log.Info("failed to get kubeconfig for the cluster", "error", err)
-
-		return nil
+		return errors.Wrap(err, "failed to get a client for the workload cluster")
 	}
 
 	nodeSelector := labels.NewSelector()
@@ -634,53 +1013,222 @@ func (r *TalosControlPlaneReconciler) updateStatus(ctx context.Context, tcp *con
 
 	var nodes v1.NodeList
 
-	err = c.List(ctx, &nodes, &client.ListOptions{
+	if err := c.List(ctx, &nodes, &client.ListOptions{
 		LabelSelector: nodeSelector.Add(*req),
-	})
-
-	if err != nil {
-		r.Log.Info("failed to list controlplane nodes", "error", err)
-
-		return nil
+	}); err != nil {
+		return errors.Wrap(err, "failed to list control plane nodes")
 	}
 
 	// if we were able to fetch some resources via control plane endpoint,
 	// workload cluster control plane endpoint is available
-	tcp.Status.Initialized = true
-	conditions.MarkTrue(tcp, controlplanev1.AvailableCondition)
-
-	for _, node := range nodes.Items {
-		if util.IsNodeReady(&node) {
-			tcp.Status.ReadyReplicas++
-		}
-	}
-
-	// fix the case then some Node objects are still visible which were deleted
-	if tcp.Status.ReadyReplicas > tcp.Status.Replicas {
-		tcp.Status.ReadyReplicas = tcp.Status.Replicas
-	}
-
-	tcp.Status.UnavailableReplicas = replicas - tcp.Status.ReadyReplicas
-
-	if tcp.Status.ReadyReplicas > 0 {
-		tcp.Status.Ready = true
-	}
-
-	r.Log.Info("ready replicas", "count", tcp.Status.ReadyReplicas)
+	tcp.V1Beta1DeprecatedStatus().Initialized = true
+	// the Cluster controller reads this v1beta2 field (not the legacy status.initialized
+	// bool above) to compute Cluster.Status.Conditions[ControlPlaneInitialized]; without it,
+	// that condition never flips true and Machines stay stuck waiting on it.
+	tcp.Status.Initialization.ControlPlaneInitialized = ptr.To(true)
 
 	return nil
 }
 
-func (r *TalosControlPlaneReconciler) reconcileExternalReference(ctx context.Context, ref corev1.ObjectReference, cluster *clusterv1.Cluster) error {
-	if !strings.HasSuffix(ref.Kind, clusterv1.TemplateSuffix) {
-		return nil
+// withinRemoteConnectionGracePeriod reports whether a failure to reach the workload cluster is still within the
+// grace period: the ClusterCache did not try to connect often enough yet, e.g. right after a controller restart,
+// or the last successful health probe is more recent than remoteConnectionGracePeriod. It mirrors how
+// KubeadmControlPlane keeps its remote conditions.
+func (r *TalosControlPlaneReconciler) withinRemoteConnectionGracePeriod(ctx context.Context, cluster *clusterv1.Cluster) bool {
+	state := r.ClusterCache.GetHealthCheckingState(ctx, util.ObjectKey(cluster))
+
+	if state.LastProbeSuccessTime.IsZero() {
+		return state.ConsecutiveFailures < 5
 	}
 
-	obj, err := external.Get(ctx, r.Client, &ref)
-	if err != nil {
-		return err
+	return time.Since(state.LastProbeSuccessTime) <= remoteConnectionGracePeriod
+}
+
+// reconcileMachineUpToDateConditions sets the UpToDate condition on each Machine, using the same predicate
+// that selects the Machines to roll out. Only Machines whose condition changed are patched.
+//
+// controlPlane is the ControlPlane built earlier in the reconcile, if any. It may miss Machines created since, which
+// were created from the current spec: their infrastructure machine and TalosConfig are not known to it, so they
+// are only compared by Kubernetes version, as Machines whose infrastructure machine or TalosConfig can't be fetched.
+func (r *TalosControlPlaneReconciler) reconcileMachineUpToDateConditions(
+	ctx context.Context,
+	cluster *clusterv1.Cluster,
+	tcp *controlplanev1.TalosControlPlane,
+	machines collections.Machines,
+	controlPlane *ControlPlane,
+) error {
+	if controlPlane == nil {
+		var err error
+
+		controlPlane, err = newControlPlane(ctx, r.Client, cluster, tcp, machines)
+		if err != nil {
+			return errors.Wrap(err, "failed to compute machine UpToDate conditions")
+		}
 	}
 
+	matchesSpec := controlPlane.MatchesSpec()
+
+	var errs []error
+
+	for _, machine := range machines {
+		condition := metav1.Condition{
+			Type:               clusterv1.MachineUpToDateCondition,
+			Status:             metav1.ConditionTrue,
+			Reason:             clusterv1.MachineUpToDateReason,
+			ObservedGeneration: machine.Generation,
+		}
+
+		if !matchesSpec(machine) {
+			condition.Status = metav1.ConditionFalse
+			condition.Reason = clusterv1.MachineNotUpToDateReason
+			condition.Message = "Machine does not match the TalosControlPlane version, infrastructure template or controlplane config"
+		}
+
+		if current := conditions.Get(machine, clusterv1.MachineUpToDateCondition); current != nil && conditions.HasSameState(current, &condition) {
+			continue
+		}
+
+		patchHelper, err := patch.NewHelper(machine, r.Client)
+		if err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+
+		conditions.Set(machine, condition)
+
+		if err := patchHelper.Patch(ctx, machine, patch.WithOwnedConditions{Conditions: []string{
+			clusterv1.MachineUpToDateCondition,
+		}}); err != nil {
+			errs = append(errs, errors.Wrapf(err, "failed to patch UpToDate condition on machine %s", machine.Name))
+		}
+	}
+
+	return kerrors.NewAggregate(errs)
+}
+
+// setMachinesReadyCondition reports whether at least spec.replicas control plane machines are ready.
+func setMachinesReadyCondition(tcp *controlplanev1.TalosControlPlane, readyReplicas int32) {
+	desiredReplicas := tcp.Spec.GetReplicas()
+
+	condition := metav1.Condition{
+		Type:    clusterv1.MachinesReadyCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  controlplanev1.MachinesReadyReason,
+		Message: fmt.Sprintf("%d of %d control plane machines are ready", readyReplicas, desiredReplicas),
+	}
+
+	if readyReplicas < desiredReplicas {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = controlplanev1.MachinesNotReadyReason
+	}
+
+	conditions.Set(tcp, condition)
+}
+
+// setMachinesUpToDateCondition reports whether all control plane machines are up-to-date.
+func setMachinesUpToDateCondition(tcp *controlplanev1.TalosControlPlane, replicas, upToDateReplicas int32) {
+	condition := metav1.Condition{
+		Type:    clusterv1.MachinesUpToDateCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  controlplanev1.MachinesUpToDateReason,
+		Message: fmt.Sprintf("%d of %d control plane machines are up-to-date", upToDateReplicas, replicas),
+	}
+
+	if upToDateReplicas < replicas {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = controlplanev1.MachinesNotUpToDateReason
+	}
+
+	conditions.Set(tcp, condition)
+}
+
+// setAvailableCondition is the only place that sets the Available condition.
+//
+// The control plane is available when it is initialized, the workload cluster can be reached, etcd has quorum and
+// at least one control plane machine has a node. Unlike the Machine Ready condition, this doesn't depend on the Node
+// Ready condition: Nodes stay NotReady until a CNI is installed, while the control plane already serves, which is
+// also how KubeadmControlPlane computes Available. Having fewer ready machines than spec.replicas, e.g. during a
+// rollout, is reported by the MachinesReady condition instead.
+//
+// When the workload cluster can't be reached, the last known state is kept during the remote connection grace
+// period (keepOnWorkloadErr), so that a controller restart or a short connection loss doesn't flip the condition.
+func setAvailableCondition(tcp *controlplanev1.TalosControlPlane, machinesWithNode int32, workloadErr error, keepOnWorkloadErr bool) {
+	condition := metav1.Condition{
+		Type:   clusterv1.AvailableCondition,
+		Status: metav1.ConditionTrue,
+		Reason: controlplanev1.AvailableReason,
+	}
+
+	etcdHealthy := conditions.Get(tcp, string(controlplanev1.EtcdClusterHealthyCondition))
+	etcdUnhealthy := etcdHealthy != nil && etcdHealthy.Status == metav1.ConditionFalse
+
+	switch {
+	case !tcp.DeletionTimestamp.IsZero():
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = controlplanev1.NotAvailableReason
+		condition.Message = "TalosControlPlane is being deleted"
+	case !ptr.Deref(tcp.Status.Initialization.ControlPlaneInitialized, false):
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = controlplanev1.NotAvailableReason
+		condition.Message = "Control plane is not yet initialized"
+	case workloadErr != nil && keepOnWorkloadErr && conditions.Has(tcp, clusterv1.AvailableCondition):
+		return
+	case workloadErr != nil:
+		condition.Status = metav1.ConditionUnknown
+		condition.Reason = controlplanev1.RemoteConnectionProbeFailedReason
+		condition.Message = fmt.Sprintf("Workload cluster can't be reached: %v", workloadErr)
+	case etcdUnhealthy && etcdHealthy.Reason == controlplanev1.EtcdClusterQuorumLostReason:
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = controlplanev1.NotAvailableReason
+		condition.Message = fmt.Sprintf("etcd does not have quorum: %s", etcdHealthy.Message)
+	case etcdUnhealthy && etcdHealthy.Reason == controlplanev1.EtcdClusterInspectionFailedReason:
+		condition.Status = metav1.ConditionUnknown
+		condition.Reason = controlplanev1.AvailableInspectionFailedReason
+		condition.Message = fmt.Sprintf("etcd can't be inspected: %s", etcdHealthy.Message)
+	case machinesWithNode < 1:
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = controlplanev1.NotAvailableReason
+		condition.Message = "There are no control plane machines with a node, at least 1 required"
+	case etcdUnhealthy:
+		condition.Message = fmt.Sprintf("etcd is degraded but has quorum: %s", etcdHealthy.Message)
+	}
+
+	conditions.Set(tcp, condition)
+}
+
+// getInfrastructureTemplate returns the infrastructure template of the TalosControlPlane. The infrastructureRef is a
+// ContractVersionedObjectReference, so the concrete apiVersion is resolved through the contract labels of the
+// template CRD.
+func (r *TalosControlPlaneReconciler) getInfrastructureTemplate(ctx context.Context, tcp *controlplanev1.TalosControlPlane) (*unstructured.Unstructured, error) {
+	return external.GetObjectFromContractVersionedRef(ctx, r.Client, tcp.Spec.MachineTemplate.Spec.InfrastructureRef, tcp.Namespace)
+}
+
+// infrastructureTemplateFailed reports that the infrastructure template could not be resolved in the MachinesCreated
+// condition, and returns the result and error to return. A missing template is a user-recoverable misconfiguration:
+// it backs off instead of returning the error, so the controller does not hot-loop.
+func infrastructureTemplateFailed(tcp *controlplanev1.TalosControlPlane, err error) (ctrl.Result, error) {
+	reason := controlplanev1.InfrastructureTemplateResolutionFailedReason
+	if apierrors.IsNotFound(err) {
+		reason = controlplanev1.InfrastructureTemplateCloningFailedReason
+	}
+
+	apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+		Type:    string(controlplanev1.MachinesCreatedCondition),
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: fmt.Sprintf("Failed to retrieve infrastructure template: %v", err),
+	})
+
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	return ctrl.Result{}, err
+}
+
+// reconcileExternalReference sets the Cluster as an owner of the infrastructure template.
+func (r *TalosControlPlaneReconciler) reconcileExternalReference(ctx context.Context, obj *unstructured.Unstructured, cluster *clusterv1.Cluster) error {
 	objPatchHelper, err := patch.NewHelper(obj, r.Client)
 	if err != nil {
 		return err
@@ -747,26 +1295,40 @@ func (r *TalosControlPlaneReconciler) reconcileKubeconfig(ctx context.Context, c
 	return ctrl.Result{}, nil
 }
 
-func (r *TalosControlPlaneReconciler) reconcileEtcdMembers(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) (result ctrl.Result, err error) {
+// reconcileEtcdMembers removes etcd members without a Machine and sets the EtcdClusterHealthy condition. It returns
+// what the etcd health check observed on each Machine.
+func (r *TalosControlPlaneReconciler) reconcileEtcdMembers(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) (ctrl.Result, map[string]etcdMachineStatus, error) {
 	var errs error
 	// Audit the etcd member list to remove any nodes that no longer exist
 	if err := r.auditEtcd(ctx, tcp, util.ObjectKey(cluster)); err != nil {
 		errs = kerrors.NewAggregate([]error{errs, err})
 	}
 
-	if err := r.etcdHealthcheck(ctx, tcp, machines.Items); err != nil {
-		conditions.MarkFalse(tcp, controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason,
-			clusterv1.ConditionSeverityWarning, "%s", err.Error())
+	health, err := r.etcdHealthcheck(ctx, tcp, machines.Items)
+	if err != nil {
+		// The reason tells the Available condition whether etcd still has quorum.
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.EtcdClusterHealthyCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  health.conditionReason(),
+			Message: fmt.Sprintf("Failed to perform etcd healthcheck: %v", err),
+		})
+
 		errs = kerrors.NewAggregate([]error{errs, err})
 	} else {
-		conditions.MarkTrue(tcp, controlplanev1.EtcdClusterHealthyCondition)
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.EtcdClusterHealthyCondition),
+			Status:  metav1.ConditionTrue,
+			Reason:  controlplanev1.EtcdClusterHealthyReason,
+			Message: "etcd healthcheck successful",
+		})
 	}
 
 	if errs != nil {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, errs
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, health.statuses, errs
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, health.statuses, nil
 }
 
 func (r *TalosControlPlaneReconciler) reconcileNodeHealth(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) (result ctrl.Result, err error) {
@@ -777,74 +1339,75 @@ func (r *TalosControlPlaneReconciler) reconcileNodeHealth(ctx context.Context, c
 			reason = controlplanev1.ControlPlaneComponentsUnhealthyReason
 		}
 
-		conditions.MarkFalse(tcp, controlplanev1.ControlPlaneComponentsHealthyCondition, reason,
-			clusterv1.ConditionSeverityWarning, "%s", err.Error())
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.ControlPlaneComponentsHealthyCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: fmt.Sprintf("Failed to perform control plane healthcheck: %v", err),
+		})
 
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	} else {
-		conditions.MarkTrue(tcp, controlplanev1.ControlPlaneComponentsHealthyCondition)
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.ControlPlaneComponentsHealthyCondition),
+			Status:  metav1.ConditionTrue,
+			Reason:  controlplanev1.ControlPlaneComponentsHealthyReason,
+			Message: "Control plane components are healthy",
+		})
 	}
 
 	return ctrl.Result{}, nil
 }
 
 func (r *TalosControlPlaneReconciler) reconcileConditions(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) (result ctrl.Result, err error) {
-	if !conditions.Has(tcp, controlplanev1.AvailableCondition) {
-		conditions.MarkFalse(tcp, controlplanev1.AvailableCondition, controlplanev1.WaitingForTalosBootReason, clusterv1.ConditionSeverityInfo, "")
-	}
-
-	if !conditions.Has(tcp, controlplanev1.MachinesBootstrapped) {
-		conditions.MarkFalse(tcp, controlplanev1.MachinesBootstrapped, controlplanev1.WaitingForMachinesReason, clusterv1.ConditionSeverityInfo, "")
+	if !conditions.Has(tcp, string(controlplanev1.MachinesBootstrapped)) {
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesBootstrapped),
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.WaitingForMachinesReason,
+			Message: "Waiting for machines to bootstrap",
+		})
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList) (res ctrl.Result, err error) {
+// reconcileMachines rolls out, scales and bootstraps the control plane. controlPlane is the ControlPlane of the
+// Machines, built if nil.
+func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, cluster *clusterv1.Cluster, tcp *controlplanev1.TalosControlPlane, machines *clusterv1.MachineList, controlPlane *ControlPlane) (res ctrl.Result, err error) {
 	logger := r.Log.WithValues("namespace", tcp.Namespace, "talosControlPlane", tcp.Name)
 
 	// If we've made it this far, we can assume that all ownedMachines are up to date
 	numMachines := len(machines.Items)
 	desiredReplicas := int(tcp.Spec.GetReplicas())
 
-	controlPlane, err := newControlPlane(ctx, r.Client, cluster, tcp, collections.FromMachineList(machines))
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Remediate machines a MachineHealthCheck flagged for the control plane to handle: nobody else
-	// will, so left alone they stay unhealthy voting members forever. Like a scale-down, remediation
-	// removes one machine at a time and only once the rest of etcd is healthy; the scale-up below then
-	// replaces it. A lone machine is never remediated, as that would leave no control plane at all.
-	if unhealthy := controlPlane.UnhealthyMachines(); unhealthy.Len() > 0 {
-		if numMachines > 1 {
-			logger.Info("remediating unhealthy control plane machines", "machines", unhealthy.Names())
-
-			res, err = r.scaleDownControlPlane(ctx, cluster, tcp, controlPlane, collections.Machines{})
-			if err != nil && (res.Requeue || res.RequeueAfter > 0) {
-				logger.Info("failed to remediate control plane", "error", err)
-
-				return res, nil
-			}
-
-			return res, err
+	if controlPlane == nil {
+		controlPlane, err = newControlPlane(ctx, r.Client, cluster, tcp, collections.FromMachineList(machines))
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-
-		logger.Info("refusing to remediate the only control plane machine", "machines", unhealthy.Names())
 	}
 
 	needRollout := controlPlane.MachinesNeedingRollout()
 	if len(needRollout) > 0 {
 		logger.Info("rolling out control plane machines", "needRollout", needRollout.Names())
-		conditions.MarkFalse(controlPlane.TCP,
-			controlplanev1.MachinesSpecUpToDateCondition,
-			controlplanev1.RollingUpdateInProgressReason,
-			clusterv1.ConditionSeverityWarning, "Rolling %d replicas with outdated spec (%d replicas up to date)", len(needRollout), len(controlPlane.Machines)-len(needRollout))
+		apimeta.SetStatusCondition(&controlPlane.TCP.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesSpecUpToDateCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.RollingUpdateInProgressReason,
+			Message: fmt.Sprintf("Rolling %d replicas with outdated spec (%d replicas up to date)", len(needRollout), len(controlPlane.Machines)-len(needRollout)),
+		})
 
 		return r.upgradeControlPlane(ctx, cluster, tcp, controlPlane, needRollout)
 	} else {
-		if conditions.Has(controlPlane.TCP, controlplanev1.MachinesSpecUpToDateCondition) {
-			conditions.MarkTrue(controlPlane.TCP, controlplanev1.MachinesSpecUpToDateCondition)
+		if conditions.Has(controlPlane.TCP, string(controlplanev1.MachinesSpecUpToDateCondition)) {
+			apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+				Type:    string(controlplanev1.MachinesSpecUpToDateCondition),
+				Status:  metav1.ConditionTrue,
+				Reason:  controlplanev1.MachinesSpecUpToDateReason,
+				Message: "All control plane machines have up-to-date spec",
+			})
+
 		}
 	}
 
@@ -854,7 +1417,7 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 		// Create new Machine w/ init
 		logger.Info("initializing control plane", "Desired", desiredReplicas, "Existing", numMachines)
 
-		return r.bootControlPlane(ctx, cluster, tcp, true)
+		return r.bootControlPlane(ctx, cluster, tcp, controlPlane, true)
 	// We are scaling up
 	case numMachines < desiredReplicas && numMachines > 0:
 		return r.scaleUpControlPlane(ctx, cluster, tcp, controlPlane)
@@ -862,7 +1425,7 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 	case numMachines > desiredReplicas:
 		res, err = r.scaleDownControlPlane(ctx, cluster, tcp, controlPlane, collections.Machines{})
 		if err != nil {
-			if res.Requeue || res.RequeueAfter > 0 {
+			if !res.IsZero() {
 				logger.Info("failed to scale down control plane", "error", err)
 
 				return res, nil
@@ -873,53 +1436,115 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 	default:
 		if !reflect.ValueOf(tcp.Spec.ControlPlaneConfig.InitConfig).IsZero() {
 			tcp.Status.Bootstrapped = true
-			conditions.MarkTrue(tcp, controlplanev1.MachinesBootstrapped)
+
+			apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+				Type:    string(controlplanev1.MachinesBootstrapped),
+				Status:  metav1.ConditionTrue,
+				Reason:  controlplanev1.MachinesBootstrappedReason,
+				Message: "Control plane bootstrapped successfully",
+			})
 		}
 
 		if !tcp.Status.Bootstrapped {
 			if err := r.bootstrapCluster(ctx, tcp, machines.Items); err != nil {
-				conditions.MarkFalse(tcp, controlplanev1.MachinesBootstrapped, controlplanev1.WaitingForTalosBootReason, clusterv1.ConditionSeverityInfo, "%s", err.Error())
+				apimeta.SetStatusCondition(&controlPlane.TCP.Status.Conditions, metav1.Condition{
+					Type:    string(controlplanev1.MachinesBootstrapped),
+					Status:  metav1.ConditionFalse,
+					Reason:  controlplanev1.WaitingForTalosBootReason,
+					Message: fmt.Sprintf("Failed to bootstrap cluster: %v", err),
+				})
 
 				logger.Info("bootstrap failed, retrying in 20 seconds", "error", err)
 
 				return ctrl.Result{RequeueAfter: time.Second * 20}, nil
 			}
 
-			conditions.MarkTrue(tcp, controlplanev1.MachinesBootstrapped)
+			apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+				Type:    string(controlplanev1.MachinesBootstrapped),
+				Status:  metav1.ConditionTrue,
+				Reason:  controlplanev1.MachinesBootstrappedReason,
+				Message: "Control plane bootstrapped successfully",
+			})
 
 			tcp.Status.Bootstrapped = true
 		}
 
-		if conditions.Has(tcp, controlplanev1.MachinesReadyCondition) {
-			conditions.MarkTrue(tcp, controlplanev1.ResizedCondition)
+		if conditions.Has(tcp, string(controlplanev1.MachinesAllReadyCondition)) {
+			apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+				Type:    string(controlplanev1.ResizedCondition),
+				Status:  metav1.ConditionTrue,
+				Reason:  controlplanev1.ResizedReason,
+				Message: "Control plane successfully resized",
+			})
 		}
 
-		conditions.MarkTrue(tcp, controlplanev1.MachinesCreatedCondition)
+		apimeta.SetStatusCondition(&tcp.Status.Conditions, metav1.Condition{
+			Type:    string(controlplanev1.MachinesCreatedCondition),
+			Status:  metav1.ConditionTrue,
+			Reason:  controlplanev1.MachinesCreatedReason,
+			Message: "Machines have been successfully created",
+		})
 	}
 
 	return ctrl.Result{}, nil
 }
 
+// hasEmptyConditionReason reports whether a condition of the TalosControlPlane has an empty reason. The CRD schema
+// (generated for []metav1.Condition) requires a reason of at least 1 character, so as long as a stored condition has
+// none, e.g. a v1beta1 condition stored by an older controller version or a manual edit, the apiserver rejects every
+// status patch of the object with "conditions[N].reason: Invalid value: \"\"".
+func hasEmptyConditionReason(tcp *controlplanev1.TalosControlPlane) bool {
+	return slices.ContainsFunc(tcp.Status.Conditions, func(c metav1.Condition) bool { return c.Reason == "" })
+}
+
+// sanitizeConditionReasons gives the conditions without a reason a placeholder one. It is only meant to fix up the
+// stored conditions once, at the start of a reconcile: the conditions the controller sets always have a reason.
+func sanitizeConditionReasons(tcp *controlplanev1.TalosControlPlane) {
+	for i := range tcp.Status.Conditions {
+		if tcp.Status.Conditions[i].Reason == "" {
+			tcp.Status.Conditions[i].Reason = "NoReasonReported"
+		}
+	}
+}
+
 func patchTalosControlPlane(ctx context.Context, patchHelper *patch.Helper, tcp *controlplanev1.TalosControlPlane, opts ...patch.Option) error {
+	// The stored conditions were fixed up at the start of the reconcile, so a condition without a reason was set
+	// without one in this reconcile. The apiserver would reject the patch anyway: name the condition instead of
+	// hiding the mistake behind a placeholder reason.
+	for _, condition := range tcp.Status.Conditions {
+		if condition.Reason == "" {
+			return fmt.Errorf("condition %q of the TalosControlPlane was set without a reason", condition.Type)
+		}
+	}
+
 	// Always update the readyCondition by summarizing the state of other conditions.
-	conditions.SetSummary(tcp,
-		conditions.WithConditions(
-			controlplanev1.MachinesCreatedCondition,
-			controlplanev1.ResizedCondition,
-			controlplanev1.MachinesReadyCondition,
-			controlplanev1.AvailableCondition,
-			controlplanev1.MachinesBootstrapped,
-		),
+	err := conditions.SetSummaryCondition(
+		tcp,
+		tcp,
+		clusterv1.ReadyCondition,
+		conditions.ForConditionTypes{
+			string(controlplanev1.MachinesCreatedCondition),
+			string(controlplanev1.ResizedCondition),
+			string(controlplanev1.MachinesAllReadyCondition),
+			string(clusterv1.AvailableCondition),
+			string(controlplanev1.MachinesBootstrapped),
+		},
 	)
+	if err != nil {
+		return errors.Wrap(err, "failed to set summary Ready condition")
+	}
 
 	opts = append(opts,
-		patch.WithOwnedConditions{Conditions: []clusterv1.ConditionType{
-			controlplanev1.MachinesCreatedCondition,
-			clusterv1.ReadyCondition,
-			controlplanev1.ResizedCondition,
-			controlplanev1.MachinesReadyCondition,
-			controlplanev1.AvailableCondition,
-			controlplanev1.MachinesBootstrapped,
+		patch.WithOwnedConditions{Conditions: []string{
+			string(controlplanev1.MachinesCreatedCondition),
+			string(clusterv1.ReadyCondition),
+			string(controlplanev1.ResizedCondition),
+			string(controlplanev1.MachinesAllReadyCondition),
+			string(clusterv1.AvailableCondition),
+			string(controlplanev1.MachinesBootstrapped),
+			clusterv1.MachinesReadyCondition,
+			clusterv1.MachinesUpToDateCondition,
+			clusterv1.PausedCondition,
 		}},
 	)
 
