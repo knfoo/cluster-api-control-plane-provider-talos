@@ -230,7 +230,7 @@ func Test_triggerInPlaceUpdate(t *testing.T) {
 
 			r := &TalosControlPlaneReconciler{Client: c}
 
-			err = r.triggerInPlaceUpdate(ctx, machine, result)
+			err = r.triggerInPlaceUpdate(ctx, nil, machine, result)
 			if tt.wantError {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err.Error()).To(Equal(tt.wantErrorMessage))

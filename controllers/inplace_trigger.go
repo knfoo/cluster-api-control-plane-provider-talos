@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
@@ -18,6 +19,7 @@ import (
 	runtimecatalog "sigs.k8s.io/cluster-api/api/runtime/catalog"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	runtimev1beta2 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
+	capicontrollerutil "sigs.k8s.io/cluster-api/util/controller"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -29,7 +31,7 @@ import (
 // (inplace_trigger.go:46-137).
 //
 // Nothing calls it while the InPlaceUpdates feature gate is off, which is the default.
-func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) error {
+func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, controlPlane *ControlPlane, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) error {
 	if overrideTriggerInPlaceUpdate != nil {
 		return overrideTriggerInPlaceUpdate(ctx, machine, machineUpToDateResult)
 	}
@@ -50,6 +52,11 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 		if err := r.Client.Patch(ctx, machine, client.MergeFrom(orig)); err != nil {
 			return errors.Wrapf(err, "failed to trigger in-place update for Machine %s by setting the %s annotation", klog.KObj(machine), clusterv1.UpdateInProgressAnnotation)
 		}
+
+		// Wait until the cache observed the Machine with the UpdateInProgressAnnotation, so that the next
+		// reconcile sees it and does not trigger a second in-place update concurrently
+		// (inplace_trigger.go:61-63).
+		r.deferUntilCacheUpToDate(controlPlane, capicontrollerutil.StructuredObject(clusterv1.GroupVersion, "Machine"), machine.ResourceVersion)
 	}
 
 	desiredMachine := machineUpToDateResult.DesiredMachine
@@ -88,9 +95,32 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 		return errors.Wrapf(err, "failed to complete triggering in-place update for Machine %s", klog.KObj(machine))
 	}
 
+	// MarkAsPending patched the Machine, so its resource version changed. Waiting for the cache to
+	// observe it keeps the next reconcile from acting on a stale Machine (inplace_trigger.go:130-134).
+	r.deferUntilCacheUpToDate(controlPlane, capicontrollerutil.StructuredObject(clusterv1.GroupVersion, "Machine"), desiredMachine.ResourceVersion)
+
 	log.Info(fmt.Sprintf("Completed triggering in-place update for Machine %s", klog.KObj(machine)))
 
+	// The event KubeadmControlPlane emits when an in-place update is triggered (inplace_trigger.go:137).
+	if r.recorder != nil {
+		r.recorder.Event(machine, corev1.EventTypeNormal, "SuccessfulStartInPlaceUpdate", "Machine starting in-place update")
+	}
+
 	return nil
+}
+
+// deferUntilCacheUpToDate tells the controller not to reconcile the TalosControlPlane again before the
+// cache observed the object the in-place update just wrote, mirroring KubeadmControlPlane's
+// DeferNextReconcileUntilCacheUpToDate calls (inplace_trigger.go:61-63, 134).
+//
+// Both handles are nil when the reconciler was built without a manager, which is how the tests of this
+// fork construct it, and then there is nothing to defer.
+func (r *TalosControlPlaneReconciler) deferUntilCacheUpToDate(controlPlane *ControlPlane, writtenObject capicontrollerutil.GroupVersionKindType, resourceVersion string) {
+	if r.controller == nil || controlPlane == nil || controlPlane.TCP == nil {
+		return
+	}
+
+	r.controller.DeferNextReconcileUntilCacheUpToDate(controlPlane.TCP, writtenObject, resourceVersion)
 }
 
 // withUpdateInProgressAnnotation returns a copy of obj with the UpdateInProgressAnnotation set, keeping

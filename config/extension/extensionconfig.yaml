@@ -1,0 +1,35 @@
+# The Cluster API Runtime SDK extension that updates Talos machines in place
+# (cmd/talos-update-extension).
+#
+# This sample is not applied by the provider: an operator registers the extension by
+# applying this file to the management cluster, and Cluster API calls its hooks only when
+# the EXP_IN_PLACE_UPDATES feature gate is enabled, which is off by default. The extension
+# therefore ships dark.
+#
+# The extension answers the Discovery, CanUpdateMachine and UpdateMachine hooks. Cluster API
+# discovers the handlers after registration and writes them into the status of this object.
+#
+# Cluster API only calls an extension over https (api/runtime/v1alpha1 ClientConfig: "The scheme
+# must be https"), so the binary serves TLS with the certificate and key given to it with
+# --cert-file and --key-file. Replace the caBundle placeholder below with the PEM-encoded CA
+# bundle that signed that certificate, or with the Secret reference documented by the Runtime SDK
+# (annotation runtime.cluster.x-k8s.io/inject-ca-from-secret).
+apiVersion: runtime.cluster.x-k8s.io/v1alpha1
+kind: ExtensionConfig
+metadata:
+  name: talos-in-place-update
+  namespace: default
+spec:
+  clientConfig:
+    # The address the extension binary listens on (--listen-address, default :8443).
+    url: https://talos-in-place-update.cluster.x-k8s.io:8443
+    # Placeholder: base64 of "replace-with-the-PEM-CA-bundle-of-the-extension-certificate".
+    caBundle: cmVwbGFjZS13aXRoLXRoZS1wZW0tY2EtYnVuZGxlLW9mLXRoZS1leHRlbnNpb24tY2VydGlmaWNhdGU=
+  # Only call the hooks for objects in namespaces that carry this label, so the extension
+  # is scoped to the clusters that are meant to be updated in place.
+  namespaceSelector:
+    matchLabels:
+      talos-in-place-update: enabled
+  settings:
+    # The Talos API address the extension uses when the hook request carries none.
+    address: ""

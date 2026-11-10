@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	utilcache "k8s.io/apimachinery/pkg/util/cache"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/pointer"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -43,6 +44,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/certs"
 	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	capicontrollerutil "sigs.k8s.io/cluster-api/util/controller"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
 	"sigs.k8s.io/cluster-api/util/labels/format"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -76,6 +78,15 @@ type TalosControlPlaneReconciler struct {
 	// It is only consulted when the InPlaceUpdates feature gate is enabled, which is off by default.
 	RuntimeClient RuntimeClient
 
+	// controller is the TalosControlPlane controller, needed to defer a reconcile until the cache
+	// observed an object the controller wrote, as KubeadmControlPlane does for in-place updates
+	// (inplace_trigger.go:61-63, 134).
+	controller capicontrollerutil.Controller
+
+	// recorder writes the events of the in-place update path, e.g. SuccessfulStartInPlaceUpdate
+	// (inplace_trigger.go:137).
+	recorder record.EventRecorder
+
 	// etcd runs etcd operations on individual machines; nil means through the Talos API.
 	etcd etcdMemberManager
 
@@ -90,8 +101,12 @@ type TalosControlPlaneReconciler struct {
 func (r *TalosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
 	r.machineApplyCache = utilcache.NewExpiring()
 	r.classicManager = classicManagerName(mgr.GetConfig().UserAgent)
+	r.recorder = mgr.GetEventRecorderFor("taloscontrolplane-controller")
 
-	return ctrl.NewControllerManagedBy(mgr).
+	// Cluster API's controller builder returns the controller handle, which the in-place update path
+	// needs to defer a reconcile until its writes are in the cache (KubeadmControlPlane does the same,
+	// SetupWithManager of reconcilers/kubeadmcontrolplane/kubeadmcontrolplane.go).
+	c, err := capicontrollerutil.NewControllerManagedBy(mgr, r.Log).
 		For(&controlplanev1.TalosControlPlane{}).
 		Owns(&clusterv1.Machine{}).
 		Watches(
@@ -103,7 +118,14 @@ func (r *TalosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, options
 		WatchesRawSource(r.ClusterCache.GetClusterSource("taloscontrolplane", r.ClusterToTalosControlPlane,
 			clustercache.WatchForProbeFailure(remoteConnectionGracePeriod))).
 		WithOptions(options).
-		Complete(r)
+		Build(context.Background(), r)
+	if err != nil {
+		return errors.Wrap(err, "failed setting up with a controller manager")
+	}
+
+	r.controller = c
+
+	return nil
 }
 
 // +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;patch

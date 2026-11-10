@@ -25,6 +25,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// The mirrored extension lookup reads ExtensionConfig objects and the namespaces that scope them, the
+// same reads the upstream Runtime SDK client performs (sigs.k8s.io/cluster-api/internal/runtime/client
+// and sigs.k8s.io/cluster-api/internal/runtime/registry), so the manager role needs access to them.
+// +kubebuilder:rbac:groups=runtime.cluster.x-k8s.io,resources=extensionconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
+
 // RuntimeClient is the part of Cluster API's Runtime SDK client that the control-plane provider needs
 // to decide whether a Machine can be updated in place. Cluster API keeps its own client and extension
 // registry in internal/ packages, which a provider cannot import, so the extension lookup is mirrored
@@ -188,5 +194,5 @@ func (r *TalosControlPlaneReconciler) tryInPlaceUpdate(
 		return true, nil
 	}
 
-	return false, r.triggerInPlaceUpdate(ctx, machineToInPlaceUpdate, machineUpToDateResult)
+	return false, r.triggerInPlaceUpdate(ctx, controlPlane, machineToInPlaceUpdate, machineUpToDateResult)
 }
