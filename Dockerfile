@@ -1,4 +1,4 @@
-# syntax = docker/dockerfile-upstream:1.14.1-labs
+# syntax = docker/dockerfile-upstream:1.28.0-labs
 
 # Meta args applied to stage base names.
 
@@ -44,6 +44,7 @@ COPY --from=manifests-build /src/config /config
 
 FROM build AS generate-build
 RUN --mount=type=cache,target=/.cache controller-gen object:headerFile=./hack/boilerplate.go.txt paths="./..."
+RUN --mount=type=cache,target=/.cache conversion-gen --output-file=zz_generated.conversion.go --go-header-file=./hack/boilerplate.go.txt ./api/v1alpha3
 
 FROM scratch AS generate
 COPY --from=generate-build /src/api /api
@@ -51,14 +52,15 @@ COPY --from=generate-build /src/api /api
 # runs unit-tests
 FROM build AS unit-tests-run
 ARG TESTPKGS
-RUN --mount=type=cache,target=/root/.cache --mount=type=cache,target=/tmp go test -v -covermode=atomic -coverprofile=coverage.txt -coverpkg=${TESTPKGS} -count 1 ${TESTPKGS}
+RUN --mount=type=cache,target=/root/.cache --mount=type=cache,target=/tmp go test -v -covermode=atomic -coverprofile=coverage.txt -coverpkg=$(echo ${TESTPKGS} | tr ' ' ',') -count 1 ${TESTPKGS}
 
 FROM scratch AS unit-tests
 COPY --from=unit-tests-run /src/coverage.txt /coverage.txt
 
-FROM --platform=${BUILDPLATFORM} alpine:3.21 AS release-build
-ADD https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv4.1.0/kustomize_v4.1.0_linux_amd64.tar.gz .
-RUN  tar -xf kustomize_v4.1.0_linux_amd64.tar.gz -C /usr/local/bin && rm kustomize_v4.1.0_linux_amd64.tar.gz
+FROM --platform=${BUILDPLATFORM} alpine:3.24 AS release-build
+ARG BUILDARCH
+ADD https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv4.1.0/kustomize_v4.1.0_linux_${BUILDARCH}.tar.gz .
+RUN  tar -xf kustomize_v4.1.0_linux_${BUILDARCH}.tar.gz -C /usr/local/bin && rm kustomize_v4.1.0_linux_${BUILDARCH}.tar.gz
 COPY ./config ./config
 ARG REGISTRY_AND_USERNAME
 ARG NAME
