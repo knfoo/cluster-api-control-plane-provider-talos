@@ -47,6 +47,15 @@ func (f *fakeRuntimeClient) GetAllExtensions(_ context.Context, hook runtimecata
 	return f.getAllExtensions[runtimecatalog.HookName(hook)], nil
 }
 
+// CallExtension is the fake counterpart of the Runtime SDK fake that Cluster API keeps in an internal/
+// package (inplace_canupdatemachine_test.go:154). The CanUpdateMachine hook call is exercised by the
+// fake in inplace_canupdatemachine_test.go.
+func (f *fakeRuntimeClient) CallExtension(_ context.Context, _ runtimecatalog.Hook, _ client.Object, _ string, _ runtimehooksv1.RequestObject, response runtimehooksv1.ResponseObject) error {
+	response.SetStatus(runtimehooksv1.ResponseStatusSuccess)
+
+	return nil
+}
+
 // TestCanUpdateMachine mirrors the KCP canUpdateMachine test cases (inplace_canupdatemachine_test.go:86-145):
 // the feature gate, zero extensions and more than one extension.
 func TestCanUpdateMachine(t *testing.T) {
@@ -61,11 +70,12 @@ func TestCanUpdateMachine(t *testing.T) {
 		name                 string
 		enableInPlaceUpdates bool
 		getAllExtensions     map[string][]string
-		getAllExtensionsErr  error
-		wantCanUpdateMachine bool
-		wantError            bool
-		wantErrorMessage     string
-		wantGetAllExtensions int
+		getAllExtensionsErr   error
+		machineUpToDateResult UpToDateResult
+		wantCanUpdateMachine  bool
+		wantError             bool
+		wantErrorMessage      string
+		wantGetAllExtensions  int
 	}{
 		{
 			name:                 "Return false if the feature gate is not enabled",
@@ -77,6 +87,7 @@ func TestCanUpdateMachine(t *testing.T) {
 			name:                 "Return false if no CanUpdateMachine extension is registered",
 			enableInPlaceUpdates: true,
 			getAllExtensions:     map[string][]string{},
+			machineUpToDateResult: fullUpToDateResult(),
 			wantCanUpdateMachine: false,
 			wantGetAllExtensions: 1,
 		},
@@ -86,28 +97,30 @@ func TestCanUpdateMachine(t *testing.T) {
 			getAllExtensions: map[string][]string{
 				"CanUpdateMachine": {"test-update-extension-1.canupdate", "test-update-extension-2.canupdate"},
 			},
-			wantCanUpdateMachine: false,
-			wantError:            true,
-			wantErrorMessage:     "found multiple CanUpdateMachine hooks (test-update-extension-1.canupdate,test-update-extension-2.canupdate): only one hook is supported",
-			wantGetAllExtensions: 1,
+			machineUpToDateResult: fullUpToDateResult(),
+			wantCanUpdateMachine:  false,
+			wantError:             true,
+			wantErrorMessage:      "found multiple CanUpdateMachine hooks (test-update-extension-1.canupdate,test-update-extension-2.canupdate): only one hook is supported",
+			wantGetAllExtensions:  1,
 		},
 		{
 			name:                 "Return an error if the extension lookup fails",
 			enableInPlaceUpdates: true,
 			getAllExtensionsErr:  errors.New("extension lookup failed"),
+			machineUpToDateResult: fullUpToDateResult(),
 			wantCanUpdateMachine: false,
 			wantError:            true,
 			wantErrorMessage:     "failed to get CanUpdateMachine extensions for Machine machine-to-in-place-update: extension lookup failed",
 			wantGetAllExtensions: 1,
 		},
 		{
-			name:                 "Return false with exactly one extension: calling the hook is the next stage",
+			name:                 "Return false with exactly one extension but no computed objects: nothing to compare",
 			enableInPlaceUpdates: true,
 			getAllExtensions: map[string][]string{
 				"CanUpdateMachine": {"talos-update.canupdatemachine"},
 			},
 			wantCanUpdateMachine: false,
-			wantGetAllExtensions: 1,
+			wantGetAllExtensions: 0,
 		},
 	}
 
@@ -124,7 +137,7 @@ func TestCanUpdateMachine(t *testing.T) {
 				},
 			}
 
-			canUpdateMachine, err := r.canUpdateMachine(context.Background(), machine)
+			canUpdateMachine, err := r.canUpdateMachine(context.Background(), machine, tt.machineUpToDateResult)
 			if tt.wantError {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err.Error()).To(Equal(tt.wantErrorMessage))

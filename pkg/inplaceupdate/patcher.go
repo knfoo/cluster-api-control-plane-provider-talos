@@ -29,6 +29,66 @@ type jsonPatchOp struct {
 	Value any    `json:"value,omitempty"`
 }
 
+// ApplyJSONPatch applies an RFC 6902 patch document to a decoded object. The control plane
+// controller uses it to apply the patches a CanUpdateMachine extension returns to the objects
+// of its request, the way KubeadmControlPlane does with the patch helper in
+// sigs.k8s.io/cluster-api/internal/util/patch (inplace_canupdatemachine.go:272-292).
+func ApplyJSONPatch(object map[string]any, patch []byte) error {
+	ops := []jsonPatchOp{}
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		return fmt.Errorf("decoding JSON patch: %w", err)
+	}
+
+	for _, op := range ops {
+		if err := applyOp(object, op); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ApplyJSONMergePatch applies an RFC 7396 JSON merge patch to a decoded object.
+func ApplyJSONMergePatch(object map[string]any, patch []byte) error {
+	merge := map[string]any{}
+	if err := json.Unmarshal(patch, &merge); err != nil {
+		return fmt.Errorf("decoding JSON merge patch: %w", err)
+	}
+
+	mergeInto(object, merge)
+
+	return nil
+}
+
+// mergeInto writes merge into object, deleting the keys whose merge value is null, as RFC 7396
+// defines the merge patch.
+func mergeInto(object, merge map[string]any) {
+	for key, value := range merge {
+		if value == nil {
+			delete(object, key)
+
+			continue
+		}
+
+		if nested, ok := object[key].(map[string]any); ok {
+			if mergeNested, ok := value.(map[string]any); ok {
+				mergeInto(nested, mergeNested)
+
+				continue
+			}
+		}
+
+		object[key] = value
+	}
+}
+
+// JSONPatchBetween returns the RFC 6902 operations that turn current into desired, as a patch
+// document. The controller uses it to report which parts of an object still differ after a
+// CanUpdateMachine call.
+func JSONPatchBetween(current, desired any) ([]byte, error) {
+	return jsonPatch(diffValue("", current, desired))
+}
+
 // jsonPatch renders operations as a JSON patch document.
 func jsonPatch(ops []jsonPatchOp) ([]byte, error) {
 	patch, err := json.Marshal(ops)

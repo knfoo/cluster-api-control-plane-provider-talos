@@ -112,6 +112,16 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
+	// A TalosConfig created with generateType carries no machine configuration data, so the
+	// extension cannot render a machine configuration for it. The answer is Success without a
+	// patch, which leaves current and desired different and makes Cluster API roll the Machine
+	// out; answering with Failure would turn the call into an error.
+	if currentSpec.Data == "" || desiredSpec.Data == "" {
+		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the TalosConfig has no machine configuration data, e.g. because it is generated with generateType")
+
+		return
+	}
+
 	if len(currentSpec.StrategicPatches) > 0 || len(desiredSpec.StrategicPatches) > 0 {
 		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the TalosConfig uses strategic patches, which the extension cannot evaluate")
 

@@ -118,6 +118,15 @@ func talosConfig(name, data string) runtime.RawExtension {
 	})
 }
 
+// generateTypeConfig is a TalosConfig created with generateType: GenerateType and Data are mutually
+// exclusive (cabptv1.TalosConfigSpec), so it carries no machine configuration data.
+func generateTypeConfig(name string) runtime.RawExtension {
+	return talosConfigRaw(name, map[string]any{
+		"talosVersion": "v1.14.0",
+		"generateType": "controlplane",
+	})
+}
+
 func machine(name, version string) clusterv1.Machine {
 	return clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -300,6 +309,16 @@ func TestCanUpdateMachineNoPatchForRolloutChanges(t *testing.T) {
 				"v1.33.1",
 			),
 		},
+		{
+			name: "generateType TalosConfig on both sides",
+			request: canUpdateRequest(
+				generateTypeConfig("talosconfig-1"),
+				generateTypeConfig("talosconfig-1"),
+				"talos-image",
+				"v1.33.1",
+				"v1.33.1",
+			),
+		},
 	}
 
 	for _, test := range tests {
@@ -431,6 +450,26 @@ func TestCanUpdateMachineNoPatchForStrategicPatches(t *testing.T) {
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
 	handler.CanUpdateMachine(canUpdateRequest(talosConfig("talosconfig-1", baseConfig), desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
+
+	expectNoInPlaceUpdate(g, resp, applier)
+}
+
+// TestCanUpdateMachineNoPatchForGenerateType checks that a TalosConfig created with generateType,
+// which has no machine configuration data, is answered with Success and no patch instead of Failure:
+// current and desired stay different, so Cluster API rolls the Machine out instead of the hook call
+// turning into an error.
+func TestCanUpdateMachineNoPatchForGenerateType(t *testing.T) {
+	g := NewWithT(t)
+	applier := newFakeApplier()
+	handler := NewHandler(applier, logr.Discard(), "", 0)
+
+	generateType := talosConfigRaw("talosconfig-1", map[string]any{
+		"talosVersion": "v1.14.0",
+		"generateType": "talos-image",
+	})
+
+	resp := &runtimehooksv1.CanUpdateMachineResponse{}
+	handler.CanUpdateMachine(canUpdateRequest(talosConfig("talosconfig-1", baseConfig), generateType, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
 }
