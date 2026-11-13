@@ -2,6 +2,8 @@ module github.com/siderolabs/cluster-api-control-plane-provider-talos
 
 go 1.26.5
 
+replace github.com/siderolabs/cluster-api-bootstrap-provider-talos => github.com/knfoo/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261112104454-8d74de3bc01c
+
 require (
 	github.com/coreos/go-semver v0.3.1
 	github.com/go-logr/logr v1.4.4
@@ -10,7 +12,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/onsi/gomega v1.44.0
 	github.com/pkg/errors v0.9.1
-	github.com/siderolabs/cluster-api-bootstrap-provider-talos v0.7.0-alpha.3
+	github.com/siderolabs/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261112104454-8d74de3bc01c
 	github.com/siderolabs/crypto v0.6.6
 	github.com/siderolabs/gen v0.8.8
 	github.com/siderolabs/go-retry v0.3.3

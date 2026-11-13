@@ -107,6 +107,11 @@ spec:
                                 type: array
                               data:
                                 type: string
+                              dataSecretKey:
+                                description: |-
+                                  DataSecretKey overrides the key name in the bootstrap data secret.
+                                  Defaults to "value". Set to "userData" for Metal3/BMH compatibility.
+                                type: string
                               generateType:
                                 type: string
                               hostname:
@@ -122,6 +127,43 @@ spec:
                                       "InfrastructureName" (use linked Machine's infrastructure's name).
                                     type: string
                                 type: object
+                              metadataFrom:
+                                description: |-
+                                  MetadataFrom specifies where to read infrastructure metadata for template
+                                  processing. When set, StrategicPatches are rendered through Go's
+                                  text/template engine. Supports flat key:value, YAML, or JSON formats.
+                                properties:
+                                  infrastructureMachine:
+                                    description: |-
+                                      InfrastructureMachine derives the metadata secret name from the
+                                      infrastructure machine reference (Machine.Spec.InfrastructureRef.Name).
+                                    properties:
+                                      dataKey:
+                                        description: 'DataKey is the key within the
+                                          secret data. Default: "metaData".'
+                                        type: string
+                                      secretNameSuffix:
+                                        description: |-
+                                          SecretNameSuffix is appended to the infrastructure machine name
+                                          to form the metadata secret name. Default: "-metadata".
+                                        type: string
+                                    type: object
+                                  secretRef:
+                                    description: SecretRef references a specific secret
+                                      containing metadata.
+                                    properties:
+                                      key:
+                                        description: 'Key within the secret data containing
+                                          the metadata. Default: "metaData".'
+                                        type: string
+                                      name:
+                                        description: Name of the secret in the same
+                                          namespace as the TalosConfig.
+                                        type: string
+                                    required:
+                                    - name
+                                    type: object
+                                type: object
                               strategicPatches:
                                 description: Talos Linux machine configuration strategic
                                   merge patch list.
@@ -130,6 +172,13 @@ spec:
                                 type: array
                               talosVersion:
                                 type: string
+                              templateVariables:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  TemplateVariables are inline key-value pairs merged into the template
+                                  context alongside metadata from MetadataFrom.
+                                type: object
                             required:
                             - generateType
                             type: object
@@ -153,6 +202,11 @@ spec:
                                 type: array
                               data:
                                 type: string
+                              dataSecretKey:
+                                description: |-
+                                  DataSecretKey overrides the key name in the bootstrap data secret.
+                                  Defaults to "value". Set to "userData" for Metal3/BMH compatibility.
+                                type: string
                               generateType:
                                 type: string
                               hostname:
@@ -168,6 +222,43 @@ spec:
                                       "InfrastructureName" (use linked Machine's infrastructure's name).
                                     type: string
                                 type: object
+                              metadataFrom:
+                                description: |-
+                                  MetadataFrom specifies where to read infrastructure metadata for template
+                                  processing. When set, StrategicPatches are rendered through Go's
+                                  text/template engine. Supports flat key:value, YAML, or JSON formats.
+                                properties:
+                                  infrastructureMachine:
+                                    description: |-
+                                      InfrastructureMachine derives the metadata secret name from the
+                                      infrastructure machine reference (Machine.Spec.InfrastructureRef.Name).
+                                    properties:
+                                      dataKey:
+                                        description: 'DataKey is the key within the
+                                          secret data. Default: "metaData".'
+                                        type: string
+                                      secretNameSuffix:
+                                        description: |-
+                                          SecretNameSuffix is appended to the infrastructure machine name
+                                          to form the metadata secret name. Default: "-metadata".
+                                        type: string
+                                    type: object
+                                  secretRef:
+                                    description: SecretRef references a specific secret
+                                      containing metadata.
+                                    properties:
+                                      key:
+                                        description: 'Key within the secret data containing
+                                          the metadata. Default: "metaData".'
+                                        type: string
+                                      name:
+                                        description: Name of the secret in the same
+                                          namespace as the TalosConfig.
+                                        type: string
+                                    required:
+                                    - name
+                                    type: object
+                                type: object
                               strategicPatches:
                                 description: Talos Linux machine configuration strategic
                                   merge patch list.
@@ -176,6 +267,13 @@ spec:
                                 type: array
                               talosVersion:
                                 type: string
+                              templateVariables:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  TemplateVariables are inline key-value pairs merged into the template
+                                  context alongside metadata from MetadataFrom.
+                                type: object
                             required:
                             - generateType
                             type: object
