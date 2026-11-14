@@ -142,8 +142,15 @@ func withUpdateInProgressAnnotation(obj client.Object) client.Object {
 	return copied
 }
 
-// applyOwned writes the spec and the metadata of an object with server-side apply under the field
-// manager of the TalosControlPlane, forcing ownership of the fields it sets.
+// applyOwned writes the spec and the update-in-progress annotation of an object with server-side apply
+// under the field manager of the TalosControlPlane, forcing ownership of the fields it sets.
+//
+// The trigger owns only the spec and the UpdateInProgressAnnotation, the way KubeadmControlPlane's
+// trigger writes the spec and the annotations it manages and nothing else (inplace_trigger.go:89-114).
+// The machine template's labels and annotations are applied by the metadata field manager,
+// capi-taloscontrolplane-metadata (machine_apply.go:138-165), so they are deliberately left out of
+// this apply: the two managers never own the same fields, and a label or annotation removed from the
+// template is removed from the object by the metadata manager rather than left behind by the trigger.
 //
 // InfraMachines and TalosConfigs are created with Create by this controller, so their spec is owned by
 // the manager that created them; an apply that is not forced would conflict with it and could not
@@ -172,9 +179,25 @@ func (r *TalosControlPlaneReconciler) applyOwned(ctx context.Context, obj client
 	modified.SetName(obj.GetName())
 	modified.SetNamespace(obj.GetNamespace())
 	modified.SetUID(obj.GetUID())
-	modified.SetLabels(obj.GetLabels())
-	modified.SetAnnotations(obj.GetAnnotations())
 	modified.SetOwnerReferences(obj.GetOwnerReferences())
+
+	// Only the update-in-progress annotation and the annotations that record the template the object was
+	// cloned from are owned here; the labels and the rest of the annotations belong to the metadata field
+	// manager (machine_apply.go:138-165). KubeadmControlPlane's trigger keeps the cloned-from annotations
+	// for the same reason (inplace_trigger.go:92-99): rollouts match machines by their infrastructure
+	// template through them.
+	annotations := map[string]string{}
+	for key, value := range obj.GetAnnotations() {
+		if key == clusterv1.TemplateClonedFromNameAnnotation ||
+			key == clusterv1.TemplateClonedFromGroupKindAnnotation ||
+			key == clusterv1.UpdateInProgressAnnotation {
+			annotations[key] = value
+		}
+	}
+
+	if len(annotations) > 0 {
+		modified.SetAnnotations(annotations)
+	}
 
 	if err := r.Client.Apply(ctx, client.ApplyConfigurationFromUnstructured(modified), client.ForceOwnership, client.FieldOwner(tcpManagerName)); err != nil {
 		return errors.Wrapf(err, "failed to apply %s %s", gvk.Kind, obj.GetName())

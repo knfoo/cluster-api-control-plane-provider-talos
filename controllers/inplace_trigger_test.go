@@ -6,7 +6,12 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
@@ -20,6 +25,7 @@ import (
 	runtimev1beta2 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
 )
@@ -288,4 +294,178 @@ func Test_MarkAsPending(t *testing.T) {
 	g.Expect(MarkAsPending(ctx, c, gotMachine, true, runtimehooksv1.CanUpdateMachine)).To(Succeed())
 	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(machine), gotMachine)).To(Succeed())
 	g.Expect(gotMachine.Annotations[runtimev1beta2.PendingHooksAnnotation]).To(Equal("UpdateMachine,CanUpdateMachine"))
+}
+
+// TestTriggerInPlaceUpdateLeavesLabelsToMetadataManager checks that the in-place trigger owns only the
+// spec and the update-in-progress annotation (issue #67). The machine template's labels and annotations
+// stay owned by the metadata field manager capi-taloscontrolplane-metadata (machine_apply.go:138-165),
+// so a label removed from the machine template and dropped by applyMetadata is gone from the InfraMachine
+// and the TalosConfig after an in-place update, instead of being kept by the trigger's field manager.
+// envtest is required because the fake client does not track managed fields.
+func TestTriggerInPlaceUpdateLeavesLabelsToMetadataManager(t *testing.T) {
+	g := NewWithT(t)
+
+	testEnv := &envtest.Environment{
+		CRDDirectoryPaths: []string{
+			crdDir(t),
+			filepath.Join("..", "config", "crd", "bases"),
+		},
+	}
+
+	cfg, err := testEnv.Start()
+	if err != nil {
+		if os.Getenv("KUBEBUILDER_ASSETS") == "" || strings.Contains(err.Error(), "no such file or directory") {
+			t.Skipf("envtest binaries are not available: %v", err)
+		}
+
+		t.Fatalf("failed to start envtest: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if stopErr := testEnv.Stop(); stopErr != nil {
+			t.Logf("failed to stop envtest: %v", stopErr)
+		}
+	})
+
+	scheme, err := inPlaceUpdateScheme()
+	g.Expect(err).ToNot(HaveOccurred())
+
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	machine, infraMachine, talosConfig, result, err := inPlaceUpdateObjects()
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// The machine template's labels and annotations, one of each the test removes later.
+	templateLabels := map[string]string{
+		clusterv1.ClusterNameLabel: "cluster-1",
+		"label-to-remove":         "value",
+		"label-kept":              "value",
+	}
+	templateAnnotations := map[string]string{
+		"annotation-1":         "annotation-value-1",
+		"annotation-to-remove": "value",
+	}
+
+	r := &TalosControlPlaneReconciler{Client: c, Scheme: scheme}
+
+	result.DesiredInfraMachine.SetLabels(templateLabels)
+	result.DesiredInfraMachine.SetAnnotations(map[string]string{
+		clusterv1.TemplateClonedFromNameAnnotation:      "infra-machine-template",
+		clusterv1.TemplateClonedFromGroupKindAnnotation: inPlaceInfraTemplateKind + ".infrastructure.cluster.x-k8s.io",
+		"annotation-1":                                  "annotation-value-1",
+		"annotation-to-remove":                          "value",
+	})
+	result.DesiredTalosConfig.Labels = templateLabels
+	result.DesiredTalosConfig.Annotations = templateAnnotations
+
+	g.Expect(c.Create(ctx, machine.DeepCopy())).To(Succeed())
+
+	// Create the InfraMachine and the TalosConfig the way the controller does: the spec under the
+	// TalosControlPlane field manager, the machine template's labels and annotations under the metadata
+	// field manager (machine_apply.go:138-165).
+	infraForCreate := infraMachine.DeepCopy()
+	infraForCreate.SetLabels(nil)
+	infraForCreate.SetAnnotations(withoutKeys(infraForCreate.GetAnnotations(), templateAnnotations))
+	g.Expect(r.applyOwned(ctx, infraForCreate)).To(Succeed())
+	g.Expect(r.applyMetadata(ctx, infraForCreate, templateLabels, templateAnnotations)).To(Succeed())
+
+	talosForCreate := talosConfig.DeepCopy()
+	talosForCreate.Labels = nil
+	talosForCreate.Annotations = nil
+	g.Expect(r.applyOwned(ctx, talosForCreate)).To(Succeed())
+	g.Expect(r.applyMetadata(ctx, talosForCreate, templateLabels, templateAnnotations)).To(Succeed())
+
+	// Trigger the in-place update.
+	g.Expect(r.triggerInPlaceUpdate(ctx, nil, machine.DeepCopy(), result)).To(Succeed())
+
+	// After the trigger, the TalosControlPlane field manager owns the spec, the update-in-progress
+	// annotation and the annotations that record the infrastructure template the object was cloned from,
+	// and no labels or other annotations.
+	gotInfra := &unstructured.Unstructured{}
+	gotInfra.SetGroupVersionKind(infraMachine.GroupVersionKind())
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(infraMachine), gotInfra)).To(Succeed())
+	g.Expect(gotInfra.Object["spec"]).To(BeComparableTo(result.DesiredInfraMachine.Object["spec"]))
+	g.Expect(gotInfra.GetAnnotations()[clusterv1.UpdateInProgressAnnotation]).To(Equal(""))
+	g.Expect(gotInfra.GetAnnotations()[clusterv1.TemplateClonedFromNameAnnotation]).To(Equal("infra-machine-template"))
+	owned := fieldsOwnedBy(gotInfra, tcpManagerName)
+	g.Expect(owned["f:spec"]).ToNot(BeNil())
+	metadata, _ := owned["f:metadata"].(map[string]any)
+	g.Expect(metadata).ToNot(BeNil())
+	g.Expect(metadata["f:labels"]).To(BeNil())
+	annotations, _ := metadata["f:annotations"].(map[string]any)
+	g.Expect(annotations["f:"+clusterv1.UpdateInProgressAnnotation]).ToNot(BeNil())
+	g.Expect(annotations["f:"+clusterv1.TemplateClonedFromNameAnnotation]).ToNot(BeNil())
+	for key := range templateAnnotations {
+		g.Expect(annotations["f:"+key]).To(BeNil())
+	}
+
+	gotTalosConfig := &cabptv1.TalosConfig{}
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(talosConfig), gotTalosConfig)).To(Succeed())
+	g.Expect(gotTalosConfig.Spec).To(BeComparableTo(result.DesiredTalosConfig.Spec))
+	g.Expect(gotTalosConfig.Annotations[clusterv1.UpdateInProgressAnnotation]).To(Equal(""))
+	owned = fieldsOwnedBy(gotTalosConfig, tcpManagerName)
+	g.Expect(owned["f:spec"]).ToNot(BeNil())
+	metadata, _ = owned["f:metadata"].(map[string]any)
+	g.Expect(metadata).ToNot(BeNil())
+	g.Expect(metadata["f:labels"]).To(BeNil())
+	annotations, _ = metadata["f:annotations"].(map[string]any)
+	g.Expect(annotations["f:"+clusterv1.UpdateInProgressAnnotation]).ToNot(BeNil())
+	for key := range templateAnnotations {
+		g.Expect(annotations["f:"+key]).To(BeNil())
+	}
+
+	// Remove a label and an annotation from the machine template and apply the metadata again: the keys
+	// the trigger never owned are removed from both objects.
+	reducedLabels := map[string]string{
+		clusterv1.ClusterNameLabel: "cluster-1",
+		"label-kept":              "value",
+	}
+	reducedAnnotations := map[string]string{
+		"annotation-1": "annotation-value-1",
+	}
+
+	g.Expect(r.applyMetadata(ctx, gotInfra, reducedLabels, reducedAnnotations)).To(Succeed())
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(infraMachine), gotInfra)).To(Succeed())
+	g.Expect(gotInfra.GetLabels()).To(Equal(reducedLabels))
+	g.Expect(gotInfra.GetAnnotations()).To(Equal(map[string]string{
+		"annotation-1":                                    "annotation-value-1",
+		clusterv1.UpdateInProgressAnnotation:              "",
+		clusterv1.TemplateClonedFromNameAnnotation:        "infra-machine-template",
+		clusterv1.TemplateClonedFromGroupKindAnnotation:   inPlaceInfraTemplateKind + ".infrastructure.cluster.x-k8s.io",
+	}))
+
+	g.Expect(r.applyMetadata(ctx, gotTalosConfig, reducedLabels, reducedAnnotations)).To(Succeed())
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(talosConfig), gotTalosConfig)).To(Succeed())
+	g.Expect(gotTalosConfig.Labels).To(Equal(reducedLabels))
+	g.Expect(gotTalosConfig.Annotations).To(Equal(map[string]string{
+		"annotation-1":                       "annotation-value-1",
+		clusterv1.UpdateInProgressAnnotation: "",
+	}))
+}
+
+// fieldsOwnedBy returns the fields of an object owned by the given apply field manager.
+func fieldsOwnedBy(obj client.Object, manager string) map[string]any {
+	merged := map[string]any{}
+	for _, managedField := range obj.GetManagedFields() {
+		if managedField.Manager != manager ||
+			managedField.Operation != metav1.ManagedFieldsOperationApply ||
+			managedField.Subresource != "" {
+			continue
+		}
+
+		var fields map[string]any
+		if err := json.Unmarshal(managedField.FieldsV1.GetRawBytes(), &fields); err != nil {
+			continue
+		}
+
+		for key, value := range fields {
+			merged[key] = value
+		}
+	}
+
+	return merged
 }
