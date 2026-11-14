@@ -20,8 +20,7 @@ import (
 )
 
 // fakeApplier stands in for a Talos node. It reports a reboot requirement when the
-// configuration touches the machine install image, which Talos cannot apply with mode
-// NO_REBOOT.
+// configuration touches the machine install image.
 type fakeApplier struct {
 	applied      map[string]string
 	alwaysReboot bool
@@ -118,8 +117,8 @@ func talosConfig(name, data string) runtime.RawExtension {
 	})
 }
 
-// generateTypeConfig is a TalosConfig created with generateType: GenerateType and Data are mutually
-// exclusive (cabptv1.TalosConfigSpec), so it carries no machine configuration data.
+// generateTypeConfig is a TalosConfig created with generateType, which carries no
+// machine configuration data.
 func generateTypeConfig(name string) runtime.RawExtension {
 	return talosConfigRaw(name, map[string]any{
 		"talosVersion": "v1.14.0",
@@ -131,8 +130,10 @@ func machine(name, version string) clusterv1.Machine {
 	return clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: clusterv1.MachineSpec{
-			Version:    version,
-			ProviderID: "talos://10.0.0.1",
+			ClusterName:       "test-cluster",
+			Version:           version,
+			ProviderID:        "talos://10.0.0.1",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{APIGroup: "infrastructure.cluster.x-k8s.io", Kind: "TalosInfraMachine", Name: "infra-machine"},
 		},
 	}
 }
@@ -434,42 +435,43 @@ func TestDiscovery(t *testing.T) {
 	g.Expect(hooks).To(ConsistOf("CanUpdateMachine", "UpdateMachine"))
 }
 
-// TestCanUpdateMachineNoPatchForStrategicPatches checks that a TalosConfig using strategic patches is
-// not updated in place: the extension cannot compute the machine configuration those patches produce,
-// so the Machine rolls out.
-func TestCanUpdateMachineNoPatchForStrategicPatches(t *testing.T) {
+// TestCanUpdateMachineRendersStrategicPatches checks the owner's condition (issue #56 item 2):
+// the strategicPatches of a generated TalosConfig are rendered through CABPT's pkg/templatepatch
+// engine and patched in place, instead of being refused.
+func TestCanUpdateMachineRendersStrategicPatches(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
 
-	desired := talosConfigRaw("talosconfig-1", map[string]any{
-		"talosVersion":     "v1.14.0",
-		"data":             baseConfig,
-		"strategicPatches": []string{"{\"machine\":{\"network\":{\"hostname\":\"new-host\"}}}"},
-	})
+	current := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-1"})
+	desired := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-2"})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(talosConfig("talosconfig-1", baseConfig), desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
-	expectNoInPlaceUpdate(g, resp, applier)
+	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(resp.BootstrapConfigPatch.PatchType).To(Equal(runtimehooksv1.JSONPatchType))
+	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
+	g.Expect(applier.dryRunRuns).To(Equal(1))
+	g.Expect(applier.applyRuns).To(BeZero())
 }
 
-// TestCanUpdateMachineNoPatchForGenerateType checks that a TalosConfig created with generateType,
-// which has no machine configuration data, is answered with Success and no patch instead of Failure:
-// current and desired stay different, so Cluster API rolls the Machine out instead of the hook call
-// turning into an error.
-func TestCanUpdateMachineNoPatchForGenerateType(t *testing.T) {
+// TestCanUpdateMachineRolloutForRebootRequiredRender checks that a rendered configuration
+// whose change Talos can only apply after a reboot - here the machine install image, set
+// through a strategic patch on a generated TalosConfig - gets no patch, so the Machine rolls out.
+func TestCanUpdateMachineRolloutForRebootRequiredRender(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
 
-	generateType := talosConfigRaw("talosconfig-1", map[string]any{
-		"talosVersion": "v1.14.0",
-		"generateType": "talos-image",
-	})
+	current := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-1"})
+	desired := generatedConfig(
+		[]string{hostnamePatch, `{"machine":{"install":{"image":"ghcr.io/siderolabs/installer:v1.14.5"}}}`},
+		map[string]string{"hostname": "control-plane-1"},
+	)
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(talosConfig("talosconfig-1", baseConfig), generateType, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
 }

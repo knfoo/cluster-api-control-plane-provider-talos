@@ -15,7 +15,6 @@ package inplaceupdate
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -23,7 +22,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
-	"k8s.io/apimachinery/pkg/runtime"
+	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 )
@@ -59,11 +58,21 @@ type Handler struct {
 	log             logr.Logger
 	timeout         time.Duration
 	defaultEndpoint string
+	metadata        MetadataReader
 }
 
 // NewHandler creates the extension handlers. endpoint is the fallback Talos address
-// used when the request carries none.
+// used when the request carries none. Without a metadata reader the extension renders
+// only the TalosConfigs that carry their machine configuration in spec.data.
 func NewHandler(applier Applier, log logr.Logger, endpoint string, timeout time.Duration) *Handler {
+	return NewHandlerWithMetadata(applier, log, endpoint, timeout, nil)
+}
+
+// NewHandlerWithMetadata creates the extension handlers with read access to the
+// management cluster objects needed to render a generated machine configuration and a
+// metadata-driven template: the Cluster of the machine, the cluster's Talos secrets
+// bundle and the metadata secrets a TalosConfig's metadataFrom points at.
+func NewHandlerWithMetadata(applier Applier, log logr.Logger, endpoint string, timeout time.Duration, metadata MetadataReader) *Handler {
 	if timeout <= 0 {
 		timeout = DefaultRequestTimeout
 	}
@@ -73,6 +82,7 @@ func NewHandler(applier Applier, log logr.Logger, endpoint string, timeout time.
 		log:             log,
 		timeout:         timeout,
 		defaultEndpoint: endpoint,
+		metadata:        metadata,
 	}
 }
 
@@ -112,34 +122,27 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	// A TalosConfig created with generateType carries no machine configuration data, so the
-	// extension cannot render a machine configuration for it. The answer is Success without a
-	// patch, which leaves current and desired different and makes Cluster API roll the Machine
-	// out; answering with Failure would turn the call into an error.
-	if currentSpec.Data == "" || desiredSpec.Data == "" {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the TalosConfig has no machine configuration data, e.g. because it is generated with generateType")
+	// The machine configuration of a TalosConfig is not the spec: it is the generated
+	// or supplied base configuration with the configuration patches and the (template
+	// rendered) strategic patches applied, exactly as the bootstrap provider builds it.
+	// A configuration the extension cannot render - a generated configuration without
+	// access to the cluster secrets, a template whose metadata is not available yet -
+	// is answered with Success and no patch, which leaves current and desired different
+	// and makes Cluster API roll the Machine out; answering with Failure would turn the
+	// call into an error.
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	defer cancel()
 
-		return
-	}
-
-	if len(currentSpec.StrategicPatches) > 0 || len(desiredSpec.StrategicPatches) > 0 {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the TalosConfig uses strategic patches, which the extension cannot evaluate")
-
-		return
-	}
-
-	currentConfig, err := machineConfig(currentSpec)
+	currentConfig, err := h.renderMachineConfig(ctx, currentSpec, req.Current.Machine)
 	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = err.Error()
+		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", err.Error())
 
 		return
 	}
 
-	desiredConfig, err := machineConfig(desiredSpec)
+	desiredConfig, err := h.renderMachineConfig(ctx, desiredSpec, req.Desired.Machine)
 	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = err.Error()
+		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", err.Error())
 
 		return
 	}
@@ -171,9 +174,6 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
-	defer cancel()
 
 	// The owner's condition: only a change the node accepts with mode
 	// ApplyConfigurationRequest_NO_REBOOT and DryRun is handled in place.
@@ -223,7 +223,12 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
-	config, err := machineConfig(spec)
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	defer cancel()
+
+	// CanUpdateMachine already rendered this configuration, so the same render is used
+	// here; a failure is a real error rather than a reason to roll the machine out.
+	config, err := h.renderMachineConfig(ctx, spec, req.Desired.Machine)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -238,9 +243,6 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
-	defer cancel()
 
 	status, err := h.applier.DryRun(ctx, endpoint, config)
 	if err != nil {
@@ -351,139 +353,41 @@ func (h *Handler) resolveEndpoint(settings map[string]string, machine clusterv1.
 	return "", errors.Errorf("cannot determine the Talos address of machine %q: set the %q setting of the ExtensionConfig or the --endpoint flag of the extension", machine.Name, SettingAddress)
 }
 
-// talosConfigSpec reads the TalosConfig spec out of the bootstrap config object of a
-// hook request.
-func talosConfigSpec(raw runtime.RawExtension) (cabptv1.TalosConfigSpec, error) {
-	data := raw.Raw
-
-	if data == nil {
-		if raw.Object == nil {
-			return cabptv1.TalosConfigSpec{}, errors.New("the bootstrap configuration of the machine is not a TalosConfig object")
-		}
-
-		var err error
-
-		data, err = json.Marshal(raw.Object)
-		if err != nil {
-			return cabptv1.TalosConfigSpec{}, errors.WithStack(err)
-		}
-	}
-
-	var object map[string]any
-	if err := json.Unmarshal(data, &object); err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.Wrap(err, "decoding the bootstrap configuration of the machine")
-	}
-
-	if kind, _ := object["kind"].(string); kind != "TalosConfig" {
-		return cabptv1.TalosConfigSpec{}, errors.Errorf("the bootstrap configuration of the machine is a %q, not a TalosConfig", kind)
-	}
-
-	specBytes, err := json.Marshal(object["spec"])
-	if err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.WithStack(err)
-	}
-
-	spec := cabptv1.TalosConfigSpec{}
-	if err := json.Unmarshal(specBytes, &spec); err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.Wrap(err, "decoding the TalosConfig spec of the machine")
-	}
-
-	return spec, nil
-}
-
-// infraSpec returns the spec of an infrastructure machine object.
-func infraSpec(raw runtime.RawExtension) any {
-	data := raw.Raw
-
-	if data == nil && raw.Object != nil {
-		data, _ = json.Marshal(raw.Object)
-	}
-
-	if len(data) == 0 {
-		return nil
-	}
-
-	var object map[string]any
-	if err := json.Unmarshal(data, &object); err != nil {
-		return nil
-	}
-
-	return object["spec"]
-}
-
-// machineConfig renders the machine configuration a TalosConfig describes: its data
-// with the RFC 6902 configuration patches applied.
-func machineConfig(spec cabptv1.TalosConfigSpec) ([]byte, error) {
-	if spec.Data == "" {
-		return nil, errors.New("the TalosConfig has no machine configuration data")
-	}
-
-	ops := make([]jsonPatchOp, 0, len(spec.ConfigPatches))
-
-	for _, patch := range spec.ConfigPatches {
-		ops = append(ops, jsonPatchOp{Op: patch.Op, Path: patch.Path, Value: patch.Value})
-	}
-
-	return applyConfigPatches([]byte(spec.Data), ops)
-}
-
-// configDiff computes the operations that turn one machine configuration into
-// another.
-func configDiff(current, desired []byte) ([]jsonPatchOp, error) {
-	currentDoc, err := machineConfigDocument(current)
+// renderMachineConfig builds the machine configuration a TalosConfig describes with the
+// bootstrap provider's exported pkg/machineconfig: Generate for a generateType TalosConfig,
+// then ApplyPatches for the RFC 6902 configPatches and the strategicPatches, whose
+// templates are rendered with the metadata of metadataFrom and the templateVariables.
+// The extension gathers only the inputs - the Cluster, the cluster's Talos secrets bundle
+// and the metadata secret - and passes them, so the generated configuration and the
+// rendered templates are identical to what the bootstrap controller writes.
+//
+// Follows the bootstrap provider's reconcileGenerate
+// (controllers/talosconfig_controller.go:478-640), which calls the same
+// pkg/machineconfig.Generate and pkg/machineconfig.ApplyPatches (stage T4b), reached
+// through the go.mod replace.
+func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) ([]byte, error) {
+	base, standardPatches, err := h.machineConfigBase(ctx, spec, machine)
 	if err != nil {
 		return nil, err
 	}
 
-	desiredDoc, err := machineConfigDocument(desired)
+	metadata, metadataPending, err := h.templateContext(ctx, spec, machine)
 	if err != nil {
 		return nil, err
 	}
 
-	return diffValue("", currentDoc, desiredDoc), nil
-}
-
-// specPatch computes the JSON patch that turns the current TalosConfig object into
-// the desired one. Only the spec is patched, as the hook contract requires.
-func specPatch(current, desired runtime.RawExtension) ([]byte, error) {
-	currentSpec, err := specObject(current)
+	config, err := machineconfig.ApplyPatches(base, machineconfig.PatchInput{
+		ConfigPatches:     machineConfigPatches(spec.ConfigPatches),
+		StrategicPatches:  spec.StrategicPatches,
+		StdPatches:        standardPatches,
+		Metadata:          metadata,
+		TemplateVariables: spec.TemplateVariables,
+		MetadataPending:   metadataPending,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	desiredSpec, err := specObject(desired)
-	if err != nil {
-		return nil, err
-	}
-
-	return jsonPatch(diffValue("/spec", currentSpec, desiredSpec))
+	return []byte(config), nil
 }
 
-func specObject(raw runtime.RawExtension) (map[string]any, error) {
-	data := raw.Raw
-
-	if data == nil {
-		if raw.Object == nil {
-			return nil, errors.New("the bootstrap configuration of the machine is not a TalosConfig object")
-		}
-
-		var err error
-
-		data, err = json.Marshal(raw.Object)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-	}
-
-	var object map[string]any
-	if err := json.Unmarshal(data, &object); err != nil {
-		return nil, errors.Wrap(err, "decoding the bootstrap configuration of the machine")
-	}
-
-	spec, ok := object["spec"].(map[string]any)
-	if !ok {
-		return nil, errors.New("the bootstrap configuration of the machine has no spec")
-	}
-
-	return spec, nil
-}

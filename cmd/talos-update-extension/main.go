@@ -26,18 +26,22 @@ import (
 	"github.com/go-logr/logr"
 	talosconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"github.com/spf13/pflag"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/component-base/logs"
 	logsv1 "k8s.io/component-base/logs/api/v1"
 	"k8s.io/klog/v2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/siderolabs/cluster-api-control-plane-provider-talos/pkg/inplaceupdate"
 )
 
-// The extension binary itself does not read the management cluster: the ExtensionConfig object that
-// registers it, and the namespaces that scope it, are read by the control plane controller and its RBAC
-// is in controllers/inplace.go, which generates config/rbac/role.yaml.
+// The extension binary reads the management cluster only when it is started with
+// --kubeconfig: rendering a generated machine configuration needs the Cluster object and
+// the cluster's Talos secrets bundle, and rendering a metadataFrom template needs the
+// metadata secret the infrastructure provider (Metal3/CAPM3) created. The rules it needs
+// are the ones the control plane controller already declares in config/rbac/role.yaml.
 
 // The hook paths are the ones the Runtime SDK catalog derives for the hooks. The
 // handler name registered in the ExtensionConfig is a suffix of the path, so these
@@ -53,6 +57,7 @@ var (
 	certFile        string
 	keyFile         string
 	talosconfigPath string
+	kubeconfigPath  string
 	defaultEndpoint string
 	requestTimeout  time.Duration
 	logOptions      = logs.NewOptions()
@@ -64,6 +69,7 @@ func main() {
 	fs.StringVar(&certFile, "cert-file", "", "PEM certificate the extension serves; required because Cluster API calls extensions over https")
 	fs.StringVar(&keyFile, "key-file", "", "PEM private key of --cert-file")
 	fs.StringVar(&talosconfigPath, "talosconfig", os.Getenv("TALOSCONFIG"), "path to the talosconfig used to talk to the machines")
+	fs.StringVar(&kubeconfigPath, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig of the management cluster; without it the extension renders only the TalosConfigs that carry their machine configuration in spec.data")
 	fs.StringVar(&defaultEndpoint, "endpoint", "", "fallback Talos API address of a machine, used when the request carries none")
 	fs.DurationVar(&requestTimeout, "timeout", inplaceupdate.DefaultRequestTimeout, "timeout of a single call to the Talos API")
 	logsv1.AddFlags(logOptions, fs)
@@ -89,7 +95,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := inplaceupdate.NewHandler(inplaceupdate.NewTalosApplier(config), log, defaultEndpoint, requestTimeout)
+	metadata, err := metadataReader(kubeconfigPath)
+	if err != nil {
+		log.Error(err, "connecting to the management cluster")
+		os.Exit(1)
+	}
+
+	handler := inplaceupdate.NewHandlerWithMetadata(inplaceupdate.NewTalosApplier(config), log, defaultEndpoint, requestTimeout, metadata)
 
 	server, err := hookServer(listenAddress, certFile, keyFile, handler, log)
 	if err != nil {
@@ -232,4 +244,31 @@ func fail(w http.ResponseWriter, err error) {
 	}
 
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+// metadataReader reads the management cluster objects the extension needs to render a
+// machine configuration. Without --kubeconfig it returns nil, and the extension answers
+// "no patch" for every TalosConfig it cannot render, so Cluster API rolls the machine
+// out instead of applying a configuration it guessed.
+func metadataReader(kubeconfigPath string) (inplaceupdate.MetadataReader, error) {
+	if kubeconfigPath == "" {
+		return nil, nil
+	}
+
+	kubeConfig, err := clientcmd.LoadFromFile(kubeconfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading the kubeconfig at %q: %w", kubeconfigPath, err)
+	}
+
+	restConfig, err := clientcmd.NewDefaultClientConfig(*kubeConfig, nil).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("building the kubeconfig at %q: %w", kubeconfigPath, err)
+	}
+
+	kubeClient, err := client.New(restConfig, client.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("connecting to the management cluster: %w", err)
+	}
+
+	return inplaceupdate.NewKubeMetadataReader(kubeClient), nil
 }

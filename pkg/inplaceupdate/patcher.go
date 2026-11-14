@@ -100,8 +100,9 @@ func jsonPatch(ops []jsonPatchOp) ([]byte, error) {
 }
 
 // documents splits a machine configuration into its YAML documents. Talos accepts
-// multi-document configurations; the extension handles a single document, which is
-// what the bootstrap provider writes into TalosConfigSpec.Data.
+// multi-document configurations: a configuration supplied in TalosConfigSpec.Data is a
+// single document, a generated one carries the machine and cluster settings in the first
+// document and the extension documents after it.
 func documents(data []byte) ([]map[string]any, error) {
 	chunks := []string{}
 	current := []string{}
@@ -154,6 +155,40 @@ func machineConfigDocument(data []byte) (map[string]any, error) {
 	}
 
 	return docs[0], nil
+}
+
+// configDiff computes the operations that turn one machine configuration into another.
+// Talos machine configurations generated for a Talos version with multidoc support carry
+// the machine and cluster settings in the first document and the extension documents
+// after it, so every document is diffed; only the first one addresses the paths Talos
+// keys by machine and cluster.
+func configDiff(current, desired []byte) ([]jsonPatchOp, error) {
+	currentDocs, err := documents(current)
+	if err != nil {
+		return nil, err
+	}
+
+	desiredDocs, err := documents(desired)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(currentDocs) != len(desiredDocs) {
+		return nil, fmt.Errorf("the machine configuration documents differ in count: %d and %d", len(currentDocs), len(desiredDocs))
+	}
+
+	ops := []jsonPatchOp{}
+
+	for index := range currentDocs {
+		prefix := ""
+		if index > 0 {
+			prefix = fmt.Sprintf("document%d", index)
+		}
+
+		ops = append(ops, diffValue(prefix, currentDocs[index], desiredDocs[index])...)
+	}
+
+	return ops, nil
 }
 
 // applyConfigPatches applies the RFC 6902 patches of a TalosConfig spec to the raw
