@@ -46,8 +46,16 @@ import (
 // The hook paths are the ones the Runtime SDK catalog derives for the hooks. The
 // handler name registered in the ExtensionConfig is a suffix of the path, so these
 // prefixes serve every registered handler name.
+//
+// The Discovery hook is registered without a handler name: catalog.GVHToPath
+// (sigs.k8s.io/cluster-api api/runtime/catalog/catalog.go:372) yields the bare path
+// without a trailing slash for it, and the Runtime SDK client never follows redirects
+// (internal/runtime/client/client.go:560-567). Go's ServeMux answers a nameless request
+// to a "/" prefix pattern with a 307 redirect, so the exact discovery path has to be
+// registered as well or discovery fails.
 const (
-	discoveryPath        = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/discovery/"
+	discoveryExactPath   = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/discovery"
+	discoveryPath        = discoveryExactPath + "/"
 	canUpdateMachinePath = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/canupdatemachine/"
 	updateMachinePath    = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/updatemachine/"
 )
@@ -144,6 +152,10 @@ func hookServer(address, certFile, keyFile string, handler *inplaceupdate.Handle
 	}
 
 	mux := http.NewServeMux()
+	// Serve the Discovery hook on the exact catalog path too: the request Cluster API
+	// sends for it has no handler name and no trailing slash (see the constants above),
+	// and a 307 redirect from the prefix pattern is not followed by the SDK client.
+	mux.HandleFunc(discoveryExactPath, discovery(handler, log))
 	mux.HandleFunc(discoveryPath, discovery(handler, log))
 	mux.HandleFunc(canUpdateMachinePath, canUpdateMachine(handler, log))
 	mux.HandleFunc(updateMachinePath, updateMachine(handler, log))

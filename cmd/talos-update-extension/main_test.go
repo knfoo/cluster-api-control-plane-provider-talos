@@ -100,6 +100,81 @@ func TestHookPathsMatchTheRuntimeCatalog(t *testing.T) {
 	}
 }
 
+// TestExtensionServesDiscoveryOnTheCatalogPath calls the hooks on the exact URLs the Runtime SDK
+// client builds (client.go urlForExtension: the service host joined with catalog.GVHToPath).
+// The Discovery hook has no handler name, so its path has no trailing slash; Go's ServeMux
+// redirects such a request to a registered "/" prefix with 307 and the SDK client does not
+// follow redirects, so the extension must answer the bare path itself.
+func TestExtensionServesDiscoveryOnTheCatalogPath(t *testing.T) {
+	g := NewWithT(t)
+
+	certPath, keyPath := selfSignedCertFiles(t)
+
+	handler := inplaceupdate.NewHandler(nil, logr.Discard(), "", 0)
+
+	server, err := hookServer("127.0.0.1:0", certPath, keyPath, handler, logr.Discard())
+	g.Expect(err).NotTo(HaveOccurred())
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	g.Expect(err).NotTo(HaveOccurred())
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		_ = server.Serve(tls.NewListener(listener, server.TLSConfig))
+	}()
+
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	cert, err := x509.ParseCertificate(pair.Certificate[0])
+	g.Expect(err).NotTo(HaveOccurred())
+
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+
+	// Like the Runtime SDK client (internal/runtime/client/client.go:560-567), this
+	// client does not follow redirects: the extension may not reroute a hook call.
+	client := &http.Client{
+		Transport:      &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	hookGVH := runtimecatalog.GroupVersionHook{
+		Group:   runtimehooksv1.GroupVersion.Group,
+		Version: runtimehooksv1.GroupVersion.Version,
+	}
+
+	// The Discovery hook: GVHToPath with an empty name, no trailing slash.
+	response, err := postJSON(ctx, client, fmt.Sprintf("https://127.0.0.1:%d%s", port,
+		runtimecatalog.GVHToPath(runtimecatalog.GroupVersionHook{Group: hookGVH.Group, Version: hookGVH.Version, Hook: "Discovery"}, "")))
+	g.Expect(err).NotTo(HaveOccurred())
+	defer response.Body.Close()
+	g.Expect(response.StatusCode).To(Equal(http.StatusOK), "the Discovery hook must answer on the bare catalog path, not redirect it")
+
+	discoveryResponse := &runtimehooksv1.DiscoveryResponse{}
+	g.Expect(json.NewDecoder(response.Body).Decode(discoveryResponse)).To(Succeed())
+	g.Expect(discoveryResponse.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+
+	// A registered handler: GVHToPath appends the canonical handler name (handler name
+	// "." ExtensionConfig name) to the hook path.
+	handlerResponse, err := postJSON(ctx, client, fmt.Sprintf("https://127.0.0.1:%d%s", port,
+		runtimecatalog.GVHToPath(runtimecatalog.GroupVersionHook{Group: hookGVH.Group, Version: hookGVH.Version, Hook: "CanUpdateMachine"},
+		"talos-in-place-update.talos-in-place-update")))
+	g.Expect(err).NotTo(HaveOccurred())
+	defer handlerResponse.Body.Close()
+	g.Expect(handlerResponse.StatusCode).To(Equal(http.StatusOK), "the CanUpdateMachine hook must answer on the catalog path of the registered handler")
+}
+
 // TestExtensionServesHooksOverHTTPS checks that the hooks are reachable over TLS with the certificate
 // from --cert-file and are not reachable over plain http: Cluster API only calls an extension whose
 // clientConfig.url is https.
