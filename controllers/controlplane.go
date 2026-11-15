@@ -306,8 +306,41 @@ func MatchesControlPlaneConfig(talosConfigs map[string]*cabptv1.TalosConfig, tcp
 			return true
 		}
 
-		return reflect.DeepEqual(tcp.Spec.ControlPlaneConfig.ControlPlaneConfig, talosConfig.Spec)
+		return reflect.DeepEqual(
+			withMetadataDefaults(tcp.Spec.ControlPlaneConfig.ControlPlaneConfig),
+			withMetadataDefaults(talosConfig.Spec),
+		)
 	}
+}
+
+// withMetadataDefaults returns a copy of cfg with the metadataFrom defaults applied. The TalosConfig
+// CRD defines these defaults (metadataFrom.secretRef.key "metaData", metadataFrom.infrastructureMachine.dataKey
+// "metaData" and metadataFrom.infrastructureMachine.secretNameSuffix "-metadata") and the API server fills
+// them in when a TalosConfig is stored, while the TalosControlPlane CRD does not define them. Comparing the
+// two specs without normalising therefore reports every Machine as not up to date whenever metadataFrom is
+// set, which triggers an endless rollout.
+func withMetadataDefaults(cfg cabptv1.TalosConfigSpec) cabptv1.TalosConfigSpec {
+	out := *cfg.DeepCopy()
+
+	if out.MetadataFrom == nil {
+		return out
+	}
+
+	if out.MetadataFrom.SecretRef != nil && out.MetadataFrom.SecretRef.Key == "" {
+		out.MetadataFrom.SecretRef.Key = "metaData"
+	}
+
+	if out.MetadataFrom.InfrastructureMachine != nil {
+		if out.MetadataFrom.InfrastructureMachine.DataKey == "" {
+			out.MetadataFrom.InfrastructureMachine.DataKey = "metaData"
+		}
+
+		if out.MetadataFrom.InfrastructureMachine.SecretNameSuffix == "" {
+			out.MetadataFrom.InfrastructureMachine.SecretNameSuffix = "-metadata"
+		}
+	}
+
+	return out
 }
 
 // inPlaceUpdateResult computes the objects an in-place update of one Machine would write, the way

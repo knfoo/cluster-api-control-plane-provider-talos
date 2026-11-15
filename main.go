@@ -28,6 +28,7 @@ import (
 	runtimev1beta2 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache" // for remote cluster client builder
 	"sigs.k8s.io/cluster-api/controllers/remote"
+	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/flags"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -73,6 +74,9 @@ func InitFlags(fs *pflag.FlagSet) {
 		"Webhook cert dir, only used when webhook-port is specified.")
 	fs.StringVar(&healthAddr, "health-addr", ":9440",
 		"The address the health endpoint binds to.")
+	// The manager reads the Cluster API feature gates (InPlaceUpdates among them) from --feature-gates,
+	// as KubeadmControlPlane does (controlplane/kubeadm/main.go:216).
+	feature.MutableGates.AddFlag(fs)
 	flags.AddManagerOptions(fs, &managerOptions)
 }
 
