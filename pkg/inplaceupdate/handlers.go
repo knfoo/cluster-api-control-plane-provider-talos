@@ -281,15 +281,20 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 // Discovery is the Discovery hook, so the extension can be registered with an
 // ExtensionConfig. Only the two in-place update hooks are implemented. The APIVersion
 // is the one the Runtime SDK catalog uses for the hook requests.
+//
+// Handler names must be unique inside an extension and valid DNS1123 labels: the Runtime
+// SDK client rejects a discovery response with a repeated handler name
+// (sigs.k8s.io/cluster-api/internal/runtime/client/client.go:774-786), so each hook gets
+// its own name rather than the extension name.
 func (h *Handler) Discovery(req *runtimehooksv1.DiscoveryRequest, resp *runtimehooksv1.DiscoveryResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 	resp.Handlers = []runtimehooksv1.ExtensionHandler{
 		{
-			Name:        "talos-in-place-update",
+			Name:        "can-update-machine",
 			RequestHook: runtimehooksv1.GroupVersionHook{APIVersion: runtimehooksv1.GroupVersion.String(), Hook: "CanUpdateMachine"},
 		},
 		{
-			Name:        "talos-in-place-update",
+			Name:        "update-machine",
 			RequestHook: runtimehooksv1.GroupVersionHook{APIVersion: runtimehooksv1.GroupVersion.String(), Hook: "UpdateMachine"},
 		},
 	}

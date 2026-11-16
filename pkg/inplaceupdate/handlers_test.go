@@ -15,6 +15,7 @@ import (
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 )
@@ -433,6 +434,29 @@ func TestDiscovery(t *testing.T) {
 	}
 
 	g.Expect(hooks).To(ConsistOf("CanUpdateMachine", "UpdateMachine"))
+}
+
+// TestDiscoveryHandlerNamesAreUnique reproduces the e2e failure of run 4bacb43-03356e7:
+// the Runtime SDK client rejects a discovery response that repeats a handler name and the
+// ExtensionConfig never gets the Discovered condition, so the extension is never called
+// (sigs.k8s.io/cluster-api/internal/runtime/client/client.go:774-786).
+func TestDiscoveryHandlerNamesAreUnique(t *testing.T) {
+	g := NewWithT(t)
+	handler := NewHandler(newFakeApplier(), logr.Discard(), "", 0)
+
+	resp := &runtimehooksv1.DiscoveryResponse{}
+	handler.Discovery(&runtimehooksv1.DiscoveryRequest{}, resp)
+
+	seen := map[string]int{}
+
+	for _, extensionHandler := range resp.Handlers {
+		g.Expect(validation.IsDNS1123Label(extensionHandler.Name)).To(BeEmpty(), "handler name %q must be a DNS1123 label", extensionHandler.Name)
+		seen[extensionHandler.Name]++
+	}
+
+	for name, count := range seen {
+		g.Expect(count).To(Equal(1), "handler name %q is announced more than once", name)
+	}
 }
 
 // TestCanUpdateMachineRendersStrategicPatches checks the owner's condition (issue #56 item 2):
