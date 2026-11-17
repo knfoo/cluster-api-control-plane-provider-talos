@@ -21,6 +21,7 @@ import (
 	runtimev1beta2 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 // hookRuntimeClient is the fork's counterpart of the fake RuntimeClient of Cluster API's Runtime SDK,
@@ -339,7 +340,53 @@ func TestCanUpdateMachineInfraMachineWithoutDryRun(t *testing.T) {
 	g.Expect(r.RuntimeClient.(*hookRuntimeClient).callExtensionCalls).To(Equal(1))
 }
 
-// TestCanUpdateMachineRequestIsCleanedUp checks that the request sent to the extension only carries the
+// TestCanUpdateMachineInfraMachineProviderWrittenFields covers the InfraMachine as the infrastructure
+// provider holds it: the API server object carries providerID and the ready flag the provider wrote,
+// while the InfraMachine computed from the InfraMachine template carries neither. Only the TalosConfig
+// changed, so the extension returns a patch for the TalosConfig and none for the InfraMachine, and the
+// Machine is still updated in place instead of rolled out.
+func TestCanUpdateMachineInfraMachineProviderWrittenFields(t *testing.T) {
+	g := NewWithT(t)
+
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.InPlaceUpdates, true)
+
+	result := testUpToDateResult()
+
+	// The InfraMachine the infrastructure provider wrote, as the API server stores it.
+	currentInfra := result.CurrentInfraMachine.Object["spec"].(map[string]any)
+	currentInfra["providerID"] = "talosinfra://e2e-control-plane-abcdefgh"
+	currentInfra["ready"] = true
+
+	// The InfraMachine cloned from the template of the same TalosControlPlane: the same spec, without the
+	// fields the provider wrote.
+	result.DesiredInfraMachine.Object["spec"] = map[string]any{"image": currentInfra["image"]}
+
+	c := fake.NewClientBuilder().WithObjects(result.CurrentInfraMachine.DeepCopy()).Build()
+
+	reason, req, err := createCanUpdateMachineRequest(context.Background(), c, testCurrentMachine(), result)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(reason).To(BeEmpty())
+
+	var desiredInfra map[string]any
+	g.Expect(json.Unmarshal(req.Desired.InfrastructureMachine.Raw, &desiredInfra)).To(Succeed())
+	g.Expect(desiredInfra["spec"].(map[string]any)["providerID"]).To(Equal("talosinfra://e2e-control-plane-abcdefgh"))
+	g.Expect(desiredInfra["spec"].(map[string]any)["ready"]).To(BeTrue())
+
+	r := &TalosControlPlaneReconciler{
+		Client: c,
+		RuntimeClient: &hookRuntimeClient{
+			handlers: []string{"talos-update.canupdatemachine"},
+			response: runtimehooksv1.CanUpdateMachineResponse{
+				BootstrapConfigPatch: jsonPatch(`[{"op":"replace","path":"/spec/data","value":"desired-machine-config"}]`),
+			},
+		},
+	}
+
+	canUpdateMachine, err := r.canUpdateMachine(context.Background(), testCurrentMachine(), result)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(canUpdateMachine).To(BeTrue())
+	g.Expect(r.RuntimeClient.(*hookRuntimeClient).callExtensionCalls).To(Equal(1))
+}
 // GVK, metadata and spec of the objects, the cleanup KubeadmControlPlane applies before calling the hook
 // (inplace_canupdatemachine.go:136-221).
 func TestCanUpdateMachineRequestIsCleanedUp(t *testing.T) {
@@ -353,8 +400,9 @@ func TestCanUpdateMachineRequestIsCleanedUp(t *testing.T) {
 	result.DesiredTalosConfig.Labels = map[string]string{"cluster.x-k8s.io/cluster-name": "test-cluster"}
 	result.DesiredInfraMachine.SetLabels(result.DesiredTalosConfig.Labels)
 
-	req, err := createCanUpdateMachineRequest(result.DesiredMachine, result)
+	reason, req, err := createCanUpdateMachineRequest(context.Background(), nil, result.DesiredMachine, result)
 	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(reason).To(BeEmpty())
 
 	currentTalosConfig := map[string]any{}
 	g.Expect(json.Unmarshal(req.Current.BootstrapConfig.Raw, &currentTalosConfig)).To(Succeed())

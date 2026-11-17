@@ -92,8 +92,12 @@ func (c *extensionRuntimeClient) GetAllExtensions(ctx context.Context, hook runt
 			if handler.RequestHook.Hook != hookName {
 				continue
 			}
-			// Canonical handler name "HANDLER_NAME.EXTENSION_NAME", as in upstream NameForHandler.
-			handlers = append(handlers, handler.Name+"."+extensionConfig.Name)
+			// Status.Handlers[].Name is already canonical ("HANDLER_NAME.EXTENSION_NAME"): discovery writes it
+			// with NameForHandler (sigs.k8s.io/cluster-api/internal/runtime/client/client.go:217-223) and the
+			// upstream runtime hook registry keys its registrations by it
+			// (sigs.k8s.io/cluster-api/internal/runtime/registry/registry.go:255), so GetAllExtensions returns
+			// it unchanged (client.go:306).
+			handlers = append(handlers, handler.Name)
 		}
 	}
 
@@ -131,25 +135,43 @@ func (c *extensionRuntimeClient) CallExtension(ctx context.Context, hook runtime
 		return errors.Wrapf(err, "failed to call extension handler %q", handler)
 	}
 
+	// An ExtensionConfig is namespaced, so the object behind a handler name is found by listing, like
+	// upstream builds its handler registry from the ExtensionConfig list
+	// (sigs.k8s.io/cluster-api/internal/runtime/registry/registry.go:236-261). A Get by name alone cannot
+	// resolve a namespaced object.
+	extensionConfigs := &runtimev1beta2.ExtensionConfigList{}
+	if err := c.client.List(ctx, extensionConfigs); err != nil {
+		return errors.Wrapf(err, "failed to call extension handler %q: failed to list ExtensionConfig objects", handler)
+	}
+
 	extensionConfig := &runtimev1beta2.ExtensionConfig{}
-	if err := c.client.Get(ctx, client.ObjectKey{Name: extensionName}, extensionConfig); err != nil {
-		return errors.Wrapf(err, "failed to call extension handler %q: failed to get ExtensionConfig %q", handler, extensionName)
-	}
-
-	// The handlers of an ExtensionConfig are only known once the Runtime SDK discovered them.
-	if !conditions.IsTrue(extensionConfig, runtimev1beta2.ExtensionConfigDiscoveredCondition) {
-		return errors.Errorf("failed to call extension handler %q: extension %q has not been discovered", handler, extensionName)
-	}
-
 	registration := runtimev1beta2.ExtensionHandler{}
 	found := false
 
-	for _, handlerRegistration := range extensionConfig.Status.Handlers {
-		// Canonical handler name "HANDLER_NAME.EXTENSION_NAME", as in upstream NameForHandler.
-		if handlerRegistration.Name+"."+extensionConfig.Name == handler {
-			registration = handlerRegistration
-			found = true
+	for i := range extensionConfigs.Items {
+		config := &extensionConfigs.Items[i]
+		if config.Name != extensionName {
+			continue
+		}
 
+		// The handlers of an ExtensionConfig are only known once the Runtime SDK discovered them.
+		if !conditions.IsTrue(config, runtimev1beta2.ExtensionConfigDiscoveredCondition) {
+			return errors.Errorf("failed to call extension handler %q: extension %q has not been discovered", handler, extensionName)
+		}
+
+		for _, handlerRegistration := range config.Status.Handlers {
+			// handler is the canonical name returned by GetAllExtensions and Status.Handlers[].Name is already
+			// canonical (discovery, client.go:217-223), so they are compared directly.
+			if handlerRegistration.Name == handler {
+				extensionConfig = config
+				registration = handlerRegistration
+				found = true
+
+				break
+			}
+		}
+
+		if found {
 			break
 		}
 	}
@@ -193,7 +215,10 @@ func (c *extensionRuntimeClient) CallExtension(ctx context.Context, hook runtime
 		return errors.Wrapf(err, "failed to call extension handler %q", handler)
 	}
 
-	httpClient, err := extensionHTTPClient(extensionConfig.Spec.ClientConfig.CABundle, extensionURL.Host)
+	// The pinned server name is the host without the port, as createHTTPClient is called with
+	// extensionURL.Hostname() upstream (client.go:531); a ServerName carrying the port never matches the
+	// extension certificate.
+	httpClient, err := extensionHTTPClient(extensionConfig.Spec.ClientConfig.CABundle, extensionURL.Hostname())
 	if err != nil {
 		return errors.Wrapf(err, "failed to call extension handler %q: failed to create the http client", handler)
 	}

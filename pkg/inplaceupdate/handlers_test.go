@@ -336,6 +336,53 @@ func TestCanUpdateMachineNoPatchForRolloutChanges(t *testing.T) {
 	}
 }
 
+// TestCanUpdateMachineIgnoresBootstrapMetadataWrittenByTheMachineController covers the
+// e2e case: the current Machine carries spec.bootstrap.dataSecretName written by the
+// Machine controller, the desired Machine carries only the ConfigRef, and the TalosConfig
+// changed. That is the normal in-place case, so the handler must not answer "the bootstrap
+// configuration reference changes" but return the machine configuration patch.
+func TestCanUpdateMachineIgnoresBootstrapMetadataWrittenByTheMachineController(t *testing.T) {
+	g := NewWithT(t)
+	applier := newFakeApplier()
+	handler := NewHandler(applier, logr.Discard(), "", 0)
+
+	dataSecretName := "talosconfig-1-bootstrap-data"
+	configRef := clusterv1.ContractVersionedObjectReference{
+		APIGroup: "bootstrap.cluster.x-k8s.io",
+		Kind:     "TalosConfig",
+		Name:     "talosconfig-1",
+	}
+
+	current := machine("control-plane-1", "v1.33.1")
+	current.Spec.Bootstrap = clusterv1.Bootstrap{ConfigRef: configRef, DataSecretName: &dataSecretName}
+
+	desired := machine("control-plane-1", "v1.33.1")
+	desired.Spec.Bootstrap = clusterv1.Bootstrap{ConfigRef: configRef}
+
+	request := &runtimehooksv1.CanUpdateMachineRequest{
+		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
+		Current: runtimehooksv1.CanUpdateMachineRequestObjects{
+			Machine:               current,
+			InfrastructureMachine: infraMachine("talos-image"),
+			BootstrapConfig:       talosConfig("talosconfig-1", baseConfig),
+		},
+		Desired: runtimehooksv1.CanUpdateMachineRequestObjects{
+			Machine:               desired,
+			InfrastructureMachine: infraMachine("talos-image"),
+			BootstrapConfig:       talosConfig("talosconfig-1", changedConfig),
+		},
+	}
+
+	resp := &runtimehooksv1.CanUpdateMachineResponse{}
+	handler.CanUpdateMachine(request, resp)
+
+	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(resp.BootstrapConfigPatch.PatchType).To(Equal(runtimehooksv1.JSONPatchType))
+	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
+	g.Expect(resp.MachinePatch.Patch).To(BeEmpty())
+	g.Expect(applier.dryRunRuns).To(Equal(1))
+}
+
 // TestUpdateMachineIdempotent checks that a second call with the same desired
 // configuration reports the update as finished.
 func TestUpdateMachineIdempotent(t *testing.T) {

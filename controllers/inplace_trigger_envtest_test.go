@@ -221,7 +221,7 @@ func Test_inPlaceUpdateEnvtest(t *testing.T) {
 			},
 			Handlers: []runtimev1beta2.ExtensionHandler{
 				{
-					Name: "update-machine",
+					Name: "update-machine.talos-updater",
 					RequestHook: runtimev1beta2.GroupVersionHook{
 						APIVersion: runtimehooksv1.GroupVersion.String(),
 						Hook:       "UpdateMachine",

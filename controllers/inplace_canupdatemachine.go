@@ -13,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	"github.com/siderolabs/cluster-api-control-plane-provider-talos/pkg/inplaceupdate"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -21,6 +22,7 @@ import (
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	"sigs.k8s.io/cluster-api/feature"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // canUpdateMachine decides whether a Machine can be updated in place instead of being rolled out. It
@@ -70,7 +72,19 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 		return false, errors.Errorf("found multiple CanUpdateMachine hooks (%s): only one hook is supported", strings.Join(extensionHandlers, ","))
 	}
 
-	canUpdate, reasons, err := r.canExtensionsUpdateMachine(ctx, machine, machineUpToDateResult, extensionHandlers)
+	reason, req, err := createCanUpdateMachineRequest(ctx, r.Client, machine, machineUpToDateResult)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to generate CanUpdateMachine request")
+	}
+	// The dry-run of the InfraMachine can itself rule out an in-place update, as in
+	// inplace_canupdatemachine.go:169-183.
+	if reason != "" {
+		log.Info(fmt.Sprintf("Machine %s cannot be updated in-place", klog.KObj(machine)), "reason", reason)
+
+		return false, nil
+	}
+
+	canUpdate, reasons, err := r.canExtensionsUpdateMachine(ctx, machine, req, extensionHandlers)
 	if err != nil {
 		return false, err
 	}
@@ -86,15 +100,11 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 // canExtensionsUpdateMachine calls the CanUpdateMachine extension and compares the patched current
 // objects with the desired ones, following canExtensionsUpdateMachine in inplace_canupdatemachine.go:92-134.
 // A failed call is an error, as in KubeadmControlPlane.
-func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Context, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult, extensionHandlers []string) (bool, []string, error) {
+func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Context, machine *clusterv1.Machine, req *runtimehooksv1.CanUpdateMachineRequest, extensionHandlers []string) (bool, []string, error) {
 	log := ctrl.LoggerFrom(ctx)
 
-	req, err := createCanUpdateMachineRequest(machine, machineUpToDateResult)
-	if err != nil {
-		return false, nil, errors.Wrapf(err, "failed to generate CanUpdateMachine request")
-	}
-
 	var reasons []string
+	var err error
 
 	for _, extensionHandler := range extensionHandlers {
 		resp := &runtimehooksv1.CanUpdateMachineResponse{}
@@ -134,17 +144,19 @@ func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Con
 // KubeadmControlPlane additionally runs a server-side apply dry-run on the Machine and the InfraMachine
 // to pick up defaulting (inplace_canupdatemachine.go:160-185). The TalosConfig has no defaulting webhook
 // (no +kubebuilder:default in the bootstrap provider's v1alpha3 API types), so the fork compares the
-// TalosConfig as computed. The InfraMachine is likewise compared without a dry-run: fields the
-// infrastructure provider wrote on it are matched only when the extension patches them.
-func createCanUpdateMachineRequest(machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) (*runtimehooksv1.CanUpdateMachineRequest, error) {
+// TalosConfig as computed. The InfraMachine is compared with the dry-run, like in the reference: the
+// infrastructure provider writes fields - e.g. providerID - on the InfraMachine that the object computed
+// from the InfraMachine template does not have, and without the dry-run they read as a change the
+// in-place update would have to make.
+func createCanUpdateMachineRequest(ctx context.Context, c client.Client, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) (string, *runtimehooksv1.CanUpdateMachineRequest, error) {
 	currentMachine := cleanupMachine(machine.DeepCopy())
 	desiredMachine := cleanupMachine(machineUpToDateResult.DesiredMachine.DeepCopy())
 
 	currentTalosConfig := cleanupTalosConfig(machineUpToDateResult.CurrentTalosConfig)
 	desiredTalosConfig := cleanupTalosConfig(machineUpToDateResult.DesiredTalosConfig)
 
-	currentInfraMachine := cleanupUnstructured(machineUpToDateResult.CurrentInfraMachine.DeepCopy())
-	desiredInfraMachine := cleanupUnstructured(machineUpToDateResult.DesiredInfraMachine.DeepCopy())
+	currentInfraMachine := machineUpToDateResult.CurrentInfraMachine.DeepCopy()
+	desiredInfraMachine := machineUpToDateResult.DesiredInfraMachine.DeepCopy()
 
 	// Sync the metadata the Machine controller writes from the desired to the current objects.
 	currentMetadata := currentTalosConfig["metadata"].(map[string]any)
@@ -152,6 +164,28 @@ func createCanUpdateMachineRequest(machine *clusterv1.Machine, machineUpToDateRe
 	currentMetadata["annotations"] = desiredTalosConfig["metadata"].(map[string]any)["annotations"]
 	currentInfraMachine.SetLabels(desiredInfraMachine.GetLabels())
 	currentInfraMachine.SetAnnotations(desiredInfraMachine.GetAnnotations())
+
+	// Apply the defaulting and the fields other controllers wrote on the InfraMachine to both sides of
+	// the diff, so only a real change in the InfraMachine spec counts as a rollout (inplace_canupdatemachine.go:169-183).
+	if err := dryRunApply(ctx, c, currentInfraMachine); err != nil {
+		// A validating webhook that rejects the InfraMachine also rejects the apply the in-place update
+		// would have to make, so the Machine is rolled out instead.
+		if apierrors.IsInvalid(err) || apierrors.IsForbidden(err) {
+			return fmt.Sprintf("server side apply dry-run for current InfraMachine failed: %s", err), nil, nil
+		}
+
+		return "", nil, errors.Wrapf(err, "server side apply dry-run failed for current InfraMachine")
+	}
+	if err := dryRunApply(ctx, c, desiredInfraMachine); err != nil {
+		if apierrors.IsInvalid(err) || apierrors.IsForbidden(err) {
+			return fmt.Sprintf("server side apply dry-run for desired InfraMachine failed: %s", err), nil, nil
+		}
+
+		return "", nil, errors.Wrapf(err, "server side apply dry-run failed for desired InfraMachine")
+	}
+
+	currentInfraMachine = cleanupUnstructured(currentInfraMachine)
+	desiredInfraMachine = cleanupUnstructured(desiredInfraMachine)
 
 	req := &runtimehooksv1.CanUpdateMachineRequest{
 		Current: runtimehooksv1.CanUpdateMachineRequestObjects{
@@ -166,22 +200,35 @@ func createCanUpdateMachineRequest(machine *clusterv1.Machine, machineUpToDateRe
 
 	req.Current.BootstrapConfig, err = convertToRawExtension(currentTalosConfig)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	req.Desired.BootstrapConfig, err = convertToRawExtension(desiredTalosConfig)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	req.Current.InfrastructureMachine, err = convertToRawExtension(currentInfraMachine)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	req.Desired.InfrastructureMachine, err = convertToRawExtension(desiredInfraMachine)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	return req, nil
+	return "", req, nil
+}
+
+// dryRunApply runs a dry-run server-side apply of obj with the field manager of the TalosControlPlane
+// controller, which writes the object the API server would store back into obj. Managed fields are
+// dropped first because the API server rejects a request that carries them.
+func dryRunApply(ctx context.Context, c client.Client, obj *unstructured.Unstructured) error {
+	if c == nil {
+		return nil
+	}
+
+	obj.SetManagedFields(nil)
+
+	return c.Apply(ctx, client.ApplyConfigurationFromUnstructured(obj), client.DryRunAll, client.FieldOwner(tcpManagerName))
 }
 
 // cleanupMachine mirrors cleanupMachine of inplace_canupdatemachine.go:223-238.

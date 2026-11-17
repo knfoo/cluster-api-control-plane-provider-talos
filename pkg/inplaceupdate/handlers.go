@@ -311,10 +311,15 @@ func rolloutReason(req *runtimehooksv1.CanUpdateMachineRequest) string {
 		return "the infrastructure machine reference changes"
 	}
 
-	if !equalJSON(req.Current.Machine.Spec.Bootstrap, req.Desired.Machine.Spec.Bootstrap) {
-		return "the bootstrap configuration reference changes"
-	}
-
+	// Machine.Spec.Bootstrap is deliberately not compared. spec.bootstrap.dataSecretName
+	// is written by the Machine controller from the bootstrap config's status, so the
+	// current and the desired Machine differ there for every control-plane Machine even
+	// though nothing about the bootstrap configuration is being rolled out. Cluster API
+	// zeroes the whole bootstrap spec before comparing Machine specs,
+	// inplace_canupdatemachine.go:329-334, which CACPPT mirrors in
+	// controllers/inplace_canupdatemachine.go:441-451. The bootstrap configuration an
+	// in-place update has to apply is the TalosConfig in req.{Current,Desired}.BootstrapConfig,
+	// compared from the rendered machine configuration below.
 	if !equalJSON(infraSpec(req.Current.InfrastructureMachine), infraSpec(req.Desired.InfrastructureMachine)) {
 		return "the infrastructure machine spec changes"
 	}

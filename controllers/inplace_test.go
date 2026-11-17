@@ -6,6 +6,10 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -67,9 +71,9 @@ func TestCanUpdateMachine(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                 string
-		enableInPlaceUpdates bool
-		getAllExtensions     map[string][]string
+		name                  string
+		enableInPlaceUpdates  bool
+		getAllExtensions      map[string][]string
 		getAllExtensionsErr   error
 		machineUpToDateResult UpToDateResult
 		wantCanUpdateMachine  bool
@@ -84,12 +88,12 @@ func TestCanUpdateMachine(t *testing.T) {
 			wantGetAllExtensions: 0,
 		},
 		{
-			name:                 "Return false if no CanUpdateMachine extension is registered",
-			enableInPlaceUpdates: true,
-			getAllExtensions:     map[string][]string{},
+			name:                  "Return false if no CanUpdateMachine extension is registered",
+			enableInPlaceUpdates:  true,
+			getAllExtensions:      map[string][]string{},
 			machineUpToDateResult: fullUpToDateResult(),
-			wantCanUpdateMachine: false,
-			wantGetAllExtensions: 1,
+			wantCanUpdateMachine:  false,
+			wantGetAllExtensions:  1,
 		},
 		{
 			name:                 "Return an error if more than one CanUpdateMachine extension is registered",
@@ -104,14 +108,14 @@ func TestCanUpdateMachine(t *testing.T) {
 			wantGetAllExtensions:  1,
 		},
 		{
-			name:                 "Return an error if the extension lookup fails",
-			enableInPlaceUpdates: true,
-			getAllExtensionsErr:  errors.New("extension lookup failed"),
+			name:                  "Return an error if the extension lookup fails",
+			enableInPlaceUpdates:  true,
+			getAllExtensionsErr:   errors.New("extension lookup failed"),
 			machineUpToDateResult: fullUpToDateResult(),
-			wantCanUpdateMachine: false,
-			wantError:            true,
-			wantErrorMessage:     "failed to get CanUpdateMachine extensions for Machine machine-to-in-place-update: extension lookup failed",
-			wantGetAllExtensions: 1,
+			wantCanUpdateMachine:  false,
+			wantError:             true,
+			wantErrorMessage:      "failed to get CanUpdateMachine extensions for Machine machine-to-in-place-update: extension lookup failed",
+			wantGetAllExtensions:  1,
 		},
 		{
 			name:                 "Return false with exactly one extension but no computed objects: nothing to compare",
@@ -181,8 +185,8 @@ func TestRuntimeClientGetAllExtensions(t *testing.T) {
 		Status: runtimev1beta2.ExtensionConfigStatus{
 			Conditions: []metav1.Condition{discovered},
 			Handlers: []runtimev1beta2.ExtensionHandler{
-				{Name: "can-update-machine", RequestHook: canUpdateMachineHook},
-				{Name: "update-machine", RequestHook: updateMachineHook},
+				{Name: "can-update-machine.talos-updater", RequestHook: canUpdateMachineHook},
+				{Name: "update-machine.talos-updater", RequestHook: updateMachineHook},
 			},
 		},
 	}
@@ -237,6 +241,97 @@ func TestRuntimeClientGetAllExtensions(t *testing.T) {
 	})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(handlers).To(ConsistOf("can-update-machine.talos-updater"))
+}
+
+// TestRuntimeClientCallExtensionCanonicalHandlerName drives the whole CanUpdateMachine call against a
+// stub extension, with an ExtensionConfig shaped the way Runtime SDK discovery writes it: the handler
+// names in Status.Handlers already carry the extension name. It reproduces the failure of the in-place
+// update e2e, where the handler was looked up with the extension name appended a second time and
+// rejected as not being in the `HANDLER_NAME.EXTENSION_NAME` format.
+func TestRuntimeClientCallExtensionCanonicalHandlerName(t *testing.T) {
+	g := NewWithT(t)
+
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
+
+	canUpdateMachineHook := runtimev1beta2.GroupVersionHook{
+		APIVersion: runtimehooksv1.GroupVersion.String(),
+		Hook:       "CanUpdateMachine",
+	}
+
+	hookPath := ""
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hookPath = r.URL.Path
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(runtimehooksv1.CanUpdateMachineResponse{
+			CommonResponse: runtimehooksv1.CommonResponse{
+				Status: runtimehooksv1.ResponseStatusSuccess,
+			},
+		})
+	}))
+	defer server.Close()
+
+	extension := &runtimev1beta2.ExtensionConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "talos-in-place-update",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Spec: runtimev1beta2.ExtensionConfigSpec{
+			ClientConfig: runtimev1beta2.ClientConfig{
+				URL:      server.URL + "/api",
+				CABundle: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}),
+			},
+			NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": metav1.NamespaceDefault}},
+		},
+		Status: runtimev1beta2.ExtensionConfigStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   runtimev1beta2.ExtensionConfigDiscoveredCondition,
+					Status: metav1.ConditionTrue,
+					Reason: runtimev1beta2.ExtensionConfigDiscoveredReason,
+				},
+			},
+			Handlers: []runtimev1beta2.ExtensionHandler{
+				{Name: "can-update-machine.talos-in-place-update", RequestHook: canUpdateMachineHook, FailurePolicy: runtimev1beta2.FailurePolicyFail},
+			},
+		},
+	}
+
+	machineNamespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   metav1.NamespaceDefault,
+			Labels: map[string]string{"kubernetes.io/metadata.name": metav1.NamespaceDefault},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	g.Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(runtimev1beta2.AddToScheme(scheme)).To(Succeed())
+
+	runtimeClient := NewRuntimeClient(fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(extension, machineNamespace).
+		Build())
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "machine-to-in-place-update",
+			Namespace: metav1.NamespaceDefault,
+		},
+	}
+
+	ctx := context.Background()
+
+	handlers, err := runtimeClient.GetAllExtensions(ctx, runtimehooksv1.CanUpdateMachine, machine)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(handlers).To(ConsistOf("can-update-machine.talos-in-place-update"))
+
+	response := &runtimehooksv1.CanUpdateMachineResponse{}
+	err = runtimeClient.CallExtension(ctx, runtimehooksv1.CanUpdateMachine, machine, handlers[0], &runtimehooksv1.CanUpdateMachineRequest{}, response)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(response.GetStatus()).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(hookPath).To(Equal("/api/hooks.runtime.cluster.x-k8s.io/v1alpha1/canupdatemachine/can-update-machine"))
 }
 
 // fullUpToDateResult is an UpToDateResult whose objects are all present, so tryInPlaceUpdate gets to
