@@ -6,11 +6,14 @@
 //
 // It answers only CanUpdateMachine and UpdateMachine (proposal
 // docs/proposals/in-place-updates.md, section 6 row L4). The owner's condition
-// (docs/adr/ADR-0003) is that a TalosConfig change is handled in place only when it
-// is a machine configuration change that Talos accepts with ApplyConfiguration mode
-// ApplyConfigurationRequest_NO_REBOOT after a DryRun. Everything else - a Talos
-// version change, a Kubernetes version change, an infrastructure change, or a change
-// Talos says needs a reboot - gets no patch, so Cluster API rolls the machine out.
+// (docs/adr/ADR-0003, amended 2026-11-15) is that a TalosConfig change is handled in place
+// only when it is a machine configuration change that Talos accepts with ApplyConfiguration
+// mode ApplyConfigurationRequest_NO_REBOOT after a DryRun. A Kubernetes version change of a
+// control-plane Machine is handled in place as well, one control-plane component at a time,
+// the way talosctl upgrade-k8s does it (pkg/inplaceupdate/kubernetes.go). Everything else -
+// a Talos version change, a Kubernetes version change that is not the next minor version, an
+// infrastructure change, or a change Talos says needs a reboot - gets no patch, so Cluster
+// API rolls the machine out.
 package inplaceupdate
 
 import (
@@ -155,12 +158,6 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	if len(ops) == 0 {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the machine configuration does not change")
-
-		return
-	}
-
 	if reason := rebootRequiredReason(ops); reason != "" {
 		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", reason)
 
@@ -175,9 +172,52 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
+	// The owner's condition (docs/adr/ADR-0003 as amended on 2026-11-15): a Kubernetes
+	// version change of a control-plane Machine is handled in place too, as the
+	// proposal's kcp-version-update example does. The Machine patch carries spec.version,
+	// and the machine configuration the node has to accept is the rendered desired
+	// configuration with the control-plane component images patched step by step, so the
+	// DryRun below covers both changes.
+	versionUpgrade := req.Current.Machine.Spec.Version != req.Desired.Machine.Spec.Version
+
+	config := desiredConfig
+
+	if versionUpgrade {
+		nodeStatus, err := h.applier.NodeStatus(ctx, endpoint)
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = err.Error()
+
+			return
+		}
+
+		// Stage L4c covers control-plane Machines: a node that runs no control-plane
+		// component (a worker Machine) is not upgraded in place by a Kubernetes version
+		// change here, so it gets no patch and Cluster API rolls it out (stage L5).
+		if !nodeStatus.hasControlPlane() {
+			h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the machine runs no control-plane components")
+
+			return
+		}
+
+		config, err = stagedKubernetesConfig(desiredConfig, nodeStatus, req.Desired.Machine.Spec.Version)
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = err.Error()
+
+			return
+		}
+	}
+
+	if len(ops) == 0 && !versionUpgrade {
+		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the machine configuration does not change")
+
+		return
+	}
+
 	// The owner's condition: only a change the node accepts with mode
 	// ApplyConfigurationRequest_NO_REBOOT and DryRun is handled in place.
-	status, err := h.applier.DryRun(ctx, endpoint, desiredConfig)
+	status, err := h.applier.DryRun(ctx, endpoint, config)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -191,17 +231,36 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	patch, err := specPatch(req.Current.BootstrapConfig, req.Desired.BootstrapConfig)
-	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = err.Error()
+	if versionUpgrade {
+		machinePatch, err := jsonPatch([]jsonPatchOp{{Op: "replace", Path: "/spec/version", Value: req.Desired.Machine.Spec.Version}})
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = err.Error()
 
-		return
+			return
+		}
+
+		resp.MachinePatch = runtimehooksv1.Patch{
+			PatchType: runtimehooksv1.JSONPatchType,
+			Patch:     machinePatch,
+		}
+
+		h.log.Info("machine Kubernetes version can be updated in place", "machine", machine, "endpoint", endpoint, "version", req.Desired.Machine.Spec.Version)
 	}
 
-	resp.BootstrapConfigPatch = runtimehooksv1.Patch{
-		PatchType: runtimehooksv1.JSONPatchType,
-		Patch:     patch,
+	if len(ops) > 0 {
+		patch, err := specPatch(req.Current.BootstrapConfig, req.Desired.BootstrapConfig)
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = err.Error()
+
+			return
+		}
+
+		resp.BootstrapConfigPatch = runtimehooksv1.Patch{
+			PatchType: runtimehooksv1.JSONPatchType,
+			Patch:     patch,
+		}
 	}
 
 	h.log.Info("machine can be updated in place", "machine", machine, "endpoint", endpoint, "operations", len(ops))
@@ -209,7 +268,10 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 
 // UpdateMachine is the UpdateMachine hook. It applies the machine configuration with
 // mode NO_REBOOT and is idempotent: a second call with the same desired configuration
-// reports the update as completed.
+// reports the update as completed. When the node runs Kubernetes components, the
+// configuration applied is the staged one of pkg/inplaceupdate/kubernetes.go, and the
+// update is completed only when the node reports every control-plane component at the
+// Machine's version.
 func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
@@ -244,6 +306,31 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
+	nodeStatus, err := h.applier.NodeStatus(ctx, endpoint)
+	if err != nil {
+		resp.Status = runtimehooksv1.ResponseStatusFailure
+		resp.Message = err.Error()
+
+		return
+	}
+
+	// A node that runs Kubernetes components is upgraded one control-plane component at a
+	// time, in the order of kubernetesComponents (pkg/inplaceupdate/kubernetes.go). A node
+	// that does not - a machine whose control plane has not started yet - gets the plain
+	// machine configuration apply of stage L4b.
+	target := req.Desired.Machine.Spec.Version
+	staged := target != "" && nodeStatus.hasControlPlane()
+
+	if staged {
+		config, err = stagedKubernetesConfig(config, nodeStatus, target)
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = err.Error()
+
+			return
+		}
+	}
+
 	status, err := h.applier.DryRun(ctx, endpoint, config)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
@@ -252,7 +339,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
-	if status.NoChanges {
+	if status.NoChanges && (!staged || componentsAtTarget(nodeStatus, target)) {
 		h.log.Info("machine configuration is already applied", "machine", machine, "endpoint", endpoint)
 		resp.RetryAfterSeconds = 0
 
@@ -274,6 +361,12 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 	}
 
 	resp.RetryAfterSeconds = DefaultRetryAfterSeconds
+
+	if staged {
+		h.log.Info("machine configuration applied in place", "machine", machine, "endpoint", endpoint, "component", firstComponentNotAtTarget(nodeStatus, target))
+
+		return
+	}
 
 	h.log.Info("machine configuration applied in place", "machine", machine, "endpoint", endpoint)
 }
@@ -303,7 +396,7 @@ func (h *Handler) Discovery(req *runtimehooksv1.DiscoveryRequest, resp *runtimeh
 // rolloutReason returns why the request cannot be handled by a machine
 // configuration change, or "" when it can.
 func rolloutReason(req *runtimehooksv1.CanUpdateMachineRequest) string {
-	if req.Current.Machine.Spec.Version != req.Desired.Machine.Spec.Version {
+	if req.Current.Machine.Spec.Version != req.Desired.Machine.Spec.Version && !kubernetesVersionUpgrade(req.Current.Machine.Spec.Version, req.Desired.Machine.Spec.Version) {
 		return "the Kubernetes version changes"
 	}
 

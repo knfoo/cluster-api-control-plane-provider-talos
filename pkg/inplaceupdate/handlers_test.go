@@ -21,16 +21,31 @@ import (
 )
 
 // fakeApplier stands in for a Talos node. It reports a reboot requirement when the
-// configuration touches the machine install image.
+// configuration touches the machine install image, and it reads the Kubernetes component
+// images out of the configuration it was given, the way a node reports them through its
+// COSI resources.
 type fakeApplier struct {
 	applied      map[string]string
 	alwaysReboot bool
 	dryRunRuns   int
 	applyRuns    int
+	node         NodeStatus
 }
 
 func newFakeApplier() *fakeApplier {
 	return &fakeApplier{applied: map[string]string{}}
+}
+
+// controlPlaneNode runs the control-plane components of Kubernetes 1.33.1, with the
+// kubelet image suffix the bootstrap provider gives it.
+func controlPlaneNode() NodeStatus {
+	return NodeStatus{
+		APIServer:         "registry.k8s.io/kube-apiserver:v1.33.1",
+		ControllerManager: "registry.k8s.io/kube-controller-manager:v1.33.1",
+		Scheduler:         "registry.k8s.io/kube-scheduler:v1.33.1",
+		Proxy:             "registry.k8s.io/kube-proxy:v1.33.1",
+		Kubelet:           "ghcr.io/siderolabs/kubelet:v1.33.1-fat",
+	}
 }
 
 func (f *fakeApplier) status(endpoint string, config []byte) ApplyStatus {
@@ -45,6 +60,10 @@ func (f *fakeApplier) status(endpoint string, config []byte) ApplyStatus {
 	return ApplyStatus{Details: "the node accepts the configuration with mode NO_REBOOT"}
 }
 
+func (f *fakeApplier) NodeStatus(_ context.Context, _ string) (NodeStatus, error) {
+	return f.node, nil
+}
+
 func (f *fakeApplier) DryRun(_ context.Context, endpoint string, config []byte) (ApplyStatus, error) {
 	f.dryRunRuns++
 
@@ -54,8 +73,73 @@ func (f *fakeApplier) DryRun(_ context.Context, endpoint string, config []byte) 
 func (f *fakeApplier) Apply(_ context.Context, endpoint string, config []byte) error {
 	f.applyRuns++
 	f.applied[endpoint] = string(config)
+	f.node = nodeStatusFromConfig(config)
 
 	return nil
+}
+
+// nodeStatusFromConfig reads the Kubernetes component images of a machine configuration,
+// both of the v1alpha1 form (cluster/apiServer/image, machine/kubelet/image) and of the
+// documents a generated configuration carries (KubeAPIServerConfig and friends).
+func nodeStatusFromConfig(data []byte) NodeStatus {
+	status := NodeStatus{}
+
+	docs, err := documents(data)
+	if err != nil {
+		return status
+	}
+
+	for _, doc := range docs {
+		for _, document := range []struct {
+			kind  string
+			image *string
+		}{
+			{kind: "KubeAPIServerConfig", image: &status.APIServer},
+			{kind: "KubeControllerManagerConfig", image: &status.ControllerManager},
+			{kind: "KubeSchedulerConfig", image: &status.Scheduler},
+			{kind: "KubeProxyConfig", image: &status.Proxy},
+			{kind: "KubeletConfig", image: &status.Kubelet},
+		} {
+			if doc["kind"] == document.kind {
+				if image, ok := doc["image"].(string); ok && image != "" {
+					*document.image = image
+				}
+			}
+		}
+
+		if cluster, ok := doc["cluster"].(map[string]any); ok {
+			setComponentImage(&status.APIServer, componentImageOf(cluster, "apiServer"))
+			setComponentImage(&status.ControllerManager, componentImageOf(cluster, "controllerManager"))
+			setComponentImage(&status.Scheduler, componentImageOf(cluster, "scheduler"))
+			setComponentImage(&status.Proxy, componentImageOf(cluster, "proxy"))
+		}
+
+		if machine, ok := doc["machine"].(map[string]any); ok {
+			setComponentImage(&status.Kubelet, componentImageOf(machine, "kubelet"))
+		}
+	}
+
+	return status
+}
+
+func componentImageOf(document map[string]any, key string) string {
+	value, ok := document[key].(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	image, ok := value["image"].(string)
+	if !ok {
+		return ""
+	}
+
+	return image
+}
+
+func setComponentImage(target *string, image string) {
+	if image != "" {
+		*target = image
+	}
 }
 
 const baseConfig = `version: v1alpha1
@@ -257,7 +341,11 @@ func TestCanUpdateMachineNoPatchWhenDryRunNeedsReboot(t *testing.T) {
 }
 
 // TestCanUpdateMachineNoPatchForRolloutChanges checks the changes the owner keeps as
-// rollouts: Talos version, Kubernetes version and infrastructure changes.
+// rollouts: Talos version and infrastructure changes. A Kubernetes version change is not in
+// this list since the owner's amendment of 2026-11-15: an adjacent Kubernetes version
+// change of a control-plane Machine is updated in place (see
+// TestCanUpdateMachineInPlaceKubernetesVersion), a non-adjacent one still rolls out (see
+// TestCanUpdateMachineRolloutForNonAdjacentKubernetesVersion).
 func TestCanUpdateMachineNoPatchForRolloutChanges(t *testing.T) {
 	g := NewWithT(t)
 
@@ -273,16 +361,6 @@ func TestCanUpdateMachineNoPatchForRolloutChanges(t *testing.T) {
 				"talos-image",
 				"v1.33.1",
 				"v1.33.1",
-			),
-		},
-		{
-			name: "Kubernetes version change",
-			request: canUpdateRequest(
-				talosConfig("talosconfig-1", baseConfig),
-				talosConfig("talosconfig-1", changedConfig),
-				"talos-image",
-				"v1.33.1",
-				"v1.34.0",
 			),
 		},
 		{
@@ -334,6 +412,151 @@ func TestCanUpdateMachineNoPatchForRolloutChanges(t *testing.T) {
 			expectNoInPlaceUpdate(g, resp, applier)
 		})
 	}
+}
+
+// TestCanUpdateMachineInPlaceKubernetesVersion checks the owner's amendment of 2026-11-15:
+// an adjacent Kubernetes version change of a control-plane Machine is handled in place. The
+// response carries the patch for Machine spec.version, together with the TalosConfig patch
+// the machine configuration diff produces, and the node is DryRun once.
+func TestCanUpdateMachineInPlaceKubernetesVersion(t *testing.T) {
+	g := NewWithT(t)
+
+	tests := []struct {
+		name             string
+		current          runtime.RawExtension
+		desired          runtime.RawExtension
+		wantsConfigPatch bool
+	}{
+		{
+			name:             "with TalosConfig changes",
+			current:          talosConfig("talosconfig-1", baseConfig),
+			desired:          talosConfig("talosconfig-1", changedConfig),
+			wantsConfigPatch: true,
+		},
+		{
+			name:             "the Kubernetes version alone",
+			current:          talosConfig("talosconfig-1", baseConfig),
+			desired:          talosConfig("talosconfig-1", baseConfig),
+			wantsConfigPatch: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			applier := newFakeApplier()
+			applier.node = controlPlaneNode()
+			handler := NewHandler(applier, logr.Discard(), "", 0)
+
+			resp := &runtimehooksv1.CanUpdateMachineResponse{}
+			handler.CanUpdateMachine(canUpdateRequest(test.current, test.desired, "talos-image", "v1.33.1", "v1.34.0"), resp)
+
+			g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+			g.Expect(resp.MachinePatch.PatchType).To(Equal(runtimehooksv1.JSONPatchType))
+
+			ops := []jsonPatchOp{}
+			g.Expect(json.Unmarshal(resp.MachinePatch.Patch, &ops)).To(Succeed())
+			g.Expect(ops).To(ContainElement(jsonPatchOp{Op: "replace", Path: "/spec/version", Value: "v1.34.0"}))
+
+			if test.wantsConfigPatch {
+				g.Expect(resp.BootstrapConfigPatch.PatchType).To(Equal(runtimehooksv1.JSONPatchType))
+				g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
+			} else {
+				g.Expect(resp.BootstrapConfigPatch.Patch).To(BeEmpty())
+			}
+
+			g.Expect(resp.InfrastructureMachinePatch.Patch).To(BeEmpty())
+			g.Expect(applier.dryRunRuns).To(Equal(1))
+			g.Expect(applier.applyRuns).To(BeZero())
+		})
+	}
+}
+
+// TestCanUpdateMachineRolloutForNonAdjacentKubernetesVersion checks the fix of the attempt-3
+// review: Talos supports the Kubernetes versions around the one it ships, so a jump of more
+// than one minor version, a patch version and a downgrade are not upgrades in place.
+func TestCanUpdateMachineRolloutForNonAdjacentKubernetesVersion(t *testing.T) {
+	g := NewWithT(t)
+
+	tests := []struct {
+		name    string
+		current string
+		desired string
+	}{
+		{name: "two minor versions", current: "v1.33.1", desired: "v1.35.0"},
+		{name: "a patch version", current: "v1.33.1", desired: "v1.33.2"},
+		{name: "a downgrade", current: "v1.34.0", desired: "v1.33.1"},
+		{name: "an unparsable version", current: "v1.33.1", desired: "not-a-version"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			applier := newFakeApplier()
+			applier.node = controlPlaneNode()
+			handler := NewHandler(applier, logr.Discard(), "", 0)
+
+			resp := &runtimehooksv1.CanUpdateMachineResponse{}
+			handler.CanUpdateMachine(
+				canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", test.current, test.desired),
+				resp,
+			)
+
+			expectNoInPlaceUpdate(g, resp, applier)
+		})
+	}
+}
+
+// TestUpdateMachineKubernetesVersionStages checks that UpdateMachine moves the control-plane
+// components in the order talosctl upgrade-k8s uses - kube-apiserver, kube-controller-manager,
+// kube-scheduler, kube-proxy, kubelet - and reports progress until the node runs every
+// component at the target version.
+func TestUpdateMachineKubernetesVersionStages(t *testing.T) {
+	g := NewWithT(t)
+
+	applier := newFakeApplier()
+	applier.node = controlPlaneNode()
+	handler := NewHandler(applier, logr.Discard(), "", 0)
+
+	request := &runtimehooksv1.UpdateMachineRequest{
+		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
+		Desired: runtimehooksv1.UpdateMachineRequestObjects{
+			Machine:               machine("control-plane-1", "v1.34.0"),
+			InfrastructureMachine: infraMachine("talos-image"),
+			BootstrapConfig:       talosConfig("talosconfig-1", changedConfig),
+		},
+	}
+
+	for index, component := range kubernetesComponents {
+		resp := &runtimehooksv1.UpdateMachineResponse{}
+		handler.UpdateMachine(request, resp)
+
+		g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+		g.Expect(resp.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)))
+
+		g.Expect(componentAtTarget(component.image(applier.node), "v1.34.0")).To(BeTrue(), "machine configuration for %q did not advance %s", component.name, component.name)
+
+		if index+1 < len(kubernetesComponents) {
+			next := kubernetesComponents[index+1]
+
+			g.Expect(componentAtTarget(next.image(applier.node), "v1.34.0")).To(BeFalse(), "%s was upgraded before %s", next.name, component.name)
+		}
+	}
+
+	g.Expect(applier.applyRuns).To(Equal(len(kubernetesComponents)))
+
+	done := &runtimehooksv1.UpdateMachineResponse{}
+	handler.UpdateMachine(request, done)
+
+	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(done.RetryAfterSeconds).To(BeZero())
+	g.Expect(applier.applyRuns).To(Equal(len(kubernetesComponents)))
+	g.Expect(componentsAtTarget(applier.node, "v1.34.0")).To(BeTrue())
+
+	applied := applier.applied["10.0.0.1"]
+	g.Expect(applied).To(ContainSubstring("kube-apiserver:v1.34.0"))
+	g.Expect(applied).To(ContainSubstring("kube-controller-manager:v1.34.0"))
+	g.Expect(applied).To(ContainSubstring("kube-scheduler:v1.34.0"))
+	g.Expect(applied).To(ContainSubstring("kube-proxy:v1.34.0"))
+	g.Expect(applied).To(ContainSubstring("kubelet:v1.34.0"))
 }
 
 // TestCanUpdateMachineIgnoresBootstrapMetadataWrittenByTheMachineController covers the
@@ -568,4 +791,48 @@ func TestUpdateMachineNeedsAnEndpoint(t *testing.T) {
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusFailure))
 	g.Expect(resp.Message).To(ContainSubstring("cannot determine the Talos address"))
 	g.Expect(applier.applyRuns).To(BeZero())
+}
+
+// TestUpdateMachineWorkerMachineCompletes checks that a Machine whose node reports only a
+// kubelet still finishes the staged apply instead of retrying forever.
+func TestUpdateMachineWorkerMachineCompletes(t *testing.T) {
+	g := NewWithT(t)
+
+	applier := newFakeApplier()
+	applier.node = NodeStatus{Kubelet: "ghcr.io/siderolabs/kubelet:v1.33.1-fat"}
+	handler := NewHandler(applier, logr.Discard(), "", 0)
+
+	request := &runtimehooksv1.UpdateMachineRequest{
+		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
+		Desired: runtimehooksv1.UpdateMachineRequestObjects{
+			Machine:               machine("worker-1", "v1.33.1"),
+			InfrastructureMachine: infraMachine("talos-image"),
+			BootstrapConfig:       talosConfig("talosconfig-1", changedConfig),
+		},
+	}
+
+	first := &runtimehooksv1.UpdateMachineResponse{}
+	handler.UpdateMachine(request, first)
+	g.Expect(first.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(first.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)))
+
+	second := &runtimehooksv1.UpdateMachineResponse{}
+	handler.UpdateMachine(request, second)
+	g.Expect(second.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(second.RetryAfterSeconds).To(BeZero(), "worker node never reports the update complete; applyRuns=%d", applier.applyRuns)
+}
+
+// TestCanUpdateMachineRolloutForWorkerMachineKubernetesVersion checks that a Kubernetes version change of a Machine
+// whose node runs no control-plane components is not handled in place.
+func TestCanUpdateMachineRolloutForWorkerMachineKubernetesVersion(t *testing.T) {
+	g := NewWithT(t)
+
+	applier := newFakeApplier()
+	applier.node = NodeStatus{Kubelet: "ghcr.io/siderolabs/kubelet:v1.33.1-fat"}
+	handler := NewHandler(applier, logr.Discard(), "", 0)
+
+	resp := &runtimehooksv1.CanUpdateMachineResponse{}
+	handler.CanUpdateMachine(canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"), resp)
+
+	expectNoInPlaceUpdate(g, resp, applier)
 }
