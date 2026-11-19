@@ -10,7 +10,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/resource/meta"
 	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/pkg/errors"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
@@ -21,13 +24,15 @@ import (
 // NodeStatus reports the Kubernetes components a node runs, read from the COSI resources
 // of the node. An empty image means the node does not report that component, which is not
 // an error: a node that reports no Kubernetes component at all is not upgraded through the
-// staged Kubernetes path.
+// staged Kubernetes path. Etcd is the etcd the node's kube-apiserver configuration points
+// at, which a control-plane node always reports and a worker Machine never has.
 type NodeStatus struct {
 	APIServer         string
 	ControllerManager string
 	Scheduler         string
 	Proxy             string
 	Kubelet           string
+	Etcd              []string
 }
 
 // hasKubernetes reports whether the node runs any Kubernetes component.
@@ -37,9 +42,9 @@ func (s NodeStatus) hasKubernetes() bool {
 
 // hasControlPlane reports whether the node runs control-plane components. A node with
 // only a kubelet (a worker Machine) has no control-plane component configuration
-// resources, so the staged Kubernetes path can never report it complete.
+// resources and no etcd, so the staged Kubernetes path can never report it complete.
 func (s NodeStatus) hasControlPlane() bool {
-	return s.APIServer != "" || s.ControllerManager != "" || s.Scheduler != ""
+	return s.APIServer != "" || s.ControllerManager != "" || s.Scheduler != "" || len(s.Etcd) > 0
 }
 
 // applyConfigurationRequest builds the Talos API request for a machine
@@ -133,8 +138,9 @@ func (a *TalosApplier) Apply(ctx context.Context, endpoint string, config []byte
 // NodeStatus reads the images of the control-plane components from the COSI state of the
 // node. The final- resources are the configurations Talos renders for the running pods, so
 // they are preferred and the plain resources are the fallback, mirroring the watch of the
-// control-plane component configurations in .lap/sources/reference/files/talos_managed.go
-// (watchControlPlaneConfigResource). A component the node does not report stays empty.
+// control-plane component configurations in the reference upgrade
+// (config/laps/references/talos-upgrade-k8s-v1.14.5/talos_managed.go, watchControlPlaneConfigResource).
+// A component the node does not report stays empty.
 func (a *TalosApplier) NodeStatus(ctx context.Context, endpoint string) (NodeStatus, error) {
 	if endpoint == "" {
 		return NodeStatus{}, errors.New("no Talos endpoint for the machine")
@@ -151,37 +157,91 @@ func (a *TalosApplier) NodeStatus(ctx context.Context, endpoint string) (NodeSta
 
 	defer client.Close()
 
-	nodeCtx := talosclient.WithNodes(ctx, endpoint)
+	return nodeStatusOf(ctx, client.COSI, endpoint)
+}
+
+// nodeStatusOf reads one node's Kubernetes components from its COSI state. The reads are
+// addressed to that single node with client.WithNode: client.WithNodes is deprecated
+// ("Use WithNode and client-side multiplexing instead") and aggregates the answers of all
+// nodes into one response, which is not a read of one node's resources.
+func nodeStatusOf(ctx context.Context, reader state.CoreStateReader, endpoint string) (NodeStatus, error) {
+	nodeCtx := talosclient.WithNode(ctx, endpoint)
 	status := NodeStatus{}
 
-	if apiserver, err := safe.StateGetByID[*k8s.APIServerConfig](nodeCtx, client.COSI, k8s.FinalAPIServerConfigID); err == nil {
+	apiserver, err := componentConfig[*k8s.APIServerConfig](nodeCtx, reader, k8s.FinalAPIServerConfigID, k8s.APIServerConfigID)
+	if err != nil {
+		return NodeStatus{}, errors.Wrapf(err, "reading the kube-apiserver configuration of Talos node %q", endpoint)
+	}
+
+	if apiserver != nil {
 		status.APIServer = apiserver.TypedSpec().Image
-	} else if apiserver, err := safe.StateGetByID[*k8s.APIServerConfig](nodeCtx, client.COSI, k8s.APIServerConfigID); err == nil {
-		status.APIServer = apiserver.TypedSpec().Image
+		status.Etcd = apiserver.TypedSpec().EtcdServers
 	}
 
-	if controllerManager, err := safe.StateGetByID[*k8s.ControllerManagerConfig](nodeCtx, client.COSI, k8s.FinalControllerManagerConfigID); err == nil {
+	controllerManager, err := componentConfig[*k8s.ControllerManagerConfig](nodeCtx, reader, k8s.FinalControllerManagerConfigID, k8s.ControllerManagerConfigID)
+	if err != nil {
+		return NodeStatus{}, errors.Wrapf(err, "reading the kube-controller-manager configuration of Talos node %q", endpoint)
+	}
+
+	if controllerManager != nil {
 		status.ControllerManager = controllerManager.TypedSpec().Image
-	} else if controllerManager, err := safe.StateGetByID[*k8s.ControllerManagerConfig](nodeCtx, client.COSI, k8s.ControllerManagerConfigID); err == nil {
-		status.ControllerManager = controllerManager.TypedSpec().Image
 	}
 
-	if scheduler, err := safe.StateGetByID[*k8s.SchedulerConfig](nodeCtx, client.COSI, k8s.FinalSchedulerConfigID); err == nil {
-		status.Scheduler = scheduler.TypedSpec().Image
-	} else if scheduler, err := safe.StateGetByID[*k8s.SchedulerConfig](nodeCtx, client.COSI, k8s.SchedulerConfigID); err == nil {
+	scheduler, err := componentConfig[*k8s.SchedulerConfig](nodeCtx, reader, k8s.FinalSchedulerConfigID, k8s.SchedulerConfigID)
+	if err != nil {
+		return NodeStatus{}, errors.Wrapf(err, "reading the kube-scheduler configuration of Talos node %q", endpoint)
+	}
+
+	if scheduler != nil {
 		status.Scheduler = scheduler.TypedSpec().Image
 	}
 
-	if manifests, err := safe.StateGetByID[*k8s.BootstrapManifestsConfig](nodeCtx, client.COSI, k8s.BootstrapManifestsConfigID); err == nil {
+	manifests, err := safe.StateGetByID[*k8s.BootstrapManifestsConfig](nodeCtx, reader, k8s.BootstrapManifestsConfigID)
+	if err != nil && !state.IsNotFoundError(err) {
+		return NodeStatus{}, errors.Wrapf(err, "reading the bootstrap manifests of Talos node %q", endpoint)
+	}
+
+	if manifests != nil {
 		status.Proxy = manifests.TypedSpec().ProxyImage
 	}
 
-	if kubelet, err := safe.StateGetByID[*k8s.KubeletSpec](nodeCtx, client.COSI, k8s.KubeletID); err == nil {
+	kubelet, err := safe.StateGetByID[*k8s.KubeletSpec](nodeCtx, reader, k8s.KubeletID)
+	if err != nil && !state.IsNotFoundError(err) {
+		return NodeStatus{}, errors.Wrapf(err, "reading the kubelet specification of Talos node %q", endpoint)
+	}
+
+	if kubelet != nil {
 		status.Kubelet = kubelet.TypedSpec().Image
 	}
 
 	return status, nil
 }
+
+// componentConfig reads the COSI resource holding the configuration of one control-plane
+// component of a node: the final- resource Talos renders for the running pod, falling back
+// to the plain resource. No resource at all is not an error, it is a node that does not run
+// that component. Every other read error is returned: a failed read must never be read as
+// "this node runs no control plane", because that answers CanUpdateMachine with "the
+// machine runs no control-plane components" and UpdateMachine with a plain configuration
+// apply, so the staged Kubernetes update never starts.
+func componentConfig[T meta.ResourceWithRD](ctx context.Context, reader state.CoreStateReader, finalID, plainID resource.ID) (T, error) {
+	config, err := safe.StateGetByID[T](ctx, reader, finalID)
+	if err == nil {
+		return config, nil
+	}
+
+	if state.IsNotFoundError(err) {
+		config, err = safe.StateGetByID[T](ctx, reader, plainID)
+		if err != nil && !state.IsNotFoundError(err) {
+			return config, err
+		}
+
+		return config, nil
+	}
+
+	return config, err
+}
+
 
 func (a *TalosApplier) request(ctx context.Context, endpoint string, config []byte, dryRun bool) (ApplyStatus, error) {
 	if endpoint == "" {

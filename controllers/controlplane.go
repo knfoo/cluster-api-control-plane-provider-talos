@@ -358,6 +358,13 @@ func (c *ControlPlane) inPlaceUpdateResult(machine *clusterv1.Machine) (UpToDate
 		CurrentTalosConfig:  c.talosConfigs[machine.Name],
 	}
 
+	// computeDesiredMachine keeps the Machine's version, which only changes through a rollout, so the
+	// in-place update has to carry the Kubernetes version of the TalosControlPlane itself: a Machine
+	// whose version differs from the TalosControlPlane's is exactly the Machine that is not up to date
+	// and has to be updated in place. KubeadmControlPlane does the same in matchesMachineSpec
+	// (pkg/filters.go:141 of the Cluster API reference).
+	result.DesiredMachine.Spec.Version = c.TCP.Spec.Version
+
 	if c.infraTemplate == nil || result.CurrentInfraMachine == nil || result.CurrentTalosConfig == nil {
 		return result, nil
 	}
