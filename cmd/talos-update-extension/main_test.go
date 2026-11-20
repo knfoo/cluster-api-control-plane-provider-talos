@@ -87,6 +87,7 @@ func TestHookPathsMatchTheRuntimeCatalog(t *testing.T) {
 	}{
 		{hook: "Discovery", serve: discoveryPath},
 		{hook: "CanUpdateMachine", serve: canUpdateMachinePath},
+		{hook: "CanUpdateMachineSet", serve: canUpdateMachineSetPath},
 		{hook: "UpdateMachine", serve: updateMachinePath},
 	} {
 		path := runtimecatalog.GVHToPath(runtimecatalog.GroupVersionHook{
@@ -142,7 +143,7 @@ func TestExtensionServesDiscoveryOnTheCatalogPath(t *testing.T) {
 	// Like the Runtime SDK client (internal/runtime/client/client.go:560-567), this
 	// client does not follow redirects: the extension may not reroute a hook call.
 	client := &http.Client{
-		Transport:      &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+		Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
@@ -169,10 +170,18 @@ func TestExtensionServesDiscoveryOnTheCatalogPath(t *testing.T) {
 	// "." ExtensionConfig name) to the hook path.
 	handlerResponse, err := postJSON(ctx, client, fmt.Sprintf("https://127.0.0.1:%d%s", port,
 		runtimecatalog.GVHToPath(runtimecatalog.GroupVersionHook{Group: hookGVH.Group, Version: hookGVH.Version, Hook: "CanUpdateMachine"},
-		"talos-in-place-update.talos-in-place-update")))
+			"talos-in-place-update.talos-in-place-update")))
 	g.Expect(err).NotTo(HaveOccurred())
 	defer handlerResponse.Body.Close()
 	g.Expect(handlerResponse.StatusCode).To(Equal(http.StatusOK), "the CanUpdateMachine hook must answer on the catalog path of the registered handler")
+
+	// The MachineDeployment hook for the Machines of a MachineSet.
+	machineSetHandlerResponse, err := postJSON(ctx, client, fmt.Sprintf("https://127.0.0.1:%d%s", port,
+		runtimecatalog.GVHToPath(runtimecatalog.GroupVersionHook{Group: hookGVH.Group, Version: hookGVH.Version, Hook: "CanUpdateMachineSet"},
+			"talos-in-place-update.talos-in-place-update")))
+	g.Expect(err).NotTo(HaveOccurred())
+	defer machineSetHandlerResponse.Body.Close()
+	g.Expect(machineSetHandlerResponse.StatusCode).To(Equal(http.StatusOK), "the CanUpdateMachineSet hook must answer on the catalog path of the registered handler")
 }
 
 // TestExtensionServesHooksOverHTTPS checks that the hooks are reachable over TLS with the certificate
@@ -234,7 +243,7 @@ func TestExtensionServesHooksOverHTTPS(t *testing.T) {
 		hooks = append(hooks, extensionHandler.RequestHook.Hook)
 	}
 
-	g.Expect(hooks).To(ConsistOf("CanUpdateMachine", "UpdateMachine"))
+	g.Expect(hooks).To(ConsistOf("CanUpdateMachine", "CanUpdateMachineSet", "UpdateMachine"))
 
 	// The same port does not serve the hooks over plain http: the connection fails, or Go's TLS listener
 	// answers the plaintext request with 400 "Client sent an HTTP request to an HTTPS server".

@@ -86,6 +86,21 @@ var kubernetesComponents = []kubernetesComponent{
 	},
 }
 
+// upgradeComponents returns the Kubernetes components a node has to run at the target
+// Kubernetes version. A node with control-plane components is upgraded in the order of
+// kubernetesComponents; a node without them - a worker Machine of a MachineDeployment -
+// only runs the kubelet, and talosctl upgrade-k8s upgrades exactly that component on such
+// a node (.lap/sources/reference/files/kubelet.go: upgradeKubeletOnNode).
+func upgradeComponents(status NodeStatus) []kubernetesComponent {
+	if status.hasControlPlane() {
+		return kubernetesComponents
+	}
+
+	// The kubelet is the last component of kubernetesComponents, and a worker node has no
+	// static pod to patch: only machine/kubelet/image changes.
+	return kubernetesComponents[len(kubernetesComponents)-1:]
+}
+
 // kubernetesVersionUpgrade reports whether the Kubernetes version of a Machine changes to
 // the next minor version, the only Kubernetes version change handled in place. Talos
 // supports the versions around the one it ships (compatibility.SupportedKubernetesVersions),
@@ -129,12 +144,12 @@ func kubernetesMinor(version string) (int, int, error) {
 	return major, minor, nil
 }
 
-// componentsAtTarget reports whether every control-plane component the node runs already
+// componentsAtTarget reports whether every Kubernetes component the node runs already
 // runs the target Kubernetes version. The kubelet image carries the -fat/-slim suffix, so
 // only the version part is compared: compatibility.KubernetesVersionFromImageRef reports
 // "1.34.0-fat" for ghcr.io/siderolabs/kubelet:v1.34.0-fat.
 func componentsAtTarget(status NodeStatus, target string) bool {
-	for _, component := range kubernetesComponents {
+	for _, component := range upgradeComponents(status) {
 		if componentAtTarget(component.image(status), target) {
 			continue
 		}
@@ -152,7 +167,7 @@ func componentsAtTarget(status NodeStatus, target string) bool {
 // firstComponentNotAtTarget returns the next component of the upgrade order the node does
 // not yet run at the target version, or "" when every component is there.
 func firstComponentNotAtTarget(status NodeStatus, target string) string {
-	for _, component := range kubernetesComponents {
+	for _, component := range upgradeComponents(status) {
 		if !componentAtTarget(component.image(status), target) {
 			return component.name
 		}
@@ -184,10 +199,12 @@ func componentAtTarget(image, target string) bool {
 }
 
 // stagedKubernetesConfig patches the machine configuration for one step of the Kubernetes
-// version upgrade: the components of kubernetesComponents up to and including the first one
-// the node does not yet run at the target version. Components the node already upgraded are
-// patched to the same image again, which is what makes the configuration stable across the
-// hook calls of one update.
+// version upgrade: the components of upgradeComponents(status) up to and including the first
+// one the node does not yet run at the target version. Components the node already upgraded
+// are patched to the same image again, which is what makes the configuration stable across
+// the hook calls of one update. For a worker Machine the list is the kubelet alone, the
+// patch talosctl upgrade-k8s applies to a node without control-plane components
+// (.lap/sources/reference/files/kubelet.go: upgradeKubeletOnNode).
 func stagedKubernetesConfig(data []byte, status NodeStatus, target string) ([]byte, error) {
 	container, err := configpatcher.WithBytes(data).Config()
 	if err != nil {
@@ -196,7 +213,7 @@ func stagedKubernetesConfig(data []byte, status NodeStatus, target string) ([]by
 
 	patches := []configpatcher.Patch{}
 
-	for _, component := range kubernetesComponents {
+	for _, component := range upgradeComponents(status) {
 		current := component.image(status)
 
 		patch, err := stdpatches.PreparePatch(component.patch(component.contract(container), componentImage(current, component.defaultImage, target)))

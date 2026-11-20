@@ -26,6 +26,7 @@ import (
 // COSI resources.
 type fakeApplier struct {
 	applied      map[string]string
+	endpoints    []string
 	alwaysReboot bool
 	dryRunRuns   int
 	applyRuns    int
@@ -60,18 +61,22 @@ func (f *fakeApplier) status(endpoint string, config []byte) ApplyStatus {
 	return ApplyStatus{Details: "the node accepts the configuration with mode NO_REBOOT"}
 }
 
-func (f *fakeApplier) NodeStatus(_ context.Context, _ string) (NodeStatus, error) {
+func (f *fakeApplier) NodeStatus(_ context.Context, endpoint string) (NodeStatus, error) {
+	f.endpoints = append(f.endpoints, endpoint)
+
 	return f.node, nil
 }
 
 func (f *fakeApplier) DryRun(_ context.Context, endpoint string, config []byte) (ApplyStatus, error) {
 	f.dryRunRuns++
+	f.endpoints = append(f.endpoints, endpoint)
 
 	return f.status(endpoint, config), nil
 }
 
 func (f *fakeApplier) Apply(_ context.Context, endpoint string, config []byte) error {
 	f.applyRuns++
+	f.endpoints = append(f.endpoints, endpoint)
 	f.applied[endpoint] = string(config)
 	f.node = nodeStatusFromConfig(config)
 
@@ -686,8 +691,9 @@ func TestExtensionRBAC(t *testing.T) {
 	g.Expect(string(role)).To(ContainSubstring("- namespaces"))
 }
 
-// TestDiscovery checks that the extension announces only the two hooks of this stage: the
-// MachineDeployment hook CanUpdateMachineSet belongs to stage L5.
+// TestDiscovery checks that the extension announces the three in-place update hooks of the
+// extension: the Machine hooks CanUpdateMachine and UpdateMachine and the MachineDeployment
+// hook CanUpdateMachineSet of stage L5.
 func TestDiscovery(t *testing.T) {
 	g := NewWithT(t)
 	handler := NewHandler(newFakeApplier(), logr.Discard(), "", 0)
@@ -703,7 +709,7 @@ func TestDiscovery(t *testing.T) {
 		hooks = append(hooks, extensionHandler.RequestHook.Hook)
 	}
 
-	g.Expect(hooks).To(ConsistOf("CanUpdateMachine", "UpdateMachine"))
+	g.Expect(hooks).To(ConsistOf("CanUpdateMachine", "CanUpdateMachineSet", "UpdateMachine"))
 }
 
 // TestDiscoveryHandlerNamesAreUnique reproduces the e2e failure of run 4bacb43-03356e7:

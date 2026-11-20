@@ -4,16 +4,18 @@
 
 // The Cluster API Runtime SDK extension that updates Talos machines in place.
 //
-// It answers only CanUpdateMachine and UpdateMachine (proposal
-// docs/proposals/in-place-updates.md, section 6 row L4). The owner's condition
-// (docs/adr/ADR-0003, amended 2026-11-15) is that a TalosConfig change is handled in place
-// only when it is a machine configuration change that Talos accepts with ApplyConfiguration
-// mode ApplyConfigurationRequest_NO_REBOOT after a DryRun. A Kubernetes version change of a
-// control-plane Machine is handled in place as well, one control-plane component at a time,
-// the way talosctl upgrade-k8s does it (pkg/inplaceupdate/kubernetes.go). Everything else -
-// a Talos version change, a Kubernetes version change that is not the next minor version, an
-// infrastructure change, or a change Talos says needs a reboot - gets no patch, so Cluster
-// API rolls the machine out.
+// It answers CanUpdateMachine and UpdateMachine for a single Machine (proposal
+// docs/proposals/in-place-updates.md, section 6 rows L4 and L5) and CanUpdateMachineSet for
+// the worker Machines of a MachineDeployment (pkg/inplaceupdate/machineset.go). The owner's
+// condition (docs/adr/ADR-0003, amended 2026-11-15) is that a TalosConfig change is handled
+// in place only when it is a machine configuration change that Talos accepts with
+// ApplyConfiguration mode ApplyConfigurationRequest_NO_REBOOT after a DryRun. A Kubernetes
+// version change is handled in place as well, one component at a time the way talosctl
+// upgrade-k8s does it (pkg/inplaceupdate/kubernetes.go): the control-plane components of a
+// control-plane Machine, the kubelet of a worker Machine. Everything else - a Talos version
+// change, a Kubernetes version change that is not the next minor version, an infrastructure
+// change, or a change Talos says needs a reboot - gets no patch, so Cluster API rolls the
+// machine out.
 package inplaceupdate
 
 import (
@@ -191,9 +193,13 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 			return
 		}
 
-		// Stage L4c covers control-plane Machines: a node that runs no control-plane
-		// component (a worker Machine) is not upgraded in place by a Kubernetes version
-		// change here, so it gets no patch and Cluster API rolls it out (stage L5).
+		// A Kubernetes version change of a MachineSet-owned worker Machine is planned by the
+		// MachineDeployment hook CanUpdateMachineSet and applied by UpdateMachine, which
+		// upgrades the kubelet of the node. This hook is called by the control plane
+		// controllers (docs .../implement-in-place-update-hooks.md: "This hook is called by
+		// KCP when performing the 'can update in-place' for a control plane machine"), so a
+		// node that runs no control-plane component gets no patch here and Cluster API keeps
+		// the MachineSet's own rollout planning in charge of it.
 		if !nodeStatus.hasControlPlane() {
 			h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the machine runs no control-plane components")
 
@@ -270,8 +276,9 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 // mode NO_REBOOT and is idempotent: a second call with the same desired configuration
 // reports the update as completed. When the node runs Kubernetes components, the
 // configuration applied is the staged one of pkg/inplaceupdate/kubernetes.go, and the
-// update is completed only when the node reports every control-plane component at the
-// Machine's version.
+// update is completed only when the node reports every Kubernetes component it runs -
+// the control-plane components of a control-plane Machine, the kubelet of a worker
+// Machine - at the Machine's version.
 func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
@@ -314,12 +321,15 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
-	// A node that runs Kubernetes components is upgraded one control-plane component at a
-	// time, in the order of kubernetesComponents (pkg/inplaceupdate/kubernetes.go). A node
-	// that does not - a machine whose control plane has not started yet - gets the plain
+	// A node that runs Kubernetes components is upgraded one component at a time, in the
+	// order of upgradeComponents (pkg/inplaceupdate/kubernetes.go): the control-plane
+	// components of a control-plane Machine, the kubelet of a worker Machine, which is the
+	// component talosctl upgrade-k8s patches on a node without control-plane components
+	// (.lap/sources/reference/files/kubelet.go: upgradeKubeletOnNode). A node that runs no
+	// Kubernetes component yet - a machine whose bootstrap has not started - gets the plain
 	// machine configuration apply of stage L4b.
 	target := req.Desired.Machine.Spec.Version
-	staged := target != "" && nodeStatus.hasControlPlane()
+	staged := target != "" && nodeStatus.hasKubernetes()
 
 	if staged {
 		config, err = stagedKubernetesConfig(config, nodeStatus, target)
@@ -372,8 +382,9 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 }
 
 // Discovery is the Discovery hook, so the extension can be registered with an
-// ExtensionConfig. Only the two in-place update hooks are implemented. The APIVersion
-// is the one the Runtime SDK catalog uses for the hook requests.
+// ExtensionConfig. The three in-place update hooks of the proposal are implemented:
+// CanUpdateMachine and UpdateMachine for a Machine, CanUpdateMachineSet for a MachineSet.
+// The APIVersion is the one the Runtime SDK catalog uses for the hook requests.
 //
 // Handler names must be unique inside an extension and valid DNS1123 labels: the Runtime
 // SDK client rejects a discovery response with a repeated handler name
@@ -385,6 +396,10 @@ func (h *Handler) Discovery(req *runtimehooksv1.DiscoveryRequest, resp *runtimeh
 		{
 			Name:        "can-update-machine",
 			RequestHook: runtimehooksv1.GroupVersionHook{APIVersion: runtimehooksv1.GroupVersion.String(), Hook: "CanUpdateMachine"},
+		},
+		{
+			Name:        "can-update-machine-set",
+			RequestHook: runtimehooksv1.GroupVersionHook{APIVersion: runtimehooksv1.GroupVersion.String(), Hook: "CanUpdateMachineSet"},
 		},
 		{
 			Name:        "update-machine",
@@ -436,11 +451,21 @@ func rebootRequiredReason(ops []jsonPatchOp) string {
 	return ""
 }
 
-// endpoint resolves the Talos API address of a machine. The Runtime SDK request only
-// carries the Machine spec (docs "Only spec is provided, status fields are not
-// included"), so the address comes from the ExtensionConfig settings, the fallback
-// given to the binary, or the machine's ProviderID.
+// resolveEndpoint returns the Talos API address of a machine. Cluster API copies the
+// addresses of the infrastructure machine into the Machine status
+// (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses), but a hook request
+// carries only the spec of the objects ("Only spec is provided, status fields are not
+// included", docs/book/src/tasks/experimental-features/runtime-sdk/implement-in-place-update-hooks.md),
+// so the extension reads the Machine from the management cluster when it was started with
+// --kubeconfig. Without a Machine address the settings of the ExtensionConfig, the
+// --endpoint fallback of the binary and the ProviderID of the machine are used.
 func (h *Handler) resolveEndpoint(settings map[string]string, machine clusterv1.Machine) (string, error) {
+	if address, err := h.machineAddress(machine); err != nil {
+		h.log.Info("the addresses of the machine cannot be read from the management cluster", "machine", machine.Name, "error", err.Error())
+	} else if address != "" {
+		return address, nil
+	}
+
 	if address := settings[SettingAddress]; address != "" {
 		return address, nil
 	}
@@ -454,6 +479,47 @@ func (h *Handler) resolveEndpoint(settings map[string]string, machine clusterv1.
 	}
 
 	return "", errors.Errorf("cannot determine the Talos address of machine %q: set the %q setting of the ExtensionConfig or the --endpoint flag of the extension", machine.Name, SettingAddress)
+}
+
+// machineAddress returns the first address the infrastructure provider reported for a
+// machine. Only a reader that implements MachineAddressReader can answer; without one the
+// extension falls back to the settings, exactly as before stage L5.
+func (h *Handler) machineAddress(machine clusterv1.Machine) (string, error) {
+	reader, ok := h.metadata.(MachineAddressReader)
+	if !ok {
+		return "", nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	defer cancel()
+
+	addresses, err := reader.MachineAddresses(ctx, machine.Namespace, machine.Name)
+	if err != nil {
+		return "", err
+	}
+
+	return pickMachineAddress(addresses), nil
+}
+
+// pickMachineAddress returns the address the extension reaches the node's Talos API at:
+// the internal address the infrastructure provider reported, since Talos serves its API on
+// the node's own network, falling back to any address the provider reported.
+func pickMachineAddress(addresses []clusterv1.MachineAddress) string {
+	for _, preferred := range []clusterv1.MachineAddressType{clusterv1.MachineInternalIP, clusterv1.MachineInternalDNS} {
+		for _, address := range addresses {
+			if address.Type == preferred && address.Address != "" {
+				return address.Address
+			}
+		}
+	}
+
+	for _, address := range addresses {
+		if address.Address != "" {
+			return address.Address
+		}
+	}
+
+	return ""
 }
 
 // renderMachineConfig builds the machine configuration a TalosConfig describes with the
@@ -493,4 +559,3 @@ func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1.TalosCon
 
 	return []byte(config), nil
 }
-

@@ -47,9 +47,24 @@ type MetadataReader interface {
 	Secret(ctx context.Context, namespace, name string) (map[string][]byte, error)
 }
 
+// MachineAddressReader reads the addresses a machine's infrastructure provider reported.
+// Cluster API copies them into the status of the Machine
+// (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses: "This field is copied
+// from the infrastructure provider reference"), and a hook request carries only the spec of
+// the objects, so this is how the extension reaches a node through the management cluster.
+// It is an optional capability of a MetadataReader: a reader without it leaves the endpoint
+// resolution of the settings, the --endpoint flag and the ProviderID in place.
+type MachineAddressReader interface {
+	// MachineAddresses returns the addresses of a machine in the order Cluster API
+	// reports them in Machine status.addresses, or nil when the Machine does not exist
+	// yet or has no addresses. Machine status.addresses is a list of MachineAddress
+	// objects (type and address), not a list of strings.
+	MachineAddresses(ctx context.Context, namespace, name string) ([]clusterv1.MachineAddress, error)
+}
+
 // NewKubeMetadataReader builds a reader that reads from the management cluster with
 // the given client. The rules the reader needs are already in config/rbac/role.yaml
-// (secrets get;list;watch and the bootstrap/cluster API groups).
+// (secrets get;list;watch, machines get;list;watch and the bootstrap/cluster API groups).
 func NewKubeMetadataReader(c client.Client) MetadataReader {
 	return &kubeMetadataReader{client: c}
 }
@@ -75,6 +90,52 @@ func (r *kubeMetadataReader) Cluster(ctx context.Context, namespace, name string
 	}
 
 	return cluster, nil
+}
+
+func (r *kubeMetadataReader) MachineAddresses(ctx context.Context, namespace, name string) ([]clusterv1.MachineAddress, error) {
+	// The Machine is read unstructured so the reader does not depend on which Cluster API
+	// version the cluster's CRD is served in. Only status.addresses is used.
+	object := &unstructured.Unstructured{}
+
+	object.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Machine"))
+
+	if err := r.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, object); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, errors.Wrapf(err, "reading the Machine %q of namespace %q", name, namespace)
+	}
+
+	// Machine status.addresses is a list of MachineAddress objects with a type and an
+	// address, not a list of strings.
+	addresses, found, err := unstructured.NestedSlice(object.Object, "status", "addresses")
+	if err != nil || !found {
+		return nil, nil
+	}
+
+	machineAddresses := []clusterv1.MachineAddress{}
+
+	for _, item := range addresses {
+		address, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		value, _ := address["address"].(string)
+		if value == "" {
+			continue
+		}
+
+		type_, _ := address["type"].(string)
+
+		machineAddresses = append(machineAddresses, clusterv1.MachineAddress{
+			Type:    clusterv1.MachineAddressType(type_),
+			Address: value,
+		})
+	}
+
+	return machineAddresses, nil
 }
 
 func (r *kubeMetadataReader) Secret(ctx context.Context, namespace, name string) (map[string][]byte, error) {

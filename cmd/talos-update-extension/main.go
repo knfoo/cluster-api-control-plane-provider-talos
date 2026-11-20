@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // talos-update-extension is the Cluster API Runtime SDK extension that updates Talos
-// machines in place. It serves the Discovery, CanUpdateMachine and UpdateMachine hooks;
-// the update logic itself lives in pkg/inplaceupdate.
+// machines in place. It serves the Discovery, CanUpdateMachine, CanUpdateMachineSet and
+// UpdateMachine hooks; the update logic itself lives in pkg/inplaceupdate.
 //
 // The extension ships dark: the ExtensionConfig in config/extension/extensionconfig.yaml
 // is only registered when an operator applies it, and Cluster API calls the hooks only
@@ -54,10 +54,11 @@ import (
 // to a "/" prefix pattern with a 307 redirect, so the exact discovery path has to be
 // registered as well or discovery fails.
 const (
-	discoveryExactPath   = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/discovery"
-	discoveryPath        = discoveryExactPath + "/"
-	canUpdateMachinePath = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/canupdatemachine/"
-	updateMachinePath    = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/updatemachine/"
+	discoveryExactPath      = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/discovery"
+	discoveryPath           = discoveryExactPath + "/"
+	canUpdateMachinePath    = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/canupdatemachine/"
+	canUpdateMachineSetPath = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/canupdatemachineset/"
+	updateMachinePath       = "/hooks.runtime.cluster.x-k8s.io/v1alpha1/updatemachine/"
 )
 
 var (
@@ -158,6 +159,7 @@ func hookServer(address, certFile, keyFile string, handler *inplaceupdate.Handle
 	mux.HandleFunc(discoveryExactPath, discovery(handler, log))
 	mux.HandleFunc(discoveryPath, discovery(handler, log))
 	mux.HandleFunc(canUpdateMachinePath, canUpdateMachine(handler, log))
+	mux.HandleFunc(canUpdateMachineSetPath, canUpdateMachineSet(handler, log))
 	mux.HandleFunc(updateMachinePath, updateMachine(handler, log))
 
 	return &http.Server{
@@ -207,6 +209,22 @@ func canUpdateMachine(handler *inplaceupdate.Handler, log logr.Logger) http.Hand
 		}
 
 		handler.CanUpdateMachine(request, response)
+		write(w, log, response)
+	}
+}
+
+func canUpdateMachineSet(handler *inplaceupdate.Handler, log logr.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		request := &runtimehooksv1.CanUpdateMachineSetRequest{}
+		response := &runtimehooksv1.CanUpdateMachineSetResponse{}
+
+		if err := decode(r, request); err != nil {
+			fail(w, err)
+
+			return
+		}
+
+		handler.CanUpdateMachineSet(request, response)
 		write(w, log, response)
 	}
 }
