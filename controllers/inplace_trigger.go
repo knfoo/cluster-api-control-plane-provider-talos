@@ -8,10 +8,12 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
@@ -258,6 +260,15 @@ func markObjectAsPending(obj client.Object, hooks ...runtimecatalog.Hook) bool {
 	obj.SetAnnotations(annotations)
 
 	return true
+}
+
+// isHookPending mirrors IsPending of Cluster API's internal/hooks, which a provider cannot import: a
+// hook is pending when its name is in the PendingHooksAnnotation of the object.
+func isHookPending(hook runtimecatalog.Hook, obj metav1.Object) bool {
+	return slices.Contains(
+		strings.Split(obj.GetAnnotations()[runtimev1beta2.PendingHooksAnnotation], ","),
+		runtimecatalog.HookName(hook),
+	)
 }
 
 func addToCommaSeparatedList(original string, elems ...string) string {

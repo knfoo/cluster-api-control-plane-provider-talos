@@ -11,14 +11,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
+	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	utilfeature "k8s.io/component-base/featuregate/testing"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -26,6 +31,7 @@ import (
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	runtimev1beta2 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
 	"sigs.k8s.io/cluster-api/feature"
+	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -453,4 +459,131 @@ func Test_tryInPlaceUpdate(t *testing.T) {
 			g.Expect(triggerInPlaceUpdateCalled).To(Equal(tt.wantTriggerInPlaceUpdateCalled), "triggerInPlaceUpdateCalled: actual: %t expected: %t", triggerInPlaceUpdateCalled, tt.wantTriggerInPlaceUpdateCalled)
 		})
 	}
+}
+
+// rollingUpdateControlPlane returns a three-Machine control plane whose TalosConfig is outdated on every
+// Machine, the state the e2e run e2e-849a0df-0928bcc reached when the in-place update step failed, along
+// with the MachineList reconcileMachines expects.
+func rollingUpdateControlPlane(machines []*clusterv1.Machine) (*clusterv1.Cluster, *controlplanev1.TalosControlPlane, *ControlPlane, *clusterv1.MachineList) {
+	tcp := &controlplanev1.TalosControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: metav1.NamespaceDefault},
+		Spec: controlplanev1.TalosControlPlaneSpec{
+			Version:  currentVersion,
+			Replicas: ptr.To[int32](int32(len(machines))),
+			RolloutStrategy: &controlplanev1.RolloutStrategy{
+				Type:          controlplanev1.RollingUpdateStrategyType,
+				RollingUpdate: &controlplanev1.RollingUpdate{MaxSurge: ptr.To(intstr.FromInt(0))},
+			},
+		},
+	}
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: metav1.NamespaceDefault},
+		Status:     clusterv1.ClusterStatus{FailureDomains: controlPlaneDomains("a", "b", "c")},
+	}
+
+	machineList := clusterv1.MachineList{Items: make([]clusterv1.Machine, 0, len(machines))}
+	for _, machine := range machines {
+		machineList.Items = append(machineList.Items, *machine)
+	}
+
+	return cluster, tcp, &ControlPlane{
+		TCP:      tcp,
+		Cluster:  cluster,
+		Machines: collections.FromMachines(machines...),
+	}, &machineList
+}
+
+// TestReconcileMachinesWaitsForInProgressInPlaceUpdate covers the failure of e2e run
+// e2e-849a0df-0928bcc: the in-place update step failed because the reconciler started an in-place update
+// for every Machine that is not up to date, one per reconcile, so all control plane Machines were marked
+// in-progress at the same time. KubeadmControlPlane waits for the update in progress to finish before
+// rolling out the next Machine (kubeadmcontrolplane_controller.go:517-523 of the Cluster API v1.14.4
+// reference); without that wait a second Machine is triggered while the first is still being updated.
+func TestReconcileMachinesWaitsForInProgressInPlaceUpdate(t *testing.T) {
+
+	g := NewWithT(t)
+
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.InPlaceUpdates, true)
+
+	machines := []*clusterv1.Machine{
+		newControlPlaneMachine("cp-1", inFailureDomain("a"), outdated(), createdAt(0)),
+		newControlPlaneMachine("cp-2", inFailureDomain("b"), outdated(), createdAt(time.Minute)),
+		newControlPlaneMachine("cp-3", inFailureDomain("c"), outdated(), createdAt(2*time.Minute)),
+	}
+
+	// cp-1 is already being updated in place: the trigger wrote the UpdateInProgressAnnotation and the
+	// UpdateMachine hook is pending on it.
+	machines[0].Annotations = map[string]string{clusterv1.UpdateInProgressAnnotation: ""}
+	markObjectAsPending(machines[0], runtimehooksv1.UpdateMachine)
+
+	cluster, tcp, controlPlane, machineList := rollingUpdateControlPlane(machines)
+
+	var triggered []string
+	overrideTryInPlaceUpdate = func(_ context.Context, _ *ControlPlane, machine *clusterv1.Machine, _ UpToDateResult) (bool, error) {
+		triggered = append(triggered, machine.Name)
+
+		return false, nil
+	}
+	defer func() { overrideTryInPlaceUpdate = nil }()
+
+	r := &TalosControlPlaneReconciler{
+		Client: fake.NewClientBuilder().Build(),
+		Log:    logr.Discard(),
+	}
+
+	// The Machine controller has not finished cp-1 yet, so three consecutive reconciles may not start
+	// the in-place update of another Machine.
+	for range 3 {
+		res, err := r.reconcileMachines(context.Background(), cluster, tcp, machineList, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(res.IsZero()).To(BeTrue())
+	}
+
+	g.Expect(triggered).To(BeEmpty(), "no Machine may be updated in place while another update is in progress")
+	g.Expect(controlPlane.MachinesToCompleteInPlaceUpdate().Names()).To(Equal([]string{"cp-1"}))
+}
+
+// TestReconcileMachinesCompletesInterruptedInPlaceUpdateTrigger covers the reentrancy step of
+// KubeadmControlPlane (kubeadmcontrolplane_controller.go:501-511 of the Cluster API v1.14.4 reference):
+// if triggerInPlaceUpdate failed after writing the UpdateInProgressAnnotation and before marking the
+// UpdateMachine hook pending, the next reconcile completes the trigger instead of waiting forever for an
+// update that never started.
+func TestReconcileMachinesCompletesInterruptedInPlaceUpdateTrigger(t *testing.T) {
+
+	g := NewWithT(t)
+
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.InPlaceUpdates, true)
+
+	machines := []*clusterv1.Machine{
+		newControlPlaneMachine("cp-1", inFailureDomain("a"), outdated(), createdAt(0)),
+		newControlPlaneMachine("cp-2", inFailureDomain("b"), outdated(), createdAt(time.Minute)),
+		newControlPlaneMachine("cp-3", inFailureDomain("c"), outdated(), createdAt(2*time.Minute)),
+	}
+
+	// The interrupted trigger: annotated, but the hook was never marked pending.
+	machines[0].Annotations = map[string]string{clusterv1.UpdateInProgressAnnotation: ""}
+
+	cluster, tcp, controlPlane, machineList := rollingUpdateControlPlane(machines)
+
+	var completed []string
+	overrideTriggerInPlaceUpdate = func(_ context.Context, machine *clusterv1.Machine, _ UpToDateResult) error {
+		completed = append(completed, machine.Name)
+		markObjectAsPending(machine, runtimehooksv1.UpdateMachine)
+
+		return nil
+	}
+	defer func() { overrideTriggerInPlaceUpdate = nil }()
+
+	r := &TalosControlPlaneReconciler{
+		Client: fake.NewClientBuilder().Build(),
+		Log:    logr.Discard(),
+	}
+
+	res, err := r.reconcileMachines(context.Background(), cluster, tcp, machineList, controlPlane)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(res.IsZero()).To(BeTrue())
+
+	g.Expect(completed).To(Equal([]string{"cp-1"}), "the interrupted trigger is completed for the annotated Machine only")
+	g.Expect(controlPlane.MachinesToCompleteTriggerInPlaceUpdate().Len()).To(BeZero())
 }

@@ -35,6 +35,7 @@ import (
 	utilcache "k8s.io/apimachinery/pkg/util/cache"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/pointer"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -1497,6 +1498,40 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// Complete the trigger of an in-place update that was interrupted between writing the
+	// UpdateInProgressAnnotation and marking the UpdateMachine hook pending, before anything else is
+	// rolled out. Same reentrancy step as KubeadmControlPlane
+	// (kubeadmcontrolplane_controller.go:501-511 of the Cluster API v1.14.4 reference).
+	if machines := controlPlane.MachinesToCompleteTriggerInPlaceUpdate(); len(machines) > 0 {
+		logger.Info("completing the trigger of an in-place update", "machines", machines.Names())
+
+		for _, machine := range machines {
+			machineUpToDateResult, err := controlPlane.inPlaceUpdateResult(machine)
+			if err != nil {
+				return ctrl.Result{}, errors.Wrapf(err, "failed to compute the in-place update for Machine %s", klog.KObj(machine))
+			}
+
+			if err := r.triggerInPlaceUpdate(ctx, controlPlane, machine, machineUpToDateResult); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	// Wait for the in-place update of a Machine to finish before rolling out the next one, like
+	// KubeadmControlPlane does (kubeadmcontrolplane_controller.go:517-523 of the Cluster API v1.14.4
+	// reference). Without this wait a changed TalosControlPlane triggers triggerInPlaceUpdate for every
+	// Machine that is not up to date, one per reconcile, so the whole control plane is updated in place
+	// at the same time instead of one Machine after the other.
+	if machines := controlPlane.MachinesToCompleteInPlaceUpdate(); len(machines) > 0 {
+		for _, machine := range machines {
+			logger.Info("waiting for the in-place update of Machine to complete", "Machine", klog.KObj(machine))
+		}
+
+		return ctrl.Result{}, nil
 	}
 
 	needRollout := controlPlane.MachinesNeedingRollout()

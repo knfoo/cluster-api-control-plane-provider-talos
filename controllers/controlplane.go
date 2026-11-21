@@ -23,6 +23,7 @@ import (
 	"k8s.io/klog/v2/klogr"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/cluster-api/util/failuredomains"
@@ -84,6 +85,32 @@ func (c *ControlPlane) MachineWithDeleteAnnotation(machines collections.Machines
 // remediate that are not being deleted yet.
 func (c *ControlPlane) UnhealthyMachines() collections.Machines {
 	return c.Machines.Filter(collections.IsUnhealthyAndOwnerRemediated, collections.Not(collections.HasDeletionTimestamp))
+}
+
+// MachinesToCompleteTriggerInPlaceUpdate returns the Machines for which triggering the in-place update
+// stopped after the UpdateInProgressAnnotation was written and before the UpdateMachine hook was marked
+// pending, i.e. the trigger has to be completed on the next reconcile. It mirrors
+// MachinesToCompleteTriggerInPlaceUpdate of KubeadmControlPlane (pkg/control_plane.go:206-213 of the
+// Cluster API v1.14.4 reference).
+func (c *ControlPlane) MachinesToCompleteTriggerInPlaceUpdate() collections.Machines {
+	return c.Machines.Filter(func(machine *clusterv1.Machine) bool {
+		_, ok := machine.Annotations[clusterv1.UpdateInProgressAnnotation]
+
+		return ok && !isHookPending(runtimehooksv1.UpdateMachine, machine)
+	})
+}
+
+// MachinesToCompleteInPlaceUpdate returns the Machines whose in-place update was triggered and has not
+// finished. The Machine controller removes the UpdateInProgressAnnotation once the UpdateMachine hook is
+// done, so the annotation is the marker of an update in progress. It mirrors
+// MachinesToCompleteInPlaceUpdate of KubeadmControlPlane (pkg/control_plane.go:216-219 of the Cluster
+// API v1.14.4 reference), which filters with inplace.IsUpdateInProgress.
+func (c *ControlPlane) MachinesToCompleteInPlaceUpdate() collections.Machines {
+	return c.Machines.Filter(func(machine *clusterv1.Machine) bool {
+		_, ok := machine.Annotations[clusterv1.UpdateInProgressAnnotation]
+
+		return ok
+	})
 }
 
 // MachinesNeedingRollout return a list of machines that need to be rolled out.
