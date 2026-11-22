@@ -62,6 +62,18 @@ type MachineAddressReader interface {
 	MachineAddresses(ctx context.Context, namespace, name string) ([]clusterv1.MachineAddress, error)
 }
 
+// ControlPlaneMachineReader lists the control-plane Machines of a cluster. It is an
+// optional capability of a MetadataReader, like MachineAddressReader: the bootstrap
+// provider's control-plane controller labels every control-plane Machine with the cluster
+// name and the control-plane label (controllers/taloscontrolplane_controller.go:669-670),
+// so the extension can find the peers of the machine it is updating and wait for the whole
+// control plane to reach the target Kubernetes version before syncing the bootstrap
+// manifests to the workload cluster.
+type ControlPlaneMachineReader interface {
+	// ControlPlaneMachines returns the Machines of the cluster's control plane.
+	ControlPlaneMachines(ctx context.Context, namespace, clusterName string) ([]clusterv1.Machine, error)
+}
+
 // NewKubeMetadataReader builds a reader that reads from the management cluster with
 // the given client. The rules the reader needs are already in config/rbac/role.yaml
 // (secrets get;list;watch, machines get;list;watch and the bootstrap/cluster API groups).
@@ -136,6 +148,34 @@ func (r *kubeMetadataReader) MachineAddresses(ctx context.Context, namespace, na
 	}
 
 	return machineAddresses, nil
+}
+
+func (r *kubeMetadataReader) ControlPlaneMachines(ctx context.Context, namespace, clusterName string) ([]clusterv1.Machine, error) {
+	// Like the other reads, the Machines are read unstructured so the reader does not
+	// depend on which Cluster API version the cluster's CRD is served in.
+	list := &unstructured.UnstructuredList{}
+
+	list.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineList"))
+
+	if err := r.client.List(ctx, list, client.MatchingLabels{
+		clusterv1.ClusterNameLabel:         clusterName,
+		clusterv1.MachineControlPlaneLabel: "",
+	}); err != nil {
+		return nil, errors.Wrapf(err, "listing the control-plane machines of cluster %q", clusterName)
+	}
+
+	machines := make([]clusterv1.Machine, 0, len(list.Items))
+
+	for i := range list.Items {
+		machine := &clusterv1.Machine{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(list.Items[i].Object, machine); err != nil {
+			return nil, errors.Wrapf(err, "decoding the Machine %q of cluster %q", list.Items[i].GetName(), clusterName)
+		}
+
+		machines = append(machines, *machine)
+	}
+
+	return machines, nil
 }
 
 func (r *kubeMetadataReader) Secret(ctx context.Context, namespace, name string) (map[string][]byte, error) {

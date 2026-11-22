@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -30,6 +31,7 @@ import (
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
+	"sigs.k8s.io/cluster-api/util/secret"
 )
 
 const (
@@ -64,6 +66,15 @@ type Handler struct {
 	timeout         time.Duration
 	defaultEndpoint string
 	metadata        MetadataReader
+	manifestSyncer  ManifestSyncer
+
+	// manifestsSynced marks the clusters and Kubernetes versions whose bootstrap manifests
+	// were already synced to the workload cluster. The sync is decided from the state of
+	// the control plane, not from a flag recorded by CanUpdateMachine, so a restart of the
+	// provider mid-upgrade does not skip it; the map only avoids repeating a sync that is
+	// idempotent anyway.
+	manifestsSynced   map[string]bool
+	manifestsSyncedMu sync.Mutex
 }
 
 // NewHandler creates the extension handlers. endpoint is the fallback Talos address
@@ -88,6 +99,8 @@ func NewHandlerWithMetadata(applier Applier, log logr.Logger, endpoint string, t
 		timeout:         timeout,
 		defaultEndpoint: endpoint,
 		metadata:        metadata,
+		manifestSyncer:  NewKubeManifestSyncer(log),
+		manifestsSynced: map[string]bool{},
 	}
 }
 
@@ -325,7 +338,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 	// order of upgradeComponents (pkg/inplaceupdate/kubernetes.go): the control-plane
 	// components of a control-plane Machine, the kubelet of a worker Machine, which is the
 	// component talosctl upgrade-k8s patches on a node without control-plane components
-	// (.lap/sources/reference/files/kubelet.go: upgradeKubeletOnNode). A node that runs no
+	// (upgradeKubeletOnNode). A node that runs no
 	// Kubernetes component yet - a machine whose bootstrap has not started - gets the plain
 	// machine configuration apply of stage L4b.
 	target := req.Desired.Machine.Spec.Version
@@ -350,6 +363,53 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 	}
 
 	if status.NoChanges && (!staged || componentsAtTarget(nodeStatus, target)) {
+		// The kube-proxy DaemonSet and the CoreDNS deployment live in the workload
+		// cluster: a Kubernetes version change of a control-plane Machine is finished only
+		// after the bootstrap manifests the node rendered for the new version are synced to
+		// that cluster, the last step of talosctl upgrade-k8s (PerformManifestsSync). The
+		// sync runs once, after every control-plane Machine of the cluster is at the target
+		// version, and until then the update stays pending. Whether it is needed is read
+		// from the control plane itself, not from anything CanUpdateMachine recorded, so
+		// restarting the provider in the middle of an upgrade does not skip it.
+		if h.manifestSyncer != nil && h.metadata != nil && staged && nodeStatus.hasControlPlane() {
+			key := manifestSyncKey(req.Desired.Machine, target)
+
+			h.manifestsSyncedMu.Lock()
+			alreadySynced := h.manifestsSynced[key]
+			h.manifestsSyncedMu.Unlock()
+
+			if !alreadySynced {
+				// The trigger rolls in-place updates out one Machine at a time and waits for the
+				// Machine that is in progress before it triggers the next one, and Success with a
+				// retry means "update in progress". Holding the first Machine open until its peers
+				// reach the target would mean the peers are never triggered, no Machine ever
+				// becomes the last one, and the control plane stalls with one Machine in progress.
+				// So the sync runs on the Machine whose peers are already at the target version,
+				// the last one triggered, and a Machine whose peers are not there yet is simply
+				// done: its own update is complete and the rollout continues.
+				if !h.controlPlaneAtTarget(ctx, req, target) {
+					h.log.Info("the bootstrap manifests are synced by the last control-plane Machine to reach the target Kubernetes version", "machine", machine, "version", target)
+					resp.RetryAfterSeconds = 0
+
+					return
+				}
+
+				if err := h.syncBootstrapManifests(ctx, req, spec, endpoint, target); err != nil {
+					if errors.Is(err, errManifestsNotReconciled) {
+						h.log.Info("the synced bootstrap manifests are still reconciling in the workload cluster", "machine", machine, "version", target)
+						resp.RetryAfterSeconds = DefaultRetryAfterSeconds
+
+						return
+					}
+
+					resp.Status = runtimehooksv1.ResponseStatusFailure
+					resp.Message = err.Error()
+
+					return
+				}
+			}
+		}
+
 		h.log.Info("machine configuration is already applied", "machine", machine, "endpoint", endpoint)
 		resp.RetryAfterSeconds = 0
 
@@ -379,6 +439,110 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 	}
 
 	h.log.Info("machine configuration applied in place", "machine", machine, "endpoint", endpoint)
+}
+
+// manifestSyncKey identifies the bootstrap manifest sync of one Kubernetes version of one
+// cluster: namespace, cluster name and the target Kubernetes version.
+func manifestSyncKey(machine clusterv1.Machine, version string) string {
+	return machine.Namespace + "/" + machine.Spec.ClusterName + "/" + version
+}
+
+// controlPlaneAtTarget reports whether every control-plane Machine of the cluster runs
+// its Kubernetes components at target, the condition for syncing the bootstrap manifests
+// to the workload cluster. A peer whose Machine cannot be read or whose node cannot be
+// reached holds the sync back: syncing manifests for a control plane that has not
+// finished its upgrade is not what talosctl upgrade-k8s does.
+func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, target string) bool {
+	reader, ok := h.metadata.(ControlPlaneMachineReader)
+	if !ok {
+		return true
+	}
+
+	machines, err := reader.ControlPlaneMachines(ctx, req.Desired.Machine.Namespace, req.Desired.Machine.Spec.ClusterName)
+	if err != nil {
+		h.log.Info("the control-plane machines of the cluster cannot be read", "cluster", req.Desired.Machine.Spec.ClusterName, "error", err.Error())
+
+		return false
+	}
+
+	for _, peer := range machines {
+		if peer.Name == req.Desired.Machine.Name {
+			continue
+		}
+
+		address, err := h.machineAddress(peer)
+		if err != nil {
+			h.log.Info("the address of a control-plane machine cannot be read", "machine", peer.Name, "error", err.Error())
+
+			return false
+		}
+
+		if address == "" {
+			h.log.Info("a control-plane machine has no address, so its Kubernetes version cannot be checked", "machine", peer.Name)
+
+			return false
+		}
+
+		status, err := h.applier.NodeStatus(ctx, address)
+		if err != nil {
+			h.log.Info("the Kubernetes components of a control-plane machine cannot be read", "machine", peer.Name, "error", err.Error())
+
+			return false
+		}
+
+		if !componentsAtTarget(status, target) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// syncBootstrapManifests syncs the bootstrap manifests of the machine to the workload
+// cluster exactly once per cluster and Kubernetes version. The kubeconfig of the workload
+// cluster is the one Cluster API stores in the secret named <cluster>-kubeconfig (util/secret:
+// secret.Name(clusterName, secret.Kubeconfig), kubeconfig stored under secret.KubeconfigDataName).
+func (h *Handler) syncBootstrapManifests(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, spec cabptv1.TalosConfigSpec, endpoint, target string) error {
+	clusterName := req.Desired.Machine.Spec.ClusterName
+	key := manifestSyncKey(req.Desired.Machine, target)
+
+	h.manifestsSyncedMu.Lock()
+	defer h.manifestsSyncedMu.Unlock()
+
+	if h.manifestsSynced[key] {
+		return nil
+	}
+
+	kubeconfigName := secret.Name(clusterName, secret.Kubeconfig)
+
+	kubeconfigData, err := h.metadata.Secret(ctx, req.Desired.Machine.Namespace, kubeconfigName)
+	if err != nil {
+		return err
+	}
+
+	if kubeconfigData == nil {
+		return errors.Errorf("the kubeconfig secret %q of cluster %q does not exist yet, so the bootstrap manifests cannot be synced to the workload cluster", kubeconfigName, clusterName)
+	}
+
+	kubeconfig, ok := kubeconfigData[secret.KubeconfigDataName]
+	if !ok || len(kubeconfig) == 0 {
+		return errors.Errorf("the kubeconfig secret %q of cluster %q has no key %q", kubeconfigName, clusterName, secret.KubeconfigDataName)
+	}
+
+	objects, err := h.applier.BootstrapManifests(ctx, endpoint)
+	if err != nil {
+		return errors.Wrapf(err, "reading the bootstrap manifests of machine %q", req.Desired.Machine.Name)
+	}
+
+	if err := h.manifestSyncer.SyncManifests(ctx, kubeconfig, objects, spec.TalosVersion); err != nil {
+		return err
+	}
+
+	h.manifestsSynced[key] = true
+
+	h.log.Info("the bootstrap manifests were synced to the workload cluster", "cluster", clusterName, "version", target, "manifests", len(objects))
+
+	return nil
 }
 
 // Discovery is the Discovery hook, so the extension can be registered with an

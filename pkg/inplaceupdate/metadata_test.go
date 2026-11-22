@@ -34,8 +34,7 @@ func TestMachineAddressesReadsTheAddressObjectsOfAMachine(t *testing.T) {
 		},
 	}
 
-	addresses, err := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(machine).Build()).
-		(MachineAddressReader).MachineAddresses(context.Background(), "default", "worker-1")
+	addresses, err := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(machine).Build()).(MachineAddressReader).MachineAddresses(context.Background(), "default", "worker-1")
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(addresses).To(Equal([]clusterv1.MachineAddress{

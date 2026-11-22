@@ -6,14 +6,12 @@
 //
 // The component order and the patches are the ones talosctl upgrade-k8s uses (Talos
 // v1.14.5): the kube-apiserver, kube-controller-manager and kube-scheduler static pods in
-// that order (.lap/sources/reference/files/talos_managed.go:150-154), kube-proxy next
-// (.lap/sources/reference/files/talos_managed.go:156), and the kubelet last
-// (.lap/sources/reference/files/talos_managed.go:161, .lap/sources/reference/files/kubelet.go).
-// upgradeStaticPodOnNode applies one component at a time and waits for that pod to run the
-// new version before patching the next one; here one machine configuration per hook call
-// takes the node one component further. Syncing the bootstrap manifests afterwards
-// (PerformManifestsSync, .lap/sources/reference/files/talos_managed.go:168) is deferred to
-// a later stage.
+// that order, kube-proxy next, and the kubelet last. upgradeStaticPodOnNode applies one
+// component at a time and waits for that pod to run the new version before patching the
+// next one; here one machine configuration per hook call takes the node one component
+// further. Syncing the bootstrap manifests afterwards, the PerformManifestsSync step of
+// talosctl upgrade-k8s, is performed by pkg/inplaceupdate/manifestsync.go once the whole
+// control plane is at the target version.
 package inplaceupdate
 
 import (
@@ -90,7 +88,7 @@ var kubernetesComponents = []kubernetesComponent{
 // Kubernetes version. A node with control-plane components is upgraded in the order of
 // kubernetesComponents; a node without them - a worker Machine of a MachineDeployment -
 // only runs the kubelet, and talosctl upgrade-k8s upgrades exactly that component on such
-// a node (.lap/sources/reference/files/kubelet.go: upgradeKubeletOnNode).
+// a node (upgradeKubeletOnNode).
 func upgradeComponents(status NodeStatus) []kubernetesComponent {
 	if status.hasControlPlane() {
 		return kubernetesComponents
@@ -204,7 +202,7 @@ func componentAtTarget(image, target string) bool {
 // are patched to the same image again, which is what makes the configuration stable across
 // the hook calls of one update. For a worker Machine the list is the kubelet alone, the
 // patch talosctl upgrade-k8s applies to a node without control-plane components
-// (.lap/sources/reference/files/kubelet.go: upgradeKubeletOnNode).
+// (upgradeKubeletOnNode).
 func stagedKubernetesConfig(data []byte, status NodeStatus, target string) ([]byte, error) {
 	container, err := configpatcher.WithBytes(data).Config()
 	if err != nil {
@@ -244,7 +242,7 @@ func stagedKubernetesConfig(data []byte, status NodeStatus, target string) ([]by
 // componentImage builds the image reference of a component for the target Kubernetes
 // version, keeping the registry of the image the node runs and the kubelet image suffix
 // (-fat, -slim), as talosctl upgrade-k8s does when it pre-pulls and patches the kubelet
-// image (.lap/sources/reference/files/kubelet.go, extractKubeletVersionSuffix).
+// image (extractKubeletVersionSuffix).
 func componentImage(current, fallback, target string) string {
 	registry := fallback
 

@@ -267,6 +267,10 @@ func TestUpdateMachineIdempotentGeneratedConfig(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
 	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
+	// This test is about rendering a generated machine configuration. The bootstrap manifest
+	// sync talks to the workload cluster with its kubeconfig, which clusterMetadata does not
+	// provide; the sync itself is covered in manifestsync_test.go.
+	handler.manifestSyncer = nil
 
 	request := &runtimehooksv1.UpdateMachineRequest{
 		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},

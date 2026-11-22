@@ -14,6 +14,7 @@ import (
 	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -31,6 +32,10 @@ type fakeApplier struct {
 	dryRunRuns   int
 	applyRuns    int
 	node         NodeStatus
+	// nodes lets a test give a node of its own to each Talos endpoint, so the control
+	// plane peers a manifest sync has to wait for can lag behind the machine being
+	// updated.
+	nodes map[string]NodeStatus
 }
 
 func newFakeApplier() *fakeApplier {
@@ -64,7 +69,48 @@ func (f *fakeApplier) status(endpoint string, config []byte) ApplyStatus {
 func (f *fakeApplier) NodeStatus(_ context.Context, endpoint string) (NodeStatus, error) {
 	f.endpoints = append(f.endpoints, endpoint)
 
+	if node, ok := f.nodes[endpoint]; ok {
+		return node, nil
+	}
+
 	return f.node, nil
+}
+
+// BootstrapManifests stands in for GetBootstrapManifests on a real node: the kube-proxy
+// DaemonSet Talos renders from the node's BootstrapManifestsConfig, carrying the image the
+// node reports.
+func (f *fakeApplier) BootstrapManifests(_ context.Context, endpoint string) ([]*unstructured.Unstructured, error) {
+	node := f.node
+
+	if status, ok := f.nodes[endpoint]; ok {
+		node = status
+	}
+
+	if node.Proxy == "" {
+		return nil, nil
+	}
+
+	return []*unstructured.Unstructured{
+		{
+			Object: map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "DaemonSet",
+				"metadata": map[string]any{
+					"name":      "kube-proxy",
+					"namespace": "kube-system",
+				},
+				"spec": map[string]any{
+					"template": map[string]any{
+						"spec": map[string]any{
+							"containers": []any{
+								map[string]any{"name": "kube-proxy", "image": node.Proxy},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, nil
 }
 
 func (f *fakeApplier) DryRun(_ context.Context, endpoint string, config []byte) (ApplyStatus, error) {

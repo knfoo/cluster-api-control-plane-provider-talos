@@ -15,10 +15,12 @@ import (
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/pkg/errors"
+	"github.com/siderolabs/go-kubernetes/kubernetes/manifests"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	talosconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // NodeStatus reports the Kubernetes components a node runs, read from the COSI resources
@@ -82,6 +84,11 @@ type Applier interface {
 	// tell whether a machine has to be upgraded component by component and how far the
 	// upgrade has come.
 	NodeStatus(ctx context.Context, endpoint string) (NodeStatus, error)
+	// BootstrapManifests returns the bootstrap manifests (kube-proxy, CoreDNS) the node
+	// has for its Kubernetes cluster, as Talos stores them in its COSI state. Syncing them
+	// to the workload cluster is the last step of the Kubernetes version update, the one
+	// talosctl upgrade-k8s performs with PerformManifestsSync.
+	BootstrapManifests(ctx context.Context, endpoint string) ([]*unstructured.Unstructured, error)
 }
 
 // TalosApplier talks to real Talos nodes.
@@ -158,6 +165,31 @@ func (a *TalosApplier) NodeStatus(ctx context.Context, endpoint string) (NodeSta
 	defer client.Close()
 
 	return nodeStatusOf(ctx, client.COSI, endpoint)
+}
+
+// BootstrapManifests reads the bootstrap manifests Talos keeps for the Kubernetes cluster,
+// the kube-proxy DaemonSet and the CoreDNS deployment, with the images the staged machine
+// configuration has given them. This is the manifest list talosctl upgrade-k8s feeds into
+// PerformManifestsSync, read from the node's COSI state with manifests.GetBootstrapManifests.
+func (a *TalosApplier) BootstrapManifests(ctx context.Context, endpoint string) ([]*unstructured.Unstructured, error) {
+	if endpoint == "" {
+		return nil, errors.New("no Talos endpoint for the machine")
+	}
+
+	client, err := talosclient.New(ctx,
+		talosclient.WithDefaultGRPCDialOptions(),
+		talosclient.WithConfig(a.config),
+		talosclient.WithEndpoints(endpoint),
+	)
+	if err != nil {
+		return nil, errors.Wrapf(err, "connecting to Talos node %q", endpoint)
+	}
+
+	defer client.Close()
+
+	// GetBootstrapManifests is an alias of unstructured objects, so the return type is the
+	// slice the ManifestSyncer takes.
+	return manifests.GetBootstrapManifests(talosclient.WithNode(ctx, endpoint), client.COSI, nil)
 }
 
 // nodeStatusOf reads one node's Kubernetes components from its COSI state. The reads are
@@ -241,7 +273,6 @@ func componentConfig[T meta.ResourceWithRD](ctx context.Context, reader state.Co
 
 	return config, err
 }
-
 
 func (a *TalosApplier) request(ctx context.Context, endpoint string, config []byte, dryRun bool) (ApplyStatus, error) {
 	if endpoint == "" {
