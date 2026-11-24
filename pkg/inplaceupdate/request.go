@@ -88,7 +88,7 @@ func specPatch(current, desired runtime.RawExtension) ([]byte, error) {
 		return nil, err
 	}
 
-	return jsonPatch(diffValue("/spec", currentSpec, desiredSpec))
+	return objectPatch("/spec", currentSpec, desiredSpec)
 }
 
 func specObject(raw runtime.RawExtension) (map[string]any, error) {
