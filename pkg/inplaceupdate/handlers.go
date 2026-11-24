@@ -49,7 +49,10 @@ const (
 
 // rebootRequiredConfigPaths are machine configuration keys Talos can only change by
 // booting the node again. They are a cheap guard in front of the DryRun: the DryRun
-// is the authoritative answer, but these changes never need to reach a node.
+// is the authoritative answer, but these changes never need to reach a node. Everything
+// else, including machine/env, is decided by the DryRun, because whether Talos applies a
+// given change with mode ApplyConfigurationRequest_NO_REBOOT depends on the Talos version
+// of the node.
 var rebootRequiredConfigPaths = []string{
 	"machine/install",
 	"machine/boot",
@@ -151,14 +154,14 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
 	defer cancel()
 
-	currentConfig, err := h.renderMachineConfig(ctx, currentSpec, req.Current.Machine)
+	currentConfig, _, err := h.renderMachineConfig(ctx, currentSpec, req.Current.Machine)
 	if err != nil {
 		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", err.Error())
 
 		return
 	}
 
-	desiredConfig, err := h.renderMachineConfig(ctx, desiredSpec, req.Desired.Machine)
+	desiredConfig, _, err := h.renderMachineConfig(ctx, desiredSpec, req.Desired.Machine)
 	if err != nil {
 		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", err.Error())
 
@@ -310,10 +313,24 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 
 	// CanUpdateMachine already rendered this configuration, so the same render is used
 	// here; a failure is a real error rather than a reason to roll the machine out.
-	config, err := h.renderMachineConfig(ctx, spec, req.Desired.Machine)
+	config, metadataPending, err := h.renderMachineConfig(ctx, spec, req.Desired.Machine)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
+
+		return
+	}
+
+	// metadataFrom is set but the metadata secret the infrastructure provider (Metal3/CAPM3)
+	// writes after the bootstrap data does not exist yet, so the rendered configuration is
+	// the phase-1 configuration: it lacks every strategic patch that still contains a
+	// template expression. Applying it would push a machine configuration to the node that
+	// is missing the patches its metadata renders. The update is reported as in progress
+	// instead, so Cluster API calls the hook again once the metadata is there, and the
+	// Machine is neither updated with a partial configuration nor rolled out.
+	if metadataPending {
+		h.log.Info("the metadata of the machine configuration is not available yet, so the machine configuration is not applied", "machine", machine, "retryAfterSeconds", DefaultRetryAfterSeconds)
+		resp.RetryAfterSeconds = DefaultRetryAfterSeconds
 
 		return
 	}
@@ -367,10 +384,12 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		// cluster: a Kubernetes version change of a control-plane Machine is finished only
 		// after the bootstrap manifests the node rendered for the new version are synced to
 		// that cluster, the last step of talosctl upgrade-k8s (PerformManifestsSync). The
-		// sync runs once, after every control-plane Machine of the cluster is at the target
-		// version, and until then the update stays pending. Whether it is needed is read
-		// from the control plane itself, not from anything CanUpdateMachine recorded, so
-		// restarting the provider in the middle of an upgrade does not skip it.
+		// sync runs once, on the control-plane Machine that reaches the target version
+		// last: a Machine whose peers are not there yet reports its own update as done,
+		// because holding it open would stop the peers from ever being triggered. Whether
+		// the sync is needed is read from the control plane itself, not from anything
+		// CanUpdateMachine recorded, so restarting the provider in the middle of an upgrade
+		// does not skip it.
 		if h.manifestSyncer != nil && h.metadata != nil && staged && nodeStatus.hasControlPlane() {
 			key := manifestSyncKey(req.Desired.Machine, target)
 
@@ -386,8 +405,18 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 				// becomes the last one, and the control plane stalls with one Machine in progress.
 				// So the sync runs on the Machine whose peers are already at the target version,
 				// the last one triggered, and a Machine whose peers are not there yet is simply
-				// done: its own update is complete and the rollout continues.
-				if !h.controlPlaneAtTarget(ctx, req, target) {
+				// done: its own update is complete and the rollout continues. A peer that cannot
+				// be read at all is not a peer that is not at the target: the sync is not skipped
+				// for it, the Machine stays in progress and Cluster API calls the hook again.
+				atTarget, err := h.controlPlaneAtTarget(ctx, req, target)
+				if err != nil {
+					h.log.Info("the Kubernetes version of a control-plane machine cannot be read, so the bootstrap manifests are not synced yet", "machine", machine, "version", target, "error", err.Error())
+					resp.RetryAfterSeconds = DefaultRetryAfterSeconds
+
+					return
+				}
+
+				if !atTarget {
 					h.log.Info("the bootstrap manifests are synced by the last control-plane Machine to reach the target Kubernetes version", "machine", machine, "version", target)
 					resp.RetryAfterSeconds = 0
 
@@ -449,20 +478,20 @@ func manifestSyncKey(machine clusterv1.Machine, version string) string {
 
 // controlPlaneAtTarget reports whether every control-plane Machine of the cluster runs
 // its Kubernetes components at target, the condition for syncing the bootstrap manifests
-// to the workload cluster. A peer whose Machine cannot be read or whose node cannot be
-// reached holds the sync back: syncing manifests for a control plane that has not
-// finished its upgrade is not what talosctl upgrade-k8s does.
-func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, target string) bool {
+// to the workload cluster. It returns an error when the state of a peer cannot be
+// determined at all - its Machine cannot be read, it has no address, or its node does not
+// answer. That is not the same as a peer that is not at the target yet: the caller keeps
+// the update in progress and retries, instead of skipping a sync the control plane has
+// not finished.
+func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, target string) (bool, error) {
 	reader, ok := h.metadata.(ControlPlaneMachineReader)
 	if !ok {
-		return true
+		return true, nil
 	}
 
 	machines, err := reader.ControlPlaneMachines(ctx, req.Desired.Machine.Namespace, req.Desired.Machine.Spec.ClusterName)
 	if err != nil {
-		h.log.Info("the control-plane machines of the cluster cannot be read", "cluster", req.Desired.Machine.Spec.ClusterName, "error", err.Error())
-
-		return false
+		return false, errors.Wrapf(err, "listing the control-plane machines of cluster %q", req.Desired.Machine.Spec.ClusterName)
 	}
 
 	for _, peer := range machines {
@@ -472,30 +501,24 @@ func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.
 
 		address, err := h.machineAddress(peer)
 		if err != nil {
-			h.log.Info("the address of a control-plane machine cannot be read", "machine", peer.Name, "error", err.Error())
-
-			return false
+			return false, errors.Wrapf(err, "reading the address of control-plane machine %q", peer.Name)
 		}
 
 		if address == "" {
-			h.log.Info("a control-plane machine has no address, so its Kubernetes version cannot be checked", "machine", peer.Name)
-
-			return false
+			return false, errors.Errorf("control-plane machine %q has no address, so its Kubernetes version cannot be checked", peer.Name)
 		}
 
 		status, err := h.applier.NodeStatus(ctx, address)
 		if err != nil {
-			h.log.Info("the Kubernetes components of a control-plane machine cannot be read", "machine", peer.Name, "error", err.Error())
-
-			return false
+			return false, errors.Wrapf(err, "reading the Kubernetes components of control-plane machine %q at %q", peer.Name, address)
 		}
 
 		if !componentsAtTarget(status, target) {
-			return false
+			return false, nil
 		}
 	}
 
-	return true
+	return true, nil
 }
 
 // syncBootstrapManifests syncs the bootstrap manifests of the machine to the workload
@@ -600,7 +623,9 @@ func rolloutReason(req *runtimehooksv1.CanUpdateMachineRequest) string {
 }
 
 // rebootRequiredReason returns the first machine configuration path in the diff that
-// Talos can only apply after a reboot.
+// Talos can only apply after a reboot. It is only the cheap guard in front of the DryRun:
+// every other change, machine/env included, is decided by the node, whose Talos version
+// says whether it accepts the change with mode ApplyConfigurationRequest_NO_REBOOT.
 func rebootRequiredReason(ops []jsonPatchOp) string {
 	for _, op := range ops {
 		path := strings.TrimPrefix(op.Path, "/")
@@ -694,19 +719,25 @@ func pickMachineAddress(addresses []clusterv1.MachineAddress) string {
 // and the metadata secret - and passes them, so the generated configuration and the
 // rendered templates are identical to what the bootstrap controller writes.
 //
+// The second return value reports that metadataFrom is set but the metadata secret does
+// not exist yet: the configuration is then the phase-1 configuration of the two-phase
+// bootstrap, which is missing the patches the metadata renders. It is complete enough to
+// diff and to patch an object with, but it must never be applied to a node - see
+// UpdateMachine.
+//
 // Follows the bootstrap provider's reconcileGenerate
 // (controllers/talosconfig_controller.go:478-640), which calls the same
 // pkg/machineconfig.Generate and pkg/machineconfig.ApplyPatches (stage T4b), reached
 // through the go.mod replace.
-func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) ([]byte, error) {
+func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) ([]byte, bool, error) {
 	base, standardPatches, err := h.machineConfigBase(ctx, spec, machine)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	metadata, metadataPending, err := h.templateContext(ctx, spec, machine)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	config, err := machineconfig.ApplyPatches(base, machineconfig.PatchInput{
@@ -718,8 +749,8 @@ func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1.TalosCon
 		MetadataPending:   metadataPending,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return []byte(config), nil
+	return []byte(config), metadataPending, nil
 }

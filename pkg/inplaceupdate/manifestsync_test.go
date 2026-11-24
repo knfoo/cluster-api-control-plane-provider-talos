@@ -432,3 +432,81 @@ func TestSupportsSSAManifestSync(t *testing.T) {
 	g.Expect(supportsSSAManifestSync("v1.12.1")).To(BeFalse())
 	g.Expect(supportsSSAManifestSync("v1.11.0")).To(BeFalse())
 }
+
+// unreachablePeerApplier is the fake node of a control-plane Machine whose Talos API does
+// not answer, so the Kubernetes version of that peer cannot be read.
+type unreachablePeerApplier struct {
+	*fakeApplier
+	unreachable map[string]bool
+}
+
+func (a *unreachablePeerApplier) NodeStatus(ctx context.Context, endpoint string) (NodeStatus, error) {
+	if a.unreachable[endpoint] {
+		return NodeStatus{}, errors.Errorf("the Talos API of %q did not answer", endpoint)
+	}
+
+	return a.fakeApplier.NodeStatus(ctx, endpoint)
+}
+
+// TestUpdateMachineKeepsTheUpdateInProgressWhenAPeerCannotBeRead checks that a peer whose
+// node status cannot be read does not skip the bootstrap manifest sync: the Machine stays
+// in progress and Cluster API calls the hook again, instead of completing an upgrade whose
+// kube-proxy was never synced. Once the peer answers, the sync runs.
+func TestUpdateMachineKeepsTheUpdateInProgressWhenAPeerCannotBeRead(t *testing.T) {
+	g := NewWithT(t)
+
+	applier := &unreachablePeerApplier{fakeApplier: newFakeApplier(), unreachable: map[string]bool{"10.0.0.2": true}}
+	applier.node = controlPlaneNode()
+
+	syncer := &recordingSyncer{}
+	reader := &syncReader{
+		machines: []clusterv1.Machine{
+			machine("control-plane-1", "v1.34.0"),
+			machine("control-plane-2", "v1.34.0"),
+		},
+		addresses: map[string][]clusterv1.MachineAddress{
+			"control-plane-2": {{Type: clusterv1.MachineAddressType("InternalIP"), Address: "10.0.0.2"}},
+		},
+		kubeconfig: []byte("kubeconfig-of-test-cluster"),
+	}
+
+	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	handler.manifestSyncer = syncer
+
+	handler.CanUpdateMachine(
+		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"),
+		&runtimehooksv1.CanUpdateMachineResponse{},
+	)
+
+	request := &runtimehooksv1.UpdateMachineRequest{
+		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
+		Desired: runtimehooksv1.UpdateMachineRequestObjects{
+			Machine:               machine("control-plane-1", "v1.34.0"),
+			InfrastructureMachine: infraMachine("talos-image"),
+			BootstrapConfig:       talosConfig("talosconfig-1", changedConfig),
+		},
+	}
+
+	for range kubernetesComponents {
+		handler.UpdateMachine(request, &runtimehooksv1.UpdateMachineResponse{})
+	}
+
+	g.Expect(componentsAtTarget(applier.node, "v1.34.0")).To(BeTrue())
+
+	unreadable := &runtimehooksv1.UpdateMachineResponse{}
+	handler.UpdateMachine(request, unreadable)
+
+	g.Expect(unreadable.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(unreadable.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)), "a peer that cannot be read keeps the update in progress instead of skipping the sync")
+	g.Expect(syncer.calls).To(BeZero())
+
+	// The peer answers and is at the target version, so the retry syncs the manifests.
+	applier.unreachable["10.0.0.2"] = false
+
+	done := &runtimehooksv1.UpdateMachineResponse{}
+	handler.UpdateMachine(request, done)
+
+	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(done.RetryAfterSeconds).To(BeZero())
+	g.Expect(syncer.calls).To(Equal(1))
+}

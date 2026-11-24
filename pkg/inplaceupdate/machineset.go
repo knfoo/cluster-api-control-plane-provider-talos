@@ -20,15 +20,19 @@
 // MachineSet out (docs/adr/ADR-0003).
 //
 // The request carries no Machine objects, so the machine configuration of the rollout is
-// rendered from the MachineSet template spec. The node decides for every Machine of the
-// MachineSet through the DryRun of CanUpdateMachine and UpdateMachine, which is the other
-// half of the owner's condition that a change is handled in place only when Talos accepts
-// it with mode ApplyConfigurationRequest_NO_REBOOT.
+// rendered from the MachineSet template spec and the Machines of the machine set are read
+// from the management cluster through the MachineSetNameLabel (pkg/inplaceupdate/metadata.go).
+// The rendered desired configuration is DryRun against a live Machine of the machine set,
+// the owner's condition of docs/adr/ADR-0003 that a change is handled in place only when
+// Talos accepts it with mode ApplyConfigurationRequest_NO_REBOOT: a node that needs a
+// reboot, or that refuses the configuration in immediate mode, gets no patch and the
+// MachineSet is rolled out.
 package inplaceupdate
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
@@ -80,14 +84,14 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 	// renders for the machines the template describes. A configuration the extension cannot
 	// render is answered with Success and no patch, which leaves the MachineSet different
 	// from its desired state and makes Cluster API roll it out.
-	currentConfig, err := h.renderMachineConfig(ctx, currentSpec, templateMachine(req.Current.MachineSet))
+	currentConfig, _, err := h.renderMachineConfig(ctx, currentSpec, templateMachine(req.Current.MachineSet))
 	if err != nil {
 		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", err.Error())
 
 		return
 	}
 
-	desiredConfig, err := h.renderMachineConfig(ctx, desiredSpec, templateMachine(req.Desired.MachineSet))
+	desiredConfig, _, err := h.renderMachineConfig(ctx, desiredSpec, templateMachine(req.Desired.MachineSet))
 	if err != nil {
 		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", err.Error())
 
@@ -102,6 +106,8 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 		return
 	}
 
+	// The Talos versions are equal (checked above), so the version of the current template
+	// is the version the machines of the machine set run.
 	if reason := rebootRequiredReason(ops); reason != "" {
 		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", reason)
 
@@ -116,6 +122,19 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", "the machine configuration of the machine set does not change")
 
 		return
+	}
+
+	// The owner's condition of docs/adr/ADR-0003: a machine configuration change is handled
+	// in place only when Talos accepts it with mode ApplyConfigurationRequest_NO_REBOOT.
+	// The reboot path guard above is the cheap half; this DryRun against a live Machine of
+	// the machine set is the authoritative one, and it is what decides a change Talos only
+	// applies after a reboot, such as machine/env on Talos v1.12.
+	if len(ops) > 0 {
+		if reason := h.machineSetDryRunReason(ctx, req, desiredConfig); reason != "" {
+			h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", reason)
+
+			return
+		}
 	}
 
 	if len(ops) > 0 {
@@ -149,6 +168,66 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 	}
 
 	h.log.Info("machine set can be updated in place", "machineSet", machineSet, "operations", len(ops), "version", desiredVersion)
+}
+
+// machineSetDryRunReason DryRuns the rendered desired machine configuration against a live
+// Machine of the machine set and returns why the MachineSet has to be rolled out, or ""
+// when a node accepts the configuration with mode ApplyConfigurationRequest_NO_REBOOT.
+//
+// Talos answers a configuration it can only apply after a boot with a mode other than
+// NO_REBOOT (pkg/inplaceupdate/talos.go: request), and an older Talos release refuses an
+// immediate-mode apply outright - machine/env on Talos v1.12 with "this config change can't
+// be applied in immediate mode". Either answer means the node can never finish the in-place
+// update, so the hook returns no patch and Cluster API rolls the MachineSet out.
+//
+// An in-place update nobody DryRunned is not approved either: when the Machines of the
+// machine set cannot be read, or when none of them can be reached, the hook returns a
+// rollout reason. It falls back to the cheap reboot path guard only in the two cases where
+// there is nothing to ask: the extension has no reader for the Machines of the machine set
+// at all, exactly like the other optional capabilities of the metadata reader, and the
+// machine set has no Machines, so there is no node to update in place.
+func (h *Handler) machineSetDryRunReason(ctx context.Context, req *runtimehooksv1.CanUpdateMachineSetRequest, desiredConfig []byte) string {
+	machineSet := req.Current.MachineSet.Name
+
+	reader, ok := h.metadata.(MachineSetMachineReader)
+	if !ok {
+		h.log.Info("the extension has no reader for the machines of the machine set, so the machine configuration is not DryRun", "machineSet", machineSet)
+
+		return ""
+	}
+
+	machines, err := reader.MachineSetMachines(ctx, req.Current.MachineSet.Namespace, machineSet)
+	if err != nil {
+		return fmt.Sprintf("the machines of the machine set %q cannot be read, so no node DryRuns the machine configuration: %v", machineSet, err)
+	}
+
+	if len(machines) == 0 {
+		h.log.Info("the machine set has no machines, so there is no node to DryRun the machine configuration", "machineSet", machineSet)
+
+		return ""
+	}
+
+	for _, machine := range machines {
+		endpoint, err := h.resolveEndpoint(req.Settings, machine)
+		if err != nil {
+			h.log.Info("the Talos address of a machine of the machine set cannot be determined, so it is not asked about the machine configuration", "machine", machine.Name, "error", err.Error())
+
+			continue
+		}
+
+		status, err := h.applier.DryRun(ctx, endpoint, desiredConfig)
+		if err != nil {
+			return fmt.Sprintf("machine %q of the machine set does not accept the machine configuration without a reboot: %v", machine.Name, err)
+		}
+
+		if status.RebootRequired {
+			return fmt.Sprintf("Talos needs a reboot to apply the machine configuration of machine %q of the machine set: %s", machine.Name, status.Details)
+		}
+
+		return ""
+	}
+
+	return fmt.Sprintf("no machine of the machine set %q can be reached, so the machine configuration is not DryRun", machineSet)
 }
 
 // machineSetRolloutReason returns why a MachineSet cannot be updated by patching its

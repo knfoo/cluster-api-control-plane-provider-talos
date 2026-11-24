@@ -10,6 +10,7 @@ package inplaceupdate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -502,5 +503,199 @@ func TestUpdateMachineFallsBackWhenTheMachineHasNoAddress(t *testing.T) {
 
 	for _, endpoint := range applier.endpoints {
 		g.Expect(endpoint).To(Equal("10.0.0.2"), "the node was addressed at %q instead of the address of the ExtensionConfig setting", endpoint)
+	}
+}
+
+// machineEnvConfig is the machine configuration of the reboot-required step of the in-place
+// e2e test: a variable under machine/env.
+const machineEnvConfig = `version: v1alpha1
+machine:
+  env:
+    E2E_REBOOT_REQUIRED: "1"
+  network:
+    hostname: worker-1
+  files:
+    - path: /var/inplace/first
+      content: original
+cluster:
+  token: bootstrap-token
+`
+
+// machineSetNodes is the fake management cluster of render_test.go plus the Machines of a
+// machine set and the addresses their infrastructure providers reported, which is what
+// CanUpdateMachineSet needs to DryRun the machine configuration of a rollout against a node.
+type machineSetNodes struct {
+	*fakeMetadata
+
+	machines []machineSetNode
+	err      error
+}
+
+type machineSetNode struct {
+	name      string
+	addresses []clusterv1.MachineAddress
+}
+
+func (f *machineSetNodes) MachineSetMachines(_ context.Context, _, _ string) ([]clusterv1.Machine, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	machines := make([]clusterv1.Machine, 0, len(f.machines))
+
+	for _, node := range f.machines {
+		machines = append(machines, clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: node.name, Namespace: "default"},
+			Spec:       clusterv1.MachineSpec{ClusterName: "test-cluster"},
+		})
+	}
+
+	return machines, nil
+}
+
+func (f *machineSetNodes) MachineAddresses(_ context.Context, _, name string) ([]clusterv1.MachineAddress, error) {
+	for _, node := range f.machines {
+		if node.name == name {
+			return node.addresses, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// TestCanUpdateMachineSetDryRunsTheMachineConfigurationAgainstItsNodes checks the owner's
+// condition of docs/adr/ADR-0003 for a machine set: the hook asks a live Machine of the
+// machine set whether the rendered desired configuration is accepted with mode
+// ApplyConfigurationRequest_NO_REBOOT, and a node that needs a reboot or that refuses the
+// configuration in immediate mode - machine/env on Talos v1.12, "this config change can't be
+// applied in immediate mode" - gets no patch, so Cluster API rolls the MachineSet out instead
+// of starting an in-place update the node can never finish. The Talos version of the template
+// is not consulted: the node is the authority.
+func TestCanUpdateMachineSetDryRunsTheMachineConfigurationAgainstItsNodes(t *testing.T) {
+	g := NewWithT(t)
+
+	for _, test := range []struct {
+		name      string
+		refuses   string
+		reboot    bool
+		wantPatch bool
+	}{
+		{name: "the node applies machine/env with mode NO_REBOOT", wantPatch: true},
+		{name: "the node needs a reboot for machine/env", reboot: true, wantPatch: false},
+		{name: "the node refuses machine/env in immediate mode", refuses: "rpc error: code = InvalidArgument desc = this config change can't be applied in immediate mode", wantPatch: false},
+	} {
+		applier := newFakeApplier()
+		applier.refuses = test.refuses
+		applier.alwaysReboot = test.reboot
+
+		nodes := &machineSetNodes{
+			fakeMetadata: clusterMetadata(),
+			machines: []machineSetNode{
+				{name: "worker-1", addresses: []clusterv1.MachineAddress{{Type: clusterv1.MachineInternalIP, Address: "10.0.0.5"}}},
+			},
+		}
+
+		handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, nodes)
+
+		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
+		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+			workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
+			workerMachineSet("workers", "v1.33.1", "talosconfig-2"),
+			talosConfigTemplateRaw("talosconfig-1", map[string]any{"talosVersion": "v1.12.12", "data": baseConfig}),
+			talosConfigTemplateRaw("talosconfig-2", map[string]any{"talosVersion": "v1.12.12", "data": machineEnvConfig}),
+			infraMachineTemplate("infra-template", "talos-image"),
+		), resp)
+
+		g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess), test.name)
+
+		if test.wantPatch {
+			g.Expect(resp.BootstrapConfigTemplatePatch.Patch).NotTo(BeEmpty(), test.name)
+		} else {
+			g.Expect(resp.BootstrapConfigTemplatePatch.Patch).To(BeEmpty(), test.name)
+		}
+
+		g.Expect(resp.MachineSetPatch.Patch).To(BeEmpty(), test.name)
+		g.Expect(resp.InfrastructureMachineTemplatePatch.Patch).To(BeEmpty(), test.name)
+		g.Expect(applier.dryRunRuns).To(Equal(1), test.name)
+		g.Expect(applier.endpoints).To(ContainElement("10.0.0.5"), test.name)
+	}
+}
+
+// TestCanUpdateMachineSetPatchesWithoutALiveMachine checks the two cases in which no node can
+// be asked and the hook still patches the template: a machine set with no Machines has no
+// node to refuse the change - the patch only changes the template the next Machines are built
+// from - and an extension started without --kubeconfig has no reader for the Machines of the
+// machine set, exactly like the other optional capabilities of the metadata reader.
+func TestCanUpdateMachineSetPatchesWithoutALiveMachine(t *testing.T) {
+	g := NewWithT(t)
+
+	for _, test := range []struct {
+		name     string
+		metadata MetadataReader
+	}{
+		{name: "the machine set has no machines", metadata: &machineSetNodes{fakeMetadata: clusterMetadata()}},
+		{name: "the extension has no reader for the machines of the machine set", metadata: clusterMetadata()},
+	} {
+		applier := newFakeApplier()
+		handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, test.metadata)
+
+		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
+		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+			workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
+			workerMachineSet("workers", "v1.33.1", "talosconfig-2"),
+			talosConfigTemplateRaw("talosconfig-1", map[string]any{"talosVersion": "v1.12.12", "data": baseConfig}),
+			talosConfigTemplateRaw("talosconfig-2", map[string]any{"talosVersion": "v1.12.12", "data": machineEnvConfig}),
+			infraMachineTemplate("infra-template", "talos-image"),
+		), resp)
+
+		g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess), test.name)
+		g.Expect(resp.BootstrapConfigTemplatePatch.Patch).NotTo(BeEmpty(), test.name)
+		g.Expect(applier.dryRunRuns).To(BeZero(), test.name)
+	}
+}
+
+// TestCanUpdateMachineSetRollsOutWhenNoNodeIsDryRun checks that an in-place update nobody
+// DryRunned is not approved: when the Machines of the machine set cannot be read, or when
+// none of them can be reached, the hook returns no patch and Cluster API rolls the MachineSet
+// out, instead of patching the template for machines whose node was never asked whether it
+// accepts the machine configuration with mode ApplyConfigurationRequest_NO_REBOOT.
+func TestCanUpdateMachineSetRollsOutWhenNoNodeIsDryRun(t *testing.T) {
+	g := NewWithT(t)
+
+	for _, test := range []struct {
+		name     string
+		metadata *machineSetNodes
+	}{
+		{
+			name:     "the machines of the machine set cannot be read",
+			metadata: &machineSetNodes{fakeMetadata: clusterMetadata(), err: errors.New("the management cluster did not answer")},
+		},
+		{
+			name: "no machine of the machine set has an address",
+			metadata: &machineSetNodes{
+				fakeMetadata: clusterMetadata(),
+				machines: []machineSetNode{
+					{name: "worker-1"},
+					{name: "worker-2"},
+				},
+			},
+		},
+	} {
+		applier := newFakeApplier()
+		handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, test.metadata)
+
+		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
+		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+			workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
+			workerMachineSet("workers", "v1.33.1", "talosconfig-2"),
+			talosConfigTemplateRaw("talosconfig-1", map[string]any{"talosVersion": "v1.12.12", "data": baseConfig}),
+			talosConfigTemplateRaw("talosconfig-2", map[string]any{"talosVersion": "v1.12.12", "data": machineEnvConfig}),
+			infraMachineTemplate("infra-template", "talos-image"),
+		), resp)
+
+		g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess), test.name)
+		g.Expect(resp.BootstrapConfigTemplatePatch.Patch).To(BeEmpty(), test.name)
+		g.Expect(resp.MachineSetPatch.Patch).To(BeEmpty(), test.name)
+		g.Expect(applier.dryRunRuns).To(BeZero(), test.name)
 	}
 }

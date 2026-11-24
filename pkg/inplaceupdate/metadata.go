@@ -74,6 +74,20 @@ type ControlPlaneMachineReader interface {
 	ControlPlaneMachines(ctx context.Context, namespace, clusterName string) ([]clusterv1.Machine, error)
 }
 
+// MachineSetMachineReader lists the Machines Cluster API currently assigns to a machine
+// set. It is an optional capability of a MetadataReader, like MachineAddressReader and
+// ControlPlaneMachineReader: the CanUpdateMachineSet request carries no Machine objects
+// ("Only spec is provided, status fields are not included", docs/book/src/tasks/
+// experimental-features/runtime-sdk/implement-in-place-update-hooks.md), so the hook has
+// to read the management cluster to find a live Machine of the machine set it can DryRun
+// the machine configuration against. Cluster API labels every Machine of a machine set
+// with the name of the set (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineSetNameLabel).
+type MachineSetMachineReader interface {
+	// MachineSetMachines returns the Machines of the machine set, or an empty list when the
+	// machine set has no Machines yet.
+	MachineSetMachines(ctx context.Context, namespace, machineSetName string) ([]clusterv1.Machine, error)
+}
+
 // NewKubeMetadataReader builds a reader that reads from the management cluster with
 // the given client. The rules the reader needs are already in config/rbac/role.yaml
 // (secrets get;list;watch, machines get;list;watch and the bootstrap/cluster API groups).
@@ -170,6 +184,34 @@ func (r *kubeMetadataReader) ControlPlaneMachines(ctx context.Context, namespace
 		machine := &clusterv1.Machine{}
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(list.Items[i].Object, machine); err != nil {
 			return nil, errors.Wrapf(err, "decoding the Machine %q of cluster %q", list.Items[i].GetName(), clusterName)
+		}
+
+		machines = append(machines, *machine)
+	}
+
+	return machines, nil
+}
+
+func (r *kubeMetadataReader) MachineSetMachines(ctx context.Context, namespace, machineSetName string) ([]clusterv1.Machine, error) {
+	// Like the other reads, the Machines are read unstructured so the reader does not
+	// depend on which Cluster API version the cluster's CRD is served in. The MachineSet
+	// controller labels every Machine it creates with the name of the machine set.
+	list := &unstructured.UnstructuredList{}
+
+	list.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineList"))
+
+	if err := r.client.List(ctx, list, client.MatchingLabels{
+		clusterv1.MachineSetNameLabel: machineSetName,
+	}); err != nil {
+		return nil, errors.Wrapf(err, "listing the machines of machine set %q", machineSetName)
+	}
+
+	machines := make([]clusterv1.Machine, 0, len(list.Items))
+
+	for i := range list.Items {
+		machine := &clusterv1.Machine{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(list.Items[i].Object, machine); err != nil {
+			return nil, errors.Wrapf(err, "decoding the Machine %q of machine set %q", list.Items[i].GetName(), machineSetName)
 		}
 
 		machines = append(machines, *machine)

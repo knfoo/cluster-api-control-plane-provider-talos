@@ -7,6 +7,7 @@ package inplaceupdate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -32,6 +33,10 @@ type fakeApplier struct {
 	dryRunRuns   int
 	applyRuns    int
 	node         NodeStatus
+	// refuses stands in for an older Talos release that rejects a configuration in
+	// immediate mode instead of reporting a reboot requirement, e.g. machine/env on
+	// Talos v1.12.
+	refuses string
 	// nodes lets a test give a node of its own to each Talos endpoint, so the control
 	// plane peers a manifest sync has to wait for can lag behind the machine being
 	// updated.
@@ -116,6 +121,10 @@ func (f *fakeApplier) BootstrapManifests(_ context.Context, endpoint string) ([]
 func (f *fakeApplier) DryRun(_ context.Context, endpoint string, config []byte) (ApplyStatus, error) {
 	f.dryRunRuns++
 	f.endpoints = append(f.endpoints, endpoint)
+
+	if f.refuses != "" {
+		return ApplyStatus{}, errors.New(f.refuses)
+	}
 
 	return f.status(endpoint, config), nil
 }
@@ -887,4 +896,71 @@ func TestCanUpdateMachineRolloutForWorkerMachineKubernetesVersion(t *testing.T) 
 	handler.CanUpdateMachine(canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
+}
+
+// TestRebootRequiredReasonIsNotTalosVersionAware checks the cheap guard in front of the
+// DryRun: only the paths Talos can never apply after booting the node again are listed, and
+// a change under machine/env is left to the node, because whether Talos applies it live
+// depends on the version the node runs.
+func TestRebootRequiredReasonIsNotTalosVersionAware(t *testing.T) {
+	g := NewWithT(t)
+
+	envChange := []jsonPatchOp{{Op: "replace", Path: "/machine/env/E2E_REBOOT_REQUIRED", Value: "1"}}
+
+	g.Expect(rebootRequiredReason(envChange)).To(BeEmpty(), "machine/env is decided by the DryRun of the node, not by its Talos version")
+
+	g.Expect(rebootRequiredReason([]jsonPatchOp{{Op: "replace", Path: "/machine/install/image", Value: "ghcr.io/siderolabs/talos:v1.14.6"}})).NotTo(BeEmpty())
+}
+
+// TestUpdateMachineWaitsForMetadataBeforeApplyingConfiguration covers the two-phase bootstrap
+// of a Metal3/CAPM3 machine: metadataFrom is set, but the metadata secret the infrastructure
+// provider writes after the bootstrap data does not exist yet, so the rendered configuration
+// is the phase-1 configuration, without the strategic patches that still contain template
+// expressions. Applying it would give the node a machine configuration that is missing the
+// patches its metadata renders, so the hook reports the update as in progress and Cluster API
+// calls the hook again instead of updating the Machine with a partial configuration.
+func TestUpdateMachineWaitsForMetadataBeforeApplyingConfiguration(t *testing.T) {
+	g := NewWithT(t)
+
+	applier := newFakeApplier()
+	metadata := clusterMetadata()
+	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, metadata)
+
+	config := talosConfigRaw("talosconfig-2", map[string]any{
+		"talosVersion": "v1.14.0",
+		"data":         baseConfig,
+		"metadataFrom": map[string]any{"secretRef": map[string]any{"name": "workers-metadata"}},
+		"strategicPatches": []string{
+			"machine:\n  sysctls:\n    net.ipv4.tcp_keepalive_time: \"{{ get \"keepalive\" }}\"\n",
+		},
+	})
+
+	request := &runtimehooksv1.UpdateMachineRequest{
+		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
+		Desired: runtimehooksv1.UpdateMachineRequestObjects{
+			Machine:               machine("worker-1", "v1.33.1"),
+			InfrastructureMachine: infraMachine("talos-image"),
+			BootstrapConfig:       config,
+		},
+	}
+
+	pending := &runtimehooksv1.UpdateMachineResponse{}
+	handler.UpdateMachine(request, pending)
+
+	g.Expect(pending.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(pending.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)), "the machine stays in progress while its metadata is missing")
+	g.Expect(applier.applyRuns).To(BeZero(), "the phase-1 configuration is not applied to the node")
+	g.Expect(applier.applied["10.0.0.1"]).To(BeEmpty())
+
+	// The infrastructure provider has created the metadata claim, so the retry renders the
+	// whole configuration and applies it.
+	metadata.withMetadata("workers-metadata", "keepalive: \"1000\"\n")
+
+	done := &runtimehooksv1.UpdateMachineResponse{}
+	handler.UpdateMachine(request, done)
+
+	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(applier.applyRuns).To(Equal(1))
+	g.Expect(applier.applied["10.0.0.1"]).To(ContainSubstring("tcp_keepalive_time"))
+	g.Expect(applier.applied["10.0.0.1"]).To(ContainSubstring("1000"))
 }

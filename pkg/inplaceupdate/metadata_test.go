@@ -89,3 +89,42 @@ func TestPickMachineAddressPrefersTheInternalAddress(t *testing.T) {
 
 	g.Expect(pickMachineAddress(nil)).To(BeEmpty())
 }
+
+// TestMachineSetMachinesReadsTheMachinesOfAMachineSet checks the capability CanUpdateMachineSet
+// uses to find a node it can DryRun the machine configuration of a rollout against: the
+// MachineSet controller labels every Machine it creates with the name of the machine set
+// (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineSetNameLabel), and Machines of another
+// machine set are not returned.
+func TestMachineSetMachinesReadsTheMachinesOfAMachineSet(t *testing.T) {
+	g := NewWithT(t)
+
+	worker := func(name, machineSet string) *unstructured.Unstructured {
+		object := &unstructured.Unstructured{}
+
+		object.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Machine"))
+		object.SetName(name)
+		object.SetNamespace("default")
+		object.SetLabels(map[string]string{
+			clusterv1.ClusterNameLabel:    "test-cluster",
+			clusterv1.MachineSetNameLabel: machineSet,
+		})
+
+		return object
+	}
+
+	reader := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(
+		worker("worker-1", "workers-abc123"),
+		worker("worker-2", "workers-abc123"),
+		worker("worker-3", "workers-def456"),
+	).Build())
+
+	machines, err := reader.(MachineSetMachineReader).MachineSetMachines(context.Background(), "default", "workers-abc123")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(machines).To(HaveLen(2))
+	g.Expect(machines[0].Name).To(Equal("worker-1"))
+	g.Expect(machines[1].Name).To(Equal("worker-2"))
+
+	machines, err = reader.(MachineSetMachineReader).MachineSetMachines(context.Background(), "default", "workers-that-do-not-exist")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(machines).To(BeEmpty())
+}
