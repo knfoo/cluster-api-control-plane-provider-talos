@@ -10,9 +10,12 @@ spec:
       port: 443
       targetPort: 9443
     # The in-place update hooks (CanUpdateMachine, CanUpdateMachineSet, UpdateMachine) are
-    # served by the manager on --runtime-extension-port, default 9444.
-    - name: runtime-extension
+    # served by the manager on --runtime-extension-port, default 9444. A port name is an IANA
+    # service name of at most 15 characters, checked by
+    # k8s.io/apimachinery/pkg/util/validation.IsValidPortName, so the hook port is named
+    # runtime-ext and reached on its number, as the webhook port above.
+    - name: runtime-ext
       port: 9444
-      targetPort: runtime-extension
+      targetPort: 9444
   selector:
     control-plane: controller-manager

@@ -13,8 +13,10 @@ spec:
               name: webhook-server
               protocol: TCP
             # The in-place update hooks of the Runtime SDK, served on --runtime-extension-port.
+            # Port names are IANA service names of at most 15 characters
+            # (k8s.io/apimachinery/pkg/util/validation.IsValidPortName).
             - containerPort: 9444
-              name: runtime-extension
+              name: runtime-ext
               protocol: TCP
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
