@@ -428,23 +428,21 @@ func Test_tryInPlaceUpdate(t *testing.T) {
 			var canUpdateMachineCalled bool
 			var triggerInPlaceUpdateCalled bool
 
-			overrideCanUpdateMachine = func(ctx context.Context, machine *clusterv1.Machine) (bool, error) {
-				canUpdateMachineCalled = true
-				if tt.canUpdateMachineFunc == nil {
-					return false, nil
-				}
-				return tt.canUpdateMachineFunc(ctx, machine)
-			}
-			overrideTriggerInPlaceUpdate = func(_ context.Context, _ *clusterv1.Machine, _ UpToDateResult) error {
-				triggerInPlaceUpdateCalled = true
-				return nil
-			}
-			defer func() {
-				overrideCanUpdateMachine = nil
-				overrideTriggerInPlaceUpdate = nil
-			}()
+			r := &TalosControlPlaneReconciler{
+				overrideCanUpdateMachine: func(ctx context.Context, machine *clusterv1.Machine) (bool, error) {
+					canUpdateMachineCalled = true
+					if tt.canUpdateMachineFunc == nil {
+						return false, nil
+					}
 
-			r := &TalosControlPlaneReconciler{}
+					return tt.canUpdateMachineFunc(ctx, machine)
+				},
+				overrideTriggerInPlaceUpdate: func(_ context.Context, _ *clusterv1.Machine, _ UpToDateResult) error {
+					triggerInPlaceUpdateCalled = true
+
+					return nil
+				},
+			}
 
 			fallbackToScaleDown, err := r.tryInPlaceUpdate(context.Background(), nil, machineToInPlaceUpdate, tt.machineUpToDateResult)
 			if tt.wantError {
@@ -520,16 +518,15 @@ func TestReconcileMachinesWaitsForInProgressInPlaceUpdate(t *testing.T) {
 	cluster, tcp, controlPlane, machineList := rollingUpdateControlPlane(machines)
 
 	var triggered []string
-	overrideTryInPlaceUpdate = func(_ context.Context, _ *ControlPlane, machine *clusterv1.Machine, _ UpToDateResult) (bool, error) {
-		triggered = append(triggered, machine.Name)
-
-		return false, nil
-	}
-	defer func() { overrideTryInPlaceUpdate = nil }()
 
 	r := &TalosControlPlaneReconciler{
 		Client: fake.NewClientBuilder().Build(),
 		Log:    logr.Discard(),
+		overrideTryInPlaceUpdate: func(_ context.Context, _ *ControlPlane, machine *clusterv1.Machine, _ UpToDateResult) (bool, error) {
+			triggered = append(triggered, machine.Name)
+
+			return false, nil
+		},
 	}
 
 	// The Machine controller has not finished cp-1 yet, so three consecutive reconciles may not start
@@ -567,17 +564,16 @@ func TestReconcileMachinesCompletesInterruptedInPlaceUpdateTrigger(t *testing.T)
 	cluster, tcp, controlPlane, machineList := rollingUpdateControlPlane(machines)
 
 	var completed []string
-	overrideTriggerInPlaceUpdate = func(_ context.Context, machine *clusterv1.Machine, _ UpToDateResult) error {
-		completed = append(completed, machine.Name)
-		markObjectAsPending(machine, runtimehooksv1.UpdateMachine)
-
-		return nil
-	}
-	defer func() { overrideTriggerInPlaceUpdate = nil }()
 
 	r := &TalosControlPlaneReconciler{
 		Client: fake.NewClientBuilder().Build(),
 		Log:    logr.Discard(),
+		overrideTriggerInPlaceUpdate: func(_ context.Context, machine *clusterv1.Machine, _ UpToDateResult) error {
+			completed = append(completed, machine.Name)
+			markObjectAsPending(machine, runtimehooksv1.UpdateMachine)
+
+			return nil
+		},
 	}
 
 	res, err := r.reconcileMachines(context.Background(), cluster, tcp, machineList, controlPlane)

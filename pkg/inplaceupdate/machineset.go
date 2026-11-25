@@ -31,19 +31,18 @@ package inplaceupdate
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
-	"github.com/pkg/errors"
-	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 )
 
-// CanUpdateMachineSet is the CanUpdateMachineSet hook.
+// CanUpdateMachineSet is the CanUpdateMachineSet hook. It shares the pipeline of the
+// CanUpdateMachine hook (pkg/inplaceupdate/handlers.go: planInPlaceUpdate): decode the
+// machine configuration spec of the current and the desired TalosConfigTemplate, render the
+// machine configuration, diff it and check the reboot guard; only the DryRun against a node
+// of the machine set is specific to a MachineSet rollout.
 func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetRequest, resp *runtimehooksv1.CanUpdateMachineSetResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
@@ -55,28 +54,6 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 		return
 	}
 
-	currentSpec, err := talosConfigTemplateSpec(req.Current.BootstrapConfigTemplate)
-	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = err.Error()
-
-		return
-	}
-
-	desiredSpec, err := talosConfigTemplateSpec(req.Desired.BootstrapConfigTemplate)
-	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = err.Error()
-
-		return
-	}
-
-	if currentSpec.TalosVersion != desiredSpec.TalosVersion {
-		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", "the Talos version changes")
-
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
 	defer cancel()
 
@@ -84,21 +61,13 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 	// renders for the machines the template describes. A configuration the extension cannot
 	// render is answered with Success and no patch, which leaves the MachineSet different
 	// from its desired state and makes Cluster API roll it out.
-	currentConfig, _, err := h.renderMachineConfig(ctx, currentSpec, templateMachine(req.Current.MachineSet))
-	if err != nil {
-		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", err.Error())
-
-		return
-	}
-
-	desiredConfig, _, err := h.renderMachineConfig(ctx, desiredSpec, templateMachine(req.Desired.MachineSet))
-	if err != nil {
-		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", err.Error())
-
-		return
-	}
-
-	ops, err := configDiff(currentConfig, desiredConfig)
+	plan, err := h.planInPlaceUpdate(
+		ctx,
+		req.Current.BootstrapConfigTemplate,
+		req.Desired.BootstrapConfigTemplate,
+		templateMachine(req.Current.MachineSet),
+		templateMachine(req.Desired.MachineSet),
+	)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -106,39 +75,27 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 		return
 	}
 
-	// The Talos versions are equal (checked above), so the version of the current template
-	// is the version the machines of the machine set run.
-	if reason := rebootRequiredReason(ops); reason != "" {
-		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", reason)
+	if plan.reason != "" {
+		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", plan.reason)
 
 		return
 	}
 
-	currentVersion := req.Current.MachineSet.Spec.Template.Spec.Version
-	desiredVersion := req.Desired.MachineSet.Spec.Template.Spec.Version
-	versionUpgrade := currentVersion != desiredVersion
+	// The reboot path guard of planInPlaceUpdate is the cheap half; this DryRun against a
+	// live Machine of the machine set is the authoritative one, and it is what decides a
+	// change Talos only applies after a reboot, such as machine/env on Talos v1.12. A
+	// failed DryRun is a rollout reason here rather than a hook failure: no node of the
+	// machine set has approved the configuration.
+	if len(plan.ops) > 0 {
+		reason := h.machineSetDryRunReason(ctx, req, plan.config)
 
-	if len(ops) == 0 && !versionUpgrade {
-		h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", "the machine configuration of the machine set does not change")
-
-		return
-	}
-
-	// The owner's condition of docs/adr/ADR-0003: a machine configuration change is handled
-	// in place only when Talos accepts it with mode ApplyConfigurationRequest_NO_REBOOT.
-	// The reboot path guard above is the cheap half; this DryRun against a live Machine of
-	// the machine set is the authoritative one, and it is what decides a change Talos only
-	// applies after a reboot, such as machine/env on Talos v1.12.
-	if len(ops) > 0 {
-		if reason := h.machineSetDryRunReason(ctx, req, desiredConfig); reason != "" {
+		if reason != "" {
 			h.log.Info("machine set cannot be updated in place", "machineSet", machineSet, "reason", reason)
 
 			return
 		}
-	}
 
-	if len(ops) > 0 {
-		patch, err := templateSpecPatch(req.Current.BootstrapConfigTemplate, req.Desired.BootstrapConfigTemplate)
+		patch, err := configPatch(req.Current.BootstrapConfigTemplate, req.Desired.BootstrapConfigTemplate)
 		if err != nil {
 			resp.Status = runtimehooksv1.ResponseStatusFailure
 			resp.Message = err.Error()
@@ -152,8 +109,8 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 		}
 	}
 
-	if versionUpgrade {
-		patch, err := jsonPatch([]jsonPatchOp{{Op: "replace", Path: "/spec/template/spec/version", Value: desiredVersion}})
+	if plan.versionChange {
+		patch, err := jsonPatch([]jsonPatchOp{{Op: "replace", Path: "/spec/template/spec/version", Value: req.Desired.MachineSet.Spec.Template.Spec.Version}})
 		if err != nil {
 			resp.Status = runtimehooksv1.ResponseStatusFailure
 			resp.Message = err.Error()
@@ -167,11 +124,11 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 		}
 	}
 
-	h.log.Info("machine set can be updated in place", "machineSet", machineSet, "operations", len(ops), "version", desiredVersion)
+	h.log.Info("machine set can be updated in place", "machineSet", machineSet, "operations", len(plan.ops), "version", req.Desired.MachineSet.Spec.Template.Spec.Version)
 }
 
-// machineSetDryRunReason DryRuns the rendered desired machine configuration against a live
-// Machine of the machine set and returns why the MachineSet has to be rolled out, or ""
+// machineSetDryRunReason DryRuns the rendered desired machine configuration against the live
+// Machines of the machine set and returns why the MachineSet has to be rolled out, or ""
 // when a node accepts the configuration with mode ApplyConfigurationRequest_NO_REBOOT.
 //
 // Talos answers a configuration it can only apply after a boot with a mode other than
@@ -182,11 +139,11 @@ func (h *Handler) CanUpdateMachineSet(req *runtimehooksv1.CanUpdateMachineSetReq
 //
 // An in-place update nobody DryRunned is not approved either: when the Machines of the
 // machine set cannot be read, or when none of them can be reached, the hook returns a
-// rollout reason. It falls back to the cheap reboot path guard only in the two cases where
-// there is nothing to ask: the extension has no reader for the Machines of the machine set
-// at all, exactly like the other optional capabilities of the metadata reader, and the
-// machine set has no Machines, so there is no node to update in place.
-func (h *Handler) machineSetDryRunReason(ctx context.Context, req *runtimehooksv1.CanUpdateMachineSetRequest, desiredConfig []byte) string {
+// rollout reason. It falls back to the cheap reboot path guard of planInPlaceUpdate only in
+// the two cases where there is nothing to ask: the extension has no reader for the Machines
+// of the machine set at all, exactly like the other optional capabilities of the metadata
+// reader, and the machine set has no Machines, so there is no node to update in place.
+func (h *Handler) machineSetDryRunReason(ctx context.Context, req *runtimehooksv1.CanUpdateMachineSetRequest, config []byte) string {
 	machineSet := req.Current.MachineSet.Name
 
 	reader, ok := h.metadata.(MachineSetMachineReader)
@@ -215,16 +172,12 @@ func (h *Handler) machineSetDryRunReason(ctx context.Context, req *runtimehooksv
 			continue
 		}
 
-		status, err := h.applier.DryRun(ctx, endpoint, desiredConfig)
+		reason, err := h.dryRunReason(ctx, endpoint, config)
 		if err != nil {
-			return fmt.Sprintf("machine %q of the machine set does not accept the machine configuration without a reboot: %v", machine.Name, err)
+			return fmt.Sprintf("machine %q of the machine set does not answer the DryRun of the machine configuration: %v", machine.Name, err)
 		}
 
-		if status.RebootRequired {
-			return fmt.Sprintf("Talos needs a reboot to apply the machine configuration of machine %q of the machine set: %s", machine.Name, status.Details)
-		}
-
-		return ""
+		return reason
 	}
 
 	return fmt.Sprintf("no machine of the machine set %q can be reached, so the machine configuration is not DryRun", machineSet)
@@ -250,7 +203,11 @@ func machineSetRolloutReason(req *runtimehooksv1.CanUpdateMachineSetRequest) str
 		return "the machine set has no bootstrap configuration template"
 	}
 
-	if !isTalosConfigTemplate(req.Current.BootstrapConfigTemplate) || !isTalosConfigTemplate(req.Desired.BootstrapConfigTemplate) {
+	// A machine set bootstrap configuration that is not a TalosConfigTemplate, or is
+	// bootstrap data instead of a template, is not an error: it is just a change this
+	// extension cannot patch, so the hook answers Success with no patch and Cluster API
+	// rolls the MachineSet out.
+	if configKind(req.Current.BootstrapConfigTemplate) != "TalosConfigTemplate" || configKind(req.Desired.BootstrapConfigTemplate) != "TalosConfigTemplate" {
 		return "the bootstrap configuration template of the machine set is not a TalosConfigTemplate"
 	}
 
@@ -259,26 +216,6 @@ func machineSetRolloutReason(req *runtimehooksv1.CanUpdateMachineSetRequest) str
 	}
 
 	return ""
-}
-
-// isTalosConfigTemplate reports whether a bootstrap config template object of a
-// CanUpdateMachineSet request is a TalosConfigTemplate. A machine set bootstrap
-// configuration is not a TalosConfigTemplate, or is bootstrap data instead of a template:
-// that is not an error, it is just a change this extension cannot patch, so the hook
-// answers Success with no patch and Cluster API rolls the MachineSet out.
-func isTalosConfigTemplate(raw runtime.RawExtension) bool {
-	data := raw.Raw
-
-	if data == nil && raw.Object != nil {
-		data, _ = json.Marshal(raw.Object)
-	}
-
-	object := map[string]any{}
-	if err := json.Unmarshal(data, &object); err != nil {
-		return false
-	}
-
-	return object["kind"] == "TalosConfigTemplate"
 }
 
 // templateMachine builds the Machine a MachineSet template describes. CanUpdateMachineSet
@@ -292,81 +229,4 @@ func templateMachine(machineSet clusterv1.MachineSet) clusterv1.Machine {
 		},
 		Spec: machineSet.Spec.Template.Spec,
 	}
-}
-
-// talosConfigTemplateSpec reads the TalosConfigTemplate spec of a bootstrap config template
-// object of a CanUpdateMachineSet request. The Runtime SDK passes the templates as
-// unstructured objects (machinedeployment_canupdatemachineset.go: createRequest,
-// cleanupUnstructured), and the machine configuration of a template is the spec of its
-// template, the same spec a TalosConfig carries.
-func talosConfigTemplateSpec(raw runtime.RawExtension) (cabptv1.TalosConfigSpec, error) {
-	spec, err := templateSpecObject(raw)
-	if err != nil {
-		return cabptv1.TalosConfigSpec{}, err
-	}
-
-	data, err := json.Marshal(spec)
-	if err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.WithStack(err)
-	}
-
-	talosSpec := cabptv1.TalosConfigSpec{}
-	if err := json.Unmarshal(data, &talosSpec); err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.Wrap(err, "decoding the TalosConfigTemplate spec of the machine set")
-	}
-
-	return talosSpec, nil
-}
-
-// templateSpecObject returns the spec.template.spec of a bootstrap config template object.
-func templateSpecObject(raw runtime.RawExtension) (map[string]any, error) {
-	data := raw.Raw
-
-	if data == nil && raw.Object != nil {
-		var err error
-
-		data, err = json.Marshal(raw.Object)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-	}
-
-	if len(data) == 0 {
-		return nil, errors.New("the machine set has no bootstrap configuration template")
-	}
-
-	object := map[string]any{}
-	if err := json.Unmarshal(data, &object); err != nil {
-		return nil, errors.Wrap(err, "decoding the bootstrap configuration template of the machine set")
-	}
-
-	if kind, _ := object["kind"].(string); kind != "TalosConfigTemplate" {
-		return nil, errors.Errorf("the bootstrap configuration template of the machine set is a %q, not a TalosConfigTemplate", kind)
-	}
-
-	unstructuredObject := &unstructured.Unstructured{Object: object}
-
-	spec, found, err := unstructured.NestedMap(unstructuredObject.Object, "spec", "template", "spec")
-	if err != nil || !found {
-		return nil, errors.New("the bootstrap configuration template of the machine set has no spec.template.spec")
-	}
-
-	return spec, nil
-}
-
-// templateSpecPatch computes the JSON patch that turns the current TalosConfigTemplate into
-// the desired one. Only spec.template.spec is patched, as the hook contract requires and as
-// applyPatchesToRequest of the MachineDeployment controller restricts the patch to.
-func templateSpecPatch(current, desired runtime.RawExtension) ([]byte, error) {
-	currentSpec, err := templateSpecObject(current)
-	if err != nil {
-		return nil, err
-	}
-
-	desiredSpec, err := templateSpecObject(desired)
-	if err != nil {
-		return nil, err
-	}
-
-	return objectPatch("/spec/template/spec", currentSpec, desiredSpec)
 }

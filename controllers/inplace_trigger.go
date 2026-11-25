@@ -34,8 +34,8 @@ import (
 //
 // Nothing calls it while the InPlaceUpdates feature gate is off, which is the default.
 func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, controlPlane *ControlPlane, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) error {
-	if overrideTriggerInPlaceUpdate != nil {
-		return overrideTriggerInPlaceUpdate(ctx, machine, machineUpToDateResult)
+	if r.overrideTriggerInPlaceUpdate != nil {
+		return r.overrideTriggerInPlaceUpdate(ctx, machine, machineUpToDateResult)
 	}
 
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", klog.KObj(machine))

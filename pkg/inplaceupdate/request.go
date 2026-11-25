@@ -1,9 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
-// Decoding of the objects a hook request carries: the TalosConfig spec, the
-// infrastructure machine spec and the TalosConfig spec patch the response returns.
+//
+// Decoding of the objects a hook request carries: the machine configuration spec of a
+// TalosConfig or TalosConfigTemplate, the infrastructure machine spec, and the patch the
+// extension returns for a bootstrap configuration object.
 package inplaceupdate
 
 import (
@@ -12,47 +13,119 @@ import (
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// talosConfigSpec reads the TalosConfig spec out of the bootstrap config object of a
-// hook request.
-func talosConfigSpec(raw runtime.RawExtension) (cabptv1.TalosConfigSpec, error) {
+// configObject decodes a bootstrap configuration object of a hook request. The Runtime SDK
+// passes the objects of a request as unstructured objects, either as raw JSON or as a decoded
+// map, so both forms are read here.
+func configObject(raw runtime.RawExtension) (map[string]any, error) {
 	data := raw.Raw
 
 	if data == nil {
 		if raw.Object == nil {
-			return cabptv1.TalosConfigSpec{}, errors.New("the bootstrap configuration of the machine is not a TalosConfig object")
+			return nil, errors.New("the request has no bootstrap configuration object")
 		}
 
 		var err error
 
 		data, err = json.Marshal(raw.Object)
 		if err != nil {
-			return cabptv1.TalosConfigSpec{}, errors.WithStack(err)
+			return nil, errors.WithStack(err)
 		}
 	}
 
-	var object map[string]any
+	if len(data) == 0 {
+		return nil, errors.New("the request has no bootstrap configuration object")
+	}
+
+	object := map[string]any{}
 	if err := json.Unmarshal(data, &object); err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.Wrap(err, "decoding the bootstrap configuration of the machine")
+		return nil, errors.Wrap(err, "decoding the bootstrap configuration object of the request")
 	}
 
-	if kind, _ := object["kind"].(string); kind != "TalosConfig" {
-		return cabptv1.TalosConfigSpec{}, errors.Errorf("the bootstrap configuration of the machine is a %q, not a TalosConfig", kind)
+	return object, nil
+}
+
+// configKind returns the kind of a bootstrap configuration object of a hook request.
+func configKind(raw runtime.RawExtension) string {
+	object, err := configObject(raw)
+	if err != nil {
+		return ""
 	}
 
-	specBytes, err := json.Marshal(object["spec"])
+	kind, _ := object["kind"].(string)
+
+	return kind
+}
+
+// configSpec returns the machine configuration spec of a bootstrap configuration object of a
+// hook request and the JSON path of that spec inside the object: spec of a TalosConfig,
+// spec.template.spec of a TalosConfigTemplate. The machine configuration of a TalosConfig
+// rollout and of a MachineSet rollout is the same TalosConfigSpec.
+func configSpec(raw runtime.RawExtension) (map[string]any, string, error) {
+	object, err := configObject(raw)
+	if err != nil {
+		return nil, "", err
+	}
+
+	switch kind, _ := object["kind"].(string); kind {
+	case "TalosConfig":
+		spec, ok := object["spec"].(map[string]any)
+		if !ok {
+			return nil, "", errors.New("the TalosConfig of the request has no spec")
+		}
+
+		return spec, "/spec", nil
+	case "TalosConfigTemplate":
+		spec, found, err := unstructured.NestedMap(object, "spec", "template", "spec")
+		if err != nil || !found {
+			return nil, "", errors.New("the TalosConfigTemplate of the request has no spec.template.spec")
+		}
+
+		return spec, "/spec/template/spec", nil
+	default:
+		return nil, "", errors.Errorf("the bootstrap configuration of the request is a %q, not a TalosConfig or a TalosConfigTemplate", kind)
+	}
+}
+
+// talosConfigSpec reads the machine configuration spec of a TalosConfig or TalosConfigTemplate
+// object of a hook request as the bootstrap provider's typed spec.
+func talosConfigSpec(raw runtime.RawExtension) (cabptv1.TalosConfigSpec, error) {
+	spec, _, err := configSpec(raw)
+	if err != nil {
+		return cabptv1.TalosConfigSpec{}, err
+	}
+
+	data, err := json.Marshal(spec)
 	if err != nil {
 		return cabptv1.TalosConfigSpec{}, errors.WithStack(err)
 	}
 
-	spec := cabptv1.TalosConfigSpec{}
-	if err := json.Unmarshal(specBytes, &spec); err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.Wrap(err, "decoding the TalosConfig spec of the machine")
+	talosSpec := cabptv1.TalosConfigSpec{}
+	if err := json.Unmarshal(data, &talosSpec); err != nil {
+		return cabptv1.TalosConfigSpec{}, errors.Wrap(err, "decoding the machine configuration spec of the request")
 	}
 
-	return spec, nil
+	return talosSpec, nil
+}
+
+// configPatch computes the JSON patch that turns the current bootstrap configuration object of
+// a request into the desired one. Only the machine configuration spec is patched, as the hook
+// contract requires and as the controllers restrict the patch to.
+func configPatch(current, desired runtime.RawExtension) ([]byte, error) {
+	currentSpec, path, err := configSpec(current)
+	if err != nil {
+		return nil, err
+	}
+
+	desiredSpec, _, err := configSpec(desired)
+	if err != nil {
+		return nil, err
+	}
+
+	return objectPatch(path, currentSpec, desiredSpec)
 }
 
 // infraSpec returns the spec of an infrastructure machine object.
@@ -73,51 +146,6 @@ func infraSpec(raw runtime.RawExtension) any {
 	}
 
 	return object["spec"]
-}
-
-// specPatch computes the JSON patch that turns the current TalosConfig object into
-// the desired one. Only the spec is patched, as the hook contract requires.
-func specPatch(current, desired runtime.RawExtension) ([]byte, error) {
-	currentSpec, err := specObject(current)
-	if err != nil {
-		return nil, err
-	}
-
-	desiredSpec, err := specObject(desired)
-	if err != nil {
-		return nil, err
-	}
-
-	return objectPatch("/spec", currentSpec, desiredSpec)
-}
-
-func specObject(raw runtime.RawExtension) (map[string]any, error) {
-	data := raw.Raw
-
-	if data == nil {
-		if raw.Object == nil {
-			return nil, errors.New("the bootstrap configuration of the machine is not a TalosConfig object")
-		}
-
-		var err error
-
-		data, err = json.Marshal(raw.Object)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-	}
-
-	var object map[string]any
-	if err := json.Unmarshal(data, &object); err != nil {
-		return nil, errors.Wrap(err, "decoding the bootstrap configuration of the machine")
-	}
-
-	spec, ok := object["spec"].(map[string]any)
-	if !ok {
-		return nil, errors.New("the bootstrap configuration of the machine has no spec")
-	}
-
-	return spec, nil
 }
 
 // machineConfigPatches converts the RFC 6902 configPatches of the TalosConfig the request

@@ -139,14 +139,13 @@ spec:
               x-kubernetes-preserve-unknown-fields: true
 `
 
-// Test_inPlaceUpdateEnvtest is the stage's end-to-end scenario against a real API server: an
+// Test_inPlaceUpdateEnvtest exercises the in-place update path against a real API server: an
 // ExtensionConfig stubs the in-place update extension, a TalosConfig-only change annotates the Machine,
 // its InfraMachine and its TalosConfig, marks the UpdateMachine hook pending on the Machine, and deletes
 // no Machine.
 //
 // The real API server is what makes this more than the unit test: it enforces server-side apply
-// ownership, which the InfraMachine and the TalosConfig need before an in-place update can change them
-// (implementation notes 194-227).
+// ownership, which the InfraMachine and the TalosConfig need before an in-place update can change them.
 func Test_inPlaceUpdateEnvtest(t *testing.T) {
 	g := NewWithT(t)
 
@@ -232,15 +231,16 @@ func Test_inPlaceUpdateEnvtest(t *testing.T) {
 	}
 	g.Expect(c.Create(ctx, extensionConfig)).To(Succeed())
 
-	r := &TalosControlPlaneReconciler{Client: c, Scheme: scheme}
-
-	// The discovered extension makes the CanUpdateMachine hook answer yes; the hook call itself is the
-	// next stage, so the override seam stands in for the extension's reply, as in KubeadmControlPlane's
+	// The discovered extension makes the CanUpdateMachine hook answer yes; calling the hook is not part
+	// of this test, so the override seam stands in for the extension's reply, as in KubeadmControlPlane's
 	// tests (inplace_test.go:40-66).
-	overrideCanUpdateMachine = func(_ context.Context, _ *clusterv1.Machine) (bool, error) {
-		return true, nil
+	r := &TalosControlPlaneReconciler{
+		Client: c,
+		Scheme: scheme,
+		overrideCanUpdateMachine: func(_ context.Context, _ *clusterv1.Machine) (bool, error) {
+			return true, nil
+		},
 	}
-	defer func() { overrideCanUpdateMachine = nil }()
 
 	fallbackToScaleDown, err := r.tryInPlaceUpdate(ctx, nil, machine, result)
 	g.Expect(err).ToNot(HaveOccurred())

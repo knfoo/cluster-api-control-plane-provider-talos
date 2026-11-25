@@ -33,8 +33,8 @@ import (
 //
 // Nothing calls this while the InPlaceUpdates feature gate is off, which is the default (ADR-0003).
 func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) (bool, error) {
-	if overrideCanUpdateMachine != nil {
-		return overrideCanUpdateMachine(ctx, machine)
+	if r.overrideCanUpdateMachine != nil {
+		return r.overrideCanUpdateMachine(ctx, machine)
 	}
 
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", klog.KObj(machine))

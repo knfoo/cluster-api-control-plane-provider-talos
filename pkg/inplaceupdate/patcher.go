@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"sigs.k8s.io/yaml"
 
 	evanphx "github.com/evanphx/json-patch/v5"
@@ -245,33 +244,6 @@ func configDiff(current, desired []byte) ([]jsonPatchOp, error) {
 	}
 
 	return ops, nil
-}
-
-// applyConfigPatches applies the RFC 6902 patches of a TalosConfig spec to the raw
-// machine configuration and returns the resulting configuration bytes, through Talos's own
-// configpatcher (github.com/siderolabs/talos/pkg/machinery/config/configpatcher), which
-// rejects a JSON patch on a multi-document machine configuration.
-func applyConfigPatches(data []byte, ops []jsonPatchOp) ([]byte, error) {
-	if len(ops) == 0 {
-		return data, nil
-	}
-
-	patch, err := json.Marshal(ops)
-	if err != nil {
-		return nil, fmt.Errorf("encoding machine configuration patches: %w", err)
-	}
-
-	loaded, err := configpatcher.LoadPatch(patch)
-	if err != nil {
-		return nil, fmt.Errorf("decoding machine configuration patches: %w", err)
-	}
-
-	out, err := configpatcher.Apply(configpatcher.WithBytes(data), []configpatcher.Patch{loaded})
-	if err != nil {
-		return nil, fmt.Errorf("applying machine configuration patches: %w", err)
-	}
-
-	return out.Bytes()
 }
 
 // equalJSON compares two decoded YAML values by their JSON form.

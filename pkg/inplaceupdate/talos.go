@@ -145,8 +145,8 @@ func (a *TalosApplier) Apply(ctx context.Context, endpoint string, config []byte
 // NodeStatus reads the images of the control-plane components from the COSI state of the
 // node. The final- resources are the configurations Talos renders for the running pods, so
 // they are preferred and the plain resources are the fallback, mirroring the watch of the
-// control-plane component configurations in the reference upgrade
-// (config/laps/references/talos-upgrade-k8s-v1.14.5/talos_managed.go, watchControlPlaneConfigResource).
+// control-plane component configurations in talosctl upgrade-k8s
+// (watchControlPlaneConfigResource).
 // A component the node does not report stays empty.
 func (a *TalosApplier) NodeStatus(ctx context.Context, endpoint string) (NodeStatus, error) {
 	if endpoint == "" {

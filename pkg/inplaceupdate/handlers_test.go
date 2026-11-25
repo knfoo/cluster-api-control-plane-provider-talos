@@ -531,9 +531,9 @@ func TestCanUpdateMachineInPlaceKubernetesVersion(t *testing.T) {
 	}
 }
 
-// TestCanUpdateMachineRolloutForNonAdjacentKubernetesVersion checks the fix of the attempt-3
-// review: Talos supports the Kubernetes versions around the one it ships, so a jump of more
-// than one minor version, a patch version and a downgrade are not upgrades in place.
+// TestCanUpdateMachineRolloutForNonAdjacentKubernetesVersion checks that Talos, which
+// supports the Kubernetes versions around the one it ships, rolls out a jump of more than one
+// minor version, a patch version and a downgrade instead of updating them in place.
 func TestCanUpdateMachineRolloutForNonAdjacentKubernetesVersion(t *testing.T) {
 	g := NewWithT(t)
 
@@ -720,19 +720,6 @@ func TestUpdateMachineFailsWhenRebootRequired(t *testing.T) {
 	g.Expect(applier.applyRuns).To(BeZero())
 }
 
-// TestApplyConfigPatches checks the RFC 6902 patches of a TalosConfig.
-func TestApplyConfigPatches(t *testing.T) {
-	g := NewWithT(t)
-
-	patched, err := applyConfigPatches([]byte(baseConfig), []jsonPatchOp{
-		{Op: "replace", Path: "/machine/files/0/content", Value: "patched"},
-		{Op: "add", Path: "/machine/files/1", Value: map[string]any{"path": "/var/inplace/second", "content": "added"}},
-	})
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(string(patched)).To(ContainSubstring("patched"))
-	g.Expect(string(patched)).To(ContainSubstring("/var/inplace/second"))
-}
-
 // TestExtensionRBAC checks that the rules the extension needs are in the generated
 // role.
 func TestExtensionRBAC(t *testing.T) {
@@ -748,7 +735,7 @@ func TestExtensionRBAC(t *testing.T) {
 
 // TestDiscovery checks that the extension announces the three in-place update hooks of the
 // extension: the Machine hooks CanUpdateMachine and UpdateMachine and the MachineDeployment
-// hook CanUpdateMachineSet of stage L5.
+// hook CanUpdateMachineSet.
 func TestDiscovery(t *testing.T) {
 	g := NewWithT(t)
 	handler := NewHandler(newFakeApplier(), logr.Discard(), "", 0)

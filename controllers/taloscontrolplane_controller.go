@@ -101,6 +101,14 @@ type TalosControlPlaneReconciler struct {
 	// classicManager is the field manager of the updates the controller makes without server-side apply, whose
 	// managed fields are handed over when a Machine is adopted for server-side apply.
 	classicManager string
+
+	// Only used for testing, as in KubeadmControlPlane (kubeadmcontrolplane_controller.go:121-127 of
+	// the Cluster API v1.14.4 reference), whose tests set them (inplace_test.go:81,85). They are nil
+	// otherwise, so the production path always runs canUpdateMachine, tryInPlaceUpdate and
+	// triggerInPlaceUpdate.
+	overrideTryInPlaceUpdate     func(ctx context.Context, controlPlane *ControlPlane, machineToInPlaceUpdate *clusterv1.Machine, machineUpToDateResult UpToDateResult) (bool, error)
+	overrideCanUpdateMachine     func(ctx context.Context, machine *clusterv1.Machine) (bool, error)
+	overrideTriggerInPlaceUpdate func(ctx context.Context, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) error
 }
 
 func (r *TalosControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {

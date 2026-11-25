@@ -396,16 +396,6 @@ type UpToDateResult struct {
 	DesiredTalosConfig  *cabptv1.TalosConfig
 }
 
-// Test seams for the in-place update path. KubeadmControlPlane keeps the equivalent fields on its
-// Reconciler (inplace.go:39-41), used by its tests (inplace_test.go:40-66); the reconciler struct of
-// this fork belongs to stage L2, so the seams are package level here. They are nil unless a test sets
-// them, so the production path always runs canUpdateMachine and triggerInPlaceUpdate.
-var (
-	overrideTryInPlaceUpdate     func(ctx context.Context, controlPlane *ControlPlane, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) (bool, error)
-	overrideCanUpdateMachine     func(ctx context.Context, machine *clusterv1.Machine) (bool, error)
-	overrideTriggerInPlaceUpdate func(ctx context.Context, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) error
-)
-
 // tryInPlaceUpdate decides between an in-place update and the scale down that rolls a Machine out,
 // following tryInPlaceUpdate in inplace.go:44-53.
 //
@@ -419,8 +409,8 @@ func (r *TalosControlPlaneReconciler) tryInPlaceUpdate(
 	machineToInPlaceUpdate *clusterv1.Machine,
 	machineUpToDateResult UpToDateResult,
 ) (bool, error) {
-	if overrideTryInPlaceUpdate != nil {
-		return overrideTryInPlaceUpdate(ctx, controlPlane, machineToInPlaceUpdate, machineUpToDateResult)
+	if r.overrideTryInPlaceUpdate != nil {
+		return r.overrideTryInPlaceUpdate(ctx, controlPlane, machineToInPlaceUpdate, machineUpToDateResult)
 	}
 
 	// A Machine cannot be updated in-place when one of the objects the update would write is missing,

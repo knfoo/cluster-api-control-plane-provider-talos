@@ -4,9 +4,8 @@
 
 // The Cluster API Runtime SDK extension that updates Talos machines in place.
 //
-// It answers CanUpdateMachine and UpdateMachine for a single Machine (proposal
-// docs/proposals/in-place-updates.md, section 6 rows L4 and L5) and CanUpdateMachineSet for
-// the worker Machines of a MachineDeployment (pkg/inplaceupdate/machineset.go). The owner's
+// It answers CanUpdateMachine and UpdateMachine for a single Machine and CanUpdateMachineSet
+// for the worker Machines of a MachineDeployment (pkg/inplaceupdate/machineset.go). The
 // condition (docs/adr/ADR-0003, amended 2026-11-15) is that a TalosConfig change is handled
 // in place only when it is a machine configuration change that Talos accepts with
 // ApplyConfiguration mode ApplyConfigurationRequest_NO_REBOOT after a DryRun. A Kubernetes
@@ -29,6 +28,7 @@ import (
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
+	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	"sigs.k8s.io/cluster-api/util/secret"
@@ -121,54 +121,10 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	currentSpec, err := talosConfigSpec(req.Current.BootstrapConfig)
-	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = err.Error()
-
-		return
-	}
-
-	desiredSpec, err := talosConfigSpec(req.Desired.BootstrapConfig)
-	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = err.Error()
-
-		return
-	}
-
-	if currentSpec.TalosVersion != desiredSpec.TalosVersion {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the Talos version changes")
-
-		return
-	}
-
-	// The machine configuration of a TalosConfig is not the spec: it is the generated
-	// or supplied base configuration with the configuration patches and the (template
-	// rendered) strategic patches applied, exactly as the bootstrap provider builds it.
-	// A configuration the extension cannot render - a generated configuration without
-	// access to the cluster secrets, a template whose metadata is not available yet -
-	// is answered with Success and no patch, which leaves current and desired different
-	// and makes Cluster API roll the Machine out; answering with Failure would turn the
-	// call into an error.
 	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
 	defer cancel()
 
-	currentConfig, _, err := h.renderMachineConfig(ctx, currentSpec, req.Current.Machine)
-	if err != nil {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", err.Error())
-
-		return
-	}
-
-	desiredConfig, _, err := h.renderMachineConfig(ctx, desiredSpec, req.Desired.Machine)
-	if err != nil {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", err.Error())
-
-		return
-	}
-
-	ops, err := configDiff(currentConfig, desiredConfig)
+	plan, err := h.planInPlaceUpdate(ctx, req.Current.BootstrapConfig, req.Desired.BootstrapConfig, req.Current.Machine, req.Desired.Machine)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -176,8 +132,8 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	if reason := rebootRequiredReason(ops); reason != "" {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", reason)
+	if plan.reason != "" {
+		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", plan.reason)
 
 		return
 	}
@@ -196,11 +152,9 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 	// and the machine configuration the node has to accept is the rendered desired
 	// configuration with the control-plane component images patched step by step, so the
 	// DryRun below covers both changes.
-	versionUpgrade := req.Current.Machine.Spec.Version != req.Desired.Machine.Spec.Version
+	config := plan.config
 
-	config := desiredConfig
-
-	if versionUpgrade {
+	if plan.versionChange {
 		nodeStatus, err := h.applier.NodeStatus(ctx, endpoint)
 		if err != nil {
 			resp.Status = runtimehooksv1.ResponseStatusFailure
@@ -222,7 +176,7 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 			return
 		}
 
-		config, err = stagedKubernetesConfig(desiredConfig, nodeStatus, req.Desired.Machine.Spec.Version)
+		config, err = stagedKubernetesConfig(config, nodeStatus, req.Desired.Machine.Spec.Version)
 		if err != nil {
 			resp.Status = runtimehooksv1.ResponseStatusFailure
 			resp.Message = err.Error()
@@ -231,15 +185,9 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		}
 	}
 
-	if len(ops) == 0 && !versionUpgrade {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "the machine configuration does not change")
-
-		return
-	}
-
 	// The owner's condition: only a change the node accepts with mode
 	// ApplyConfigurationRequest_NO_REBOOT and DryRun is handled in place.
-	status, err := h.applier.DryRun(ctx, endpoint, config)
+	reason, err := h.dryRunReason(ctx, endpoint, config)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -247,13 +195,13 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	if status.RebootRequired {
-		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", "Talos needs a reboot to apply the machine configuration", "details", status.Details)
+	if reason != "" {
+		h.log.Info("machine cannot be updated in place", "machine", machine, "reason", reason)
 
 		return
 	}
 
-	if versionUpgrade {
+	if plan.versionChange {
 		machinePatch, err := jsonPatch([]jsonPatchOp{{Op: "replace", Path: "/spec/version", Value: req.Desired.Machine.Spec.Version}})
 		if err != nil {
 			resp.Status = runtimehooksv1.ResponseStatusFailure
@@ -270,8 +218,8 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		h.log.Info("machine Kubernetes version can be updated in place", "machine", machine, "endpoint", endpoint, "version", req.Desired.Machine.Spec.Version)
 	}
 
-	if len(ops) > 0 {
-		patch, err := specPatch(req.Current.BootstrapConfig, req.Desired.BootstrapConfig)
+	if len(plan.ops) > 0 {
+		patch, err := configPatch(req.Current.BootstrapConfig, req.Desired.BootstrapConfig)
 		if err != nil {
 			resp.Status = runtimehooksv1.ResponseStatusFailure
 			resp.Message = err.Error()
@@ -285,7 +233,7 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		}
 	}
 
-	h.log.Info("machine can be updated in place", "machine", machine, "endpoint", endpoint, "operations", len(ops))
+	h.log.Info("machine can be updated in place", "machine", machine, "endpoint", endpoint, "operations", len(plan.ops))
 }
 
 // UpdateMachine is the UpdateMachine hook. It applies the machine configuration with
@@ -357,7 +305,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 	// component talosctl upgrade-k8s patches on a node without control-plane components
 	// (upgradeKubeletOnNode). A node that runs no
 	// Kubernetes component yet - a machine whose bootstrap has not started - gets the plain
-	// machine configuration apply of stage L4b.
+	// machine configuration apply.
 	target := req.Desired.Machine.Spec.Version
 	staged := target != "" && nodeStatus.hasKubernetes()
 
@@ -640,6 +588,104 @@ func rebootRequiredReason(ops []jsonPatchOp) string {
 	return ""
 }
 
+// inPlacePlan is what the pipeline the two CanUpdate hooks share computes for a request.
+type inPlacePlan struct {
+	// ops is the machine configuration diff between the current and the desired object.
+	ops []jsonPatchOp
+
+	// config is the rendered desired machine configuration the node has to accept.
+	config []byte
+
+	// reason is why the Machine or MachineSet has to roll out; "" means a node can apply
+	// the change in place.
+	reason string
+
+	// versionChange is true when the Kubernetes version of the Machine or MachineSet
+	// changes, which the hook patches on the Machine resp. the MachineSet template.
+	versionChange bool
+}
+
+// planInPlaceUpdate is the pipeline both CanUpdate hooks share: decode the machine
+// configuration spec of the current and the desired bootstrap configuration object of the
+// request, render the machine configuration the way the bootstrap provider builds it, diff
+// it and run the cheap reboot guard. The Kubernetes version of the rollout is read from the
+// Machine spec handed in: CanUpdateMachine passes the Machines of the request, CanUpdateMachineSet
+// the Machine its template describes (templateMachine), whose spec carries the template's version.
+//
+// The machine configuration of a TalosConfig and of a TalosConfigTemplate is not the spec:
+// it is the generated or supplied base configuration with the configuration patches and the
+// (template rendered) strategic patches applied, exactly as the bootstrap provider builds
+// it. A configuration the extension cannot render - a generated configuration without access
+// to the cluster secrets, a template whose metadata is not available yet - is answered with
+// Success and no patch, which leaves current and desired different and makes Cluster API
+// roll the Machine resp. the MachineSet out; answering with Failure would turn the call into
+// an error.
+func (h *Handler) planInPlaceUpdate(
+	ctx context.Context,
+	current, desired runtime.RawExtension,
+	currentMachine, desiredMachine clusterv1.Machine,
+) (inPlacePlan, error) {
+	currentVersion, desiredVersion := currentMachine.Spec.Version, desiredMachine.Spec.Version
+
+	currentSpec, err := talosConfigSpec(current)
+	if err != nil {
+		return inPlacePlan{}, err
+	}
+
+	desiredSpec, err := talosConfigSpec(desired)
+	if err != nil {
+		return inPlacePlan{}, err
+	}
+
+	if currentSpec.TalosVersion != desiredSpec.TalosVersion {
+		return inPlacePlan{reason: "the Talos version changes"}, nil
+	}
+
+	currentConfig, _, err := h.renderMachineConfig(ctx, currentSpec, currentMachine)
+	if err != nil {
+		return inPlacePlan{reason: err.Error()}, nil
+	}
+
+	desiredConfig, _, err := h.renderMachineConfig(ctx, desiredSpec, desiredMachine)
+	if err != nil {
+		return inPlacePlan{reason: err.Error()}, nil
+	}
+
+	ops, err := configDiff(currentConfig, desiredConfig)
+	if err != nil {
+		return inPlacePlan{}, err
+	}
+
+	if reason := rebootRequiredReason(ops); reason != "" {
+		return inPlacePlan{reason: reason}, nil
+	}
+
+	if len(ops) == 0 && currentVersion == desiredVersion {
+		return inPlacePlan{reason: "the machine configuration does not change"}, nil
+	}
+
+	return inPlacePlan{ops: ops, config: desiredConfig, versionChange: currentVersion != desiredVersion}, nil
+}
+
+// dryRunReason is the owner's condition of docs/adr/ADR-0003: a machine configuration change
+// is handled in place only when a node accepts it with mode
+// ApplyConfigurationRequest_NO_REBOOT after a DryRun. It asks the node at endpoint about
+// config and returns why the change has to roll out, or "" when the node accepts it. An error
+// is a failure of the DryRun call itself, which the caller turns into a hook failure or a
+// rollout reason.
+func (h *Handler) dryRunReason(ctx context.Context, endpoint string, config []byte) (string, error) {
+	status, err := h.applier.DryRun(ctx, endpoint, config)
+	if err != nil {
+		return "", err
+	}
+
+	if status.RebootRequired {
+		return fmt.Sprintf("Talos needs a reboot to apply the machine configuration at %q: %s", endpoint, status.Details), nil
+	}
+
+	return "", nil
+}
+
 // resolveEndpoint returns the Talos API address of a machine. Cluster API copies the
 // addresses of the infrastructure machine into the Machine status
 // (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses), but a hook request
@@ -672,7 +718,7 @@ func (h *Handler) resolveEndpoint(settings map[string]string, machine clusterv1.
 
 // machineAddress returns the first address the infrastructure provider reported for a
 // machine. Only a reader that implements MachineAddressReader can answer; without one the
-// extension falls back to the settings, exactly as before stage L5.
+// extension falls back to the settings.
 func (h *Handler) machineAddress(machine clusterv1.Machine) (string, error) {
 	reader, ok := h.metadata.(MachineAddressReader)
 	if !ok {
@@ -727,7 +773,7 @@ func pickMachineAddress(addresses []clusterv1.MachineAddress) string {
 //
 // Follows the bootstrap provider's reconcileGenerate
 // (controllers/talosconfig_controller.go:478-640), which calls the same
-// pkg/machineconfig.Generate and pkg/machineconfig.ApplyPatches (stage T4b), reached
+// pkg/machineconfig.Generate and pkg/machineconfig.ApplyPatches, reached
 // through the go.mod replace.
 func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) ([]byte, bool, error) {
 	base, standardPatches, err := h.machineConfigBase(ctx, spec, machine)

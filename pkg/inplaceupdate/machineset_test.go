@@ -112,7 +112,7 @@ func unmarshalPatch(patch []byte) []jsonPatchOp {
 	return ops
 }
 
-// TestCanUpdateMachineSetInPlaceForTemplateChange checks the e2e case of the stage: a new
+// TestCanUpdateMachineSetInPlaceForTemplateChange checks the end-to-end case: a new
 // TalosConfigTemplate whose machine configuration differs in a way Talos applies without a
 // reboot is answered with the patch of spec.template.spec, so the MachineSet is not rolled
 // out and the same Machines are kept.
@@ -387,7 +387,7 @@ func TestCanUpdateMachineWorkerMachineConfigChange(t *testing.T) {
 // Machine is changed in place, and the configuration applied to the node patches the kubelet
 // only - the components of a control plane are not touched, as talosctl upgrade-k8s does for
 // a node without control-plane components
-// (.lap/sources/reference/files/kubelet.go: upgradeKubeletOnNode).
+// (talosctl upgrade-k8s: upgradeKubeletOnNode).
 func TestUpdateMachineWorkerKubernetesVersionUpgradesKubeletOnly(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
