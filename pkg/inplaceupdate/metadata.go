@@ -2,15 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Read access to the management cluster objects the extension needs to render a
-// machine configuration the way the bootstrap provider does: the Cluster of the
+// Read access to the management cluster objects the in-place update hooks need: the
+// addresses the infrastructure provider reported for a Machine, the Cluster of the
 // machine, the Talos secrets bundle CABPT generates a configuration from, and the
 // infrastructure metadata secrets a TalosConfig's metadataFrom points at.
 //
-// The extension ships dark and the reader is optional: without one the extension
-// still renders TalosConfigs that carry their machine configuration in spec.data,
-// and it answers "no patch" for generated or metadata-driven configurations, which
-// makes Cluster API roll the machine out instead of guessing a configuration.
+// The reader is always built from the manager's client, because the hooks are served by
+// the CACPPT manager itself: a hook request carries only the spec of the objects, so the
+// Machine addresses and the cluster's talosconfig are read here. The rules are the ones
+// config/rbac/role.yaml already grants the manager.
 package inplaceupdate
 
 import (
@@ -35,9 +35,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// MetadataReader reads the objects the extension needs to render a machine
-// configuration. Secret returns nil data when the secret does not exist, which is
-// the normal transient state of a Metal3/CAPM3 metadata secret that the
+// MetadataReader reads the objects the hooks need to render a machine configuration and to
+// reach the node it is applied to. Secret returns nil data when the secret does not exist,
+// which is the normal transient state of a Metal3/CAPM3 metadata secret that the
 // infrastructure provider has not created yet.
 type MetadataReader interface {
 	// Cluster returns the Cluster object of a machine.
@@ -45,43 +45,37 @@ type MetadataReader interface {
 
 	// Secret returns the data of a secret, or nil when the secret does not exist.
 	Secret(ctx context.Context, namespace, name string) (map[string][]byte, error)
-}
 
-// MachineAddressReader reads the addresses a machine's infrastructure provider reported.
-// Cluster API copies them into the status of the Machine
-// (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses: "This field is copied
-// from the infrastructure provider reference"), and a hook request carries only the spec of
-// the objects, so this is how the extension reaches a node through the management cluster.
-// It is an optional capability of a MetadataReader: a reader without it leaves the endpoint
-// resolution of the settings, the --endpoint flag and the ProviderID in place.
-type MachineAddressReader interface {
-	// MachineAddresses returns the addresses of a machine in the order Cluster API
-	// reports them in Machine status.addresses, or nil when the Machine does not exist
-	// yet or has no addresses. Machine status.addresses is a list of MachineAddress
-	// objects (type and address), not a list of strings.
+	// MachineAddresses returns the addresses of a machine in the order Cluster API reports
+	// them in Machine status.addresses, or nil when the Machine does not exist yet or has no
+	// addresses. Machine status.addresses is a list of MachineAddress objects (type and
+	// address), not a list of strings. Cluster API copies them from the infrastructure
+	// provider reference (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses)
+	// and a hook request carries only the spec of the objects ("Only spec is provided, status
+	// fields are not included", docs/book/src/tasks/experimental-features/runtime-sdk/
+	// implement-in-place-update-hooks.md), so this is how a hook reaches a node.
 	MachineAddresses(ctx context.Context, namespace, name string) ([]clusterv1.MachineAddress, error)
 }
 
 // ControlPlaneMachineReader lists the control-plane Machines of a cluster. It is an
-// optional capability of a MetadataReader, like MachineAddressReader: the bootstrap
-// provider's control-plane controller labels every control-plane Machine with the cluster
-// name and the control-plane label (controllers/taloscontrolplane_controller.go:669-670),
-// so the extension can find the peers of the machine it is updating and wait for the whole
-// control plane to reach the target Kubernetes version before syncing the bootstrap
-// manifests to the workload cluster.
+// optional capability of a MetadataReader: the bootstrap provider's control-plane controller
+// labels every control-plane Machine with the cluster name and the control-plane label
+// (controllers/taloscontrolplane_controller.go:669-670), so the hook can find the peers of
+// the machine it is updating and wait for the whole control plane to reach the target
+// Kubernetes version before syncing the bootstrap manifests to the workload cluster.
 type ControlPlaneMachineReader interface {
 	// ControlPlaneMachines returns the Machines of the cluster's control plane.
 	ControlPlaneMachines(ctx context.Context, namespace, clusterName string) ([]clusterv1.Machine, error)
 }
 
 // MachineSetMachineReader lists the Machines Cluster API currently assigns to a machine
-// set. It is an optional capability of a MetadataReader, like MachineAddressReader and
-// ControlPlaneMachineReader: the CanUpdateMachineSet request carries no Machine objects
-// ("Only spec is provided, status fields are not included", docs/book/src/tasks/
-// experimental-features/runtime-sdk/implement-in-place-update-hooks.md), so the hook has
-// to read the management cluster to find a live Machine of the machine set it can DryRun
-// the machine configuration against. Cluster API labels every Machine of a machine set
-// with the name of the set (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineSetNameLabel).
+// set. It is an optional capability of a MetadataReader, like ControlPlaneMachineReader: the
+// CanUpdateMachineSet request carries no Machine objects ("Only spec is provided, status
+// fields are not included", docs/book/src/tasks/experimental-features/runtime-sdk/
+// implement-in-place-update-hooks.md), so the hook has to read the management cluster to
+// find a live Machine of the machine set it can DryRun the machine configuration against.
+// Cluster API labels every Machine of a machine set with the name of the set
+// (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineSetNameLabel).
 type MachineSetMachineReader interface {
 	// MachineSetMachines returns the Machines of the machine set, or an empty list when the
 	// machine set has no Machines yet.
@@ -288,8 +282,8 @@ func secretsBundleSecretName(clusterName string) string {
 // machineConfigBase returns the base machine configuration of a TalosConfig and the
 // standard patches the bootstrap provider adds to a generated one. A TalosConfig that
 // supplies its own data starts from that data; a generateType TalosConfig is generated by
-// the bootstrap provider's pkg/machineconfig.Generate, which the extension reaches through
-// the go.mod replace. The extension resolves only the inputs (the Cluster, the cluster's
+// the bootstrap provider's pkg/machineconfig.Generate, which the hooks reach through
+// the go.mod replace. The hooks resolve only the inputs (the Cluster, the cluster's
 // Talos secrets bundle, the Kubernetes version and the hostname source) and hands them to
 // Generate.
 //
@@ -304,10 +298,6 @@ func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1.TalosConfi
 
 	if _, err := talosmachine.ParseType(spec.GenerateType); err != nil {
 		return "", nil, errors.Errorf("the TalosConfig has no machine configuration data and generate type %q is not a Talos machine type", spec.GenerateType)
-	}
-
-	if h.metadata == nil {
-		return "", nil, errors.New("the TalosConfig is generated with generateType and the extension cannot generate its machine configuration: start the extension with --kubeconfig so it can read the cluster's Talos secrets")
 	}
 
 	cluster, err := h.metadata.Cluster(ctx, machine.Namespace, machine.Spec.ClusterName)
@@ -351,7 +341,7 @@ func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1.TalosConfi
 }
 
 // clusterSecretsBundle reads the Talos secrets bundle the bootstrap provider generated for
-// the cluster. The extension never creates a bundle: without one the machine configuration
+// the cluster. The hooks never create a bundle: without one the machine configuration
 // cannot be rendered and the machine is rolled out instead.
 // Ported from the read branch of the bootstrap provider's getSecretsBundle
 // (controllers/secrets.go:83-104).
@@ -413,10 +403,6 @@ func (h *Handler) templateContext(ctx context.Context, spec cabptv1.TalosConfigS
 	metadata := map[string]string{}
 
 	if hasMetadata {
-		if h.metadata == nil {
-			return nil, false, errors.New("the TalosConfig reads metadataFrom, but the extension was started without --kubeconfig and cannot read the metadata secret")
-		}
-
 		name, key, err := metadataSecret(spec, machine)
 		if err != nil {
 			return nil, false, err
@@ -431,7 +417,7 @@ func (h *Handler) templateContext(ctx context.Context, spec cabptv1.TalosConfigS
 			// The metadata claim is created after the bootstrap data, so the secret is
 			// transiently absent. The bootstrap provider writes the configuration without
 			// the rendered patches in that case (two-phase bootstrap, phase 1) and skips the
-			// patches that still contain template expressions; the extension renders the
+			// patches that still contain template expressions; the hooks render the
 			// same configuration.
 			return nil, true, nil
 		}

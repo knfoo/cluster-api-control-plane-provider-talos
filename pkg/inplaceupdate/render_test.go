@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 	"github.com/siderolabs/talos/pkg/machinery/config"
@@ -30,9 +29,10 @@ import (
 // bootstrap provider generated for that cluster, and the metadata secrets a metadataFrom
 // TalosConfig points at.
 type fakeMetadata struct {
-	cluster    *clusterv1.Cluster
-	secrets    map[string]map[string][]byte
-	clusterErr error
+	cluster          *clusterv1.Cluster
+	secrets          map[string]map[string][]byte
+	machineAddresses map[string][]clusterv1.MachineAddress
+	clusterErr       error
 }
 
 func (f *fakeMetadata) Cluster(_ context.Context, _, name string) (*clusterv1.Cluster, error) {
@@ -49,6 +49,10 @@ func (f *fakeMetadata) Cluster(_ context.Context, _, name string) (*clusterv1.Cl
 
 func (f *fakeMetadata) Secret(_ context.Context, _, name string) (map[string][]byte, error) {
 	return f.secrets[name], nil
+}
+
+func (f *fakeMetadata) MachineAddresses(_ context.Context, _, name string) ([]clusterv1.MachineAddress, error) {
+	return f.machineAddresses[name], nil
 }
 
 // clusterMetadata builds the cluster and the Talos secrets bundle a generated machine
@@ -77,8 +81,15 @@ func clusterMetadata() *fakeMetadata {
 				},
 			},
 		},
+		machineAddresses: map[string][]clusterv1.MachineAddress{
+			"control-plane-1": {{Type: clusterv1.MachineInternalIP, Address: "10.0.0.1"}},
+			"control-plane-2": {{Type: clusterv1.MachineInternalIP, Address: "10.0.0.2"}},
+			"worker-1":        {{Type: clusterv1.MachineInternalIP, Address: "10.0.0.2"}},
+			"worker-2":        {{Type: clusterv1.MachineInternalIP, Address: "10.0.0.1"}},
+		},
 		secrets: map[string]map[string][]byte{
-			"test-cluster-talos": {"bundle": bundleYAML},
+			"test-cluster-talos":                   {"bundle": bundleYAML},
+			"test-cluster" + talosConfigSecretName: {"talosconfig": fakeTalosConfig("test-cluster", "10.0.0.1")},
 		},
 	}
 }
@@ -109,29 +120,29 @@ const hostnamePatch = "machine:\n  network:\n    hostname: {{ get \"hostname\" }
 func TestCanUpdateMachineRendersGeneratedConfig(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
+	handler := fakeHandler(applier, clusterMetadata())
 
 	config := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-1"})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(config, config, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(config, config, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
 }
 
 // TestCanUpdateMachineRolloutWithoutClusterAccess checks that a generated TalosConfig is
-// answered with Success and no patch when the extension was started without a kubeconfig:
-// it cannot generate the machine configuration, so Cluster API rolls the Machine out
-// instead of the hook call turning into an error.
+// answered with Success and no patch when the manager's metadata reader cannot find the
+// cluster: it cannot generate the machine configuration, so Cluster API rolls the Machine
+// out instead of the hook call turning into an error.
 func TestCanUpdateMachineRolloutWithoutClusterAccess(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := fakeHandler(applier, &fakeMetadata{})
 
 	config := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-1"})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(config, config, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(config, config, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
 }
@@ -143,7 +154,7 @@ func TestCanUpdateMachineRendersMetadata(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
 	metadata := clusterMetadata().withMetadata("infra-machine-metadata", "hostname: control-plane-1\nrole: controlplane\n")
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, metadata)
+	handler := fakeHandler(applier, metadata)
 
 	patch := "machine:\n  network:\n    hostname: {{ get \"hostname\" }}-{{ get \"role\" }}\n"
 
@@ -162,7 +173,7 @@ func TestCanUpdateMachineRendersMetadata(t *testing.T) {
 	})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
@@ -176,7 +187,7 @@ func TestCanUpdateMachineRendersMetadata(t *testing.T) {
 func TestCanUpdateMachineRolloutForMetadataNotYetAvailable(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
+	handler := fakeHandler(applier, clusterMetadata())
 
 	config := talosConfigRaw("talosconfig-1", map[string]any{
 		"talosVersion":     "v1.14.0",
@@ -186,7 +197,7 @@ func TestCanUpdateMachineRolloutForMetadataNotYetAvailable(t *testing.T) {
 	})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(config, config, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(config, config, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
 }
@@ -198,7 +209,7 @@ func TestCanUpdateMachineRolloutForMetadataNotYetAvailable(t *testing.T) {
 func TestCanUpdateMachineRendersStrategicPatchesOnData(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := fakeHandler(applier, clusterMetadata())
 
 	desired := talosConfigRaw("talosconfig-1", map[string]any{
 		"talosVersion":     "v1.14.0",
@@ -207,7 +218,7 @@ func TestCanUpdateMachineRendersStrategicPatchesOnData(t *testing.T) {
 	})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(talosConfig("talosconfig-1", baseConfig), desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(talosConfig("talosconfig-1", baseConfig), desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
@@ -220,7 +231,7 @@ func TestCanUpdateMachineRendersStrategicPatchesOnData(t *testing.T) {
 func TestCanUpdateMachineRolloutForTemplateError(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
+	handler := fakeHandler(applier, clusterMetadata())
 
 	current := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-1"})
 	desired := generatedConfig([]string{`machine:
@@ -228,7 +239,7 @@ func TestCanUpdateMachineRolloutForTemplateError(t *testing.T) {
     hostname: {{ get "hostname" `}, map[string]string{"hostname": "control-plane-2"})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
 }
@@ -242,7 +253,7 @@ func TestCanUpdateMachineGeneratedConfigWinsOverData(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
 	metadata := clusterMetadata()
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, metadata)
+	handler := fakeHandler(applier, metadata)
 
 	current := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-1"})
 
@@ -255,7 +266,7 @@ func TestCanUpdateMachineGeneratedConfigWinsOverData(t *testing.T) {
 	})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
 
 	expectNoInPlaceUpdate(g, resp, applier)
 }
@@ -266,14 +277,11 @@ func TestCanUpdateMachineGeneratedConfigWinsOverData(t *testing.T) {
 func TestUpdateMachineIdempotentGeneratedConfig(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
-	// This test is about rendering a generated machine configuration. The bootstrap manifest
-	// sync talks to the workload cluster with its kubeconfig, which clusterMetadata does not
-	// provide; the sync itself is covered in manifestsync_test.go.
-	handler.manifestSyncer = nil
+	handler := fakeHandler(applier, clusterMetadata())
+	// fakeHandler leaves the manifest syncer nil, so this test only exercises rendering and
+	// the fake node; the manifest sync itself is covered in manifestsync_test.go.
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-1", "v1.33.1"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -282,7 +290,7 @@ func TestUpdateMachineIdempotentGeneratedConfig(t *testing.T) {
 	}
 
 	first := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, first)
+	handler.UpdateMachine(context.Background(), request, first)
 
 	g.Expect(first.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(first.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)))
@@ -290,7 +298,7 @@ func TestUpdateMachineIdempotentGeneratedConfig(t *testing.T) {
 	g.Expect(applier.applied["10.0.0.1"]).To(ContainSubstring("control-plane-1"))
 
 	second := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, second)
+	handler.UpdateMachine(context.Background(), request, second)
 
 	g.Expect(second.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(second.RetryAfterSeconds).To(BeZero())

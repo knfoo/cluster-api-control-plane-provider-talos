@@ -7,13 +7,13 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"net/netip"
 	"reflect"
 	"strings"
 
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	controlplanev1 "github.com/siderolabs/cluster-api-control-plane-provider-talos/api/v1beta1"
+	"github.com/siderolabs/cluster-api-control-plane-provider-talos/pkg/inplaceupdate"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	talosconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	corev1 "k8s.io/api/core/v1"
@@ -24,28 +24,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// talosEndpoint returns the address to use as a Talos API endpoint, and false if the address can't be one.
-//
-// Link-local addresses are skipped: they are only reachable on the link of the node, and an IPv6 link-local address
-// carries a zone (e.g. "fe80::1%eth0") that is not valid in the gRPC target the Talos client builds from its
-// endpoints, so a single one of them breaks the client for every endpoint. Infrastructure providers such as Metal3
-// report them in the Machine addresses. Addresses that are not IPs (host names) are kept as they are.
-func talosEndpoint(address string) (string, bool) {
-	if address == "" {
-		return "", false
-	}
-
-	ip, err := netip.ParseAddr(address)
-	if err != nil {
-		return address, true
-	}
-
-	if ip.IsLinkLocalUnicast() {
-		return "", false
-	}
-
-	return ip.WithZone("").String(), true
-}
+// talosEndpoint is implemented in pkg/inplaceupdate as TalosEndpoint, so the in-place update
+// hooks and the controllers reach a node's Talos API with the same rule.
+var talosEndpoint = inplaceupdate.TalosEndpoint
 
 // talosEndpoints converts the addresses with talosEndpoint, and also returns the non-empty addresses it skipped.
 func talosEndpoints(addresses []string) (endpoints, skipped []string) {

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -36,9 +35,9 @@ func (s *recordingSyncer) SyncManifests(_ context.Context, kubeconfig []byte, ob
 	return s.err
 }
 
-// syncReader is a MetadataReader with the optional MachineAddressReader and
-// ControlPlaneMachineReader capabilities, so a test can hand the handler the control
-// plane of a cluster and the kubeconfig secret Cluster API stores for it.
+// syncReader is a MetadataReader with the ControlPlaneMachineReader capability and the
+// Machine status addresses the manager hooks need, so a test can hand the handler the
+// control plane of a cluster and the kubeconfig secret Cluster API stores for it.
 type syncReader struct {
 	machines   []clusterv1.Machine
 	addresses  map[string][]clusterv1.MachineAddress
@@ -50,6 +49,12 @@ func (r *syncReader) Cluster(_ context.Context, _, _ string) (*clusterv1.Cluster
 }
 
 func (r *syncReader) Secret(_ context.Context, _, name string) (map[string][]byte, error) {
+	if name == "test-cluster"+talosConfigSecretName {
+		return map[string][]byte{
+			talosConfigSecretKey: fakeTalosConfig("test-cluster", "10.0.0.1"),
+		}, nil
+	}
+
 	if name != "test-cluster-kubeconfig" {
 		return nil, nil
 	}
@@ -58,7 +63,11 @@ func (r *syncReader) Secret(_ context.Context, _, name string) (map[string][]byt
 }
 
 func (r *syncReader) MachineAddresses(_ context.Context, _, name string) ([]clusterv1.MachineAddress, error) {
-	return r.addresses[name], nil
+	if addresses, ok := r.addresses[name]; ok {
+		return addresses, nil
+	}
+
+	return []clusterv1.MachineAddress{{Type: clusterv1.MachineInternalIP, Address: "10.0.0.1"}}, nil
 }
 
 func (r *syncReader) ControlPlaneMachines(_ context.Context, _, _ string) ([]clusterv1.Machine, error) {
@@ -93,17 +102,16 @@ func TestUpdateMachineSyncsBootstrapManifestsOnceControlPlaneIsAtTarget(t *testi
 		kubeconfig: []byte("kubeconfig-of-test-cluster"),
 	}
 
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	handler := fakeHandler(applier, reader)
 	handler.manifestSyncer = syncer
 
 	// Cluster API runs CanUpdateMachine before the first UpdateMachine request.
-	handler.CanUpdateMachine(
+	handler.CanUpdateMachine(context.Background(),
 		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"),
 		&runtimehooksv1.CanUpdateMachineResponse{},
 	)
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-1", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -113,7 +121,7 @@ func TestUpdateMachineSyncsBootstrapManifestsOnceControlPlaneIsAtTarget(t *testi
 
 	for range kubernetesComponents {
 		resp := &runtimehooksv1.UpdateMachineResponse{}
-		handler.UpdateMachine(request, resp)
+		handler.UpdateMachine(context.Background(), request, resp)
 
 		g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 		g.Expect(resp.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)))
@@ -125,7 +133,7 @@ func TestUpdateMachineSyncsBootstrapManifestsOnceControlPlaneIsAtTarget(t *testi
 	// still runs the old one: this Machine's update is complete and the sync waits for
 	// the peer, which the trigger has not rolled out yet.
 	lagging := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, lagging)
+	handler.UpdateMachine(context.Background(), request, lagging)
 
 	g.Expect(lagging.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(lagging.RetryAfterSeconds).To(BeZero())
@@ -136,9 +144,8 @@ func TestUpdateMachineSyncsBootstrapManifestsOnceControlPlaneIsAtTarget(t *testi
 	peer := newFakeApplier()
 	peer.node = controlPlaneNode()
 
-	peerHandler := NewHandlerWithMetadata(peer, logr.Discard(), "", 0, reader)
+	peerHandler := fakeHandler(peer, reader)
 	peerRequest := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.2"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-2", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -147,13 +154,13 @@ func TestUpdateMachineSyncsBootstrapManifestsOnceControlPlaneIsAtTarget(t *testi
 	}
 
 	for range kubernetesComponents {
-		peerHandler.UpdateMachine(peerRequest, &runtimehooksv1.UpdateMachineResponse{})
+		peerHandler.UpdateMachine(context.Background(), peerRequest, &runtimehooksv1.UpdateMachineResponse{})
 	}
 
 	applier.nodes["10.0.0.2"] = peer.node
 
 	done := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, done)
+	handler.UpdateMachine(context.Background(), request, done)
 
 	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(done.RetryAfterSeconds).To(BeZero())
@@ -169,7 +176,7 @@ func TestUpdateMachineSyncsBootstrapManifestsOnceControlPlaneIsAtTarget(t *testi
 	// The sync already ran for this cluster and version: a further hook call completes
 	// without syncing again.
 	again := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, again)
+	handler.UpdateMachine(context.Background(), request, again)
 
 	g.Expect(again.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(again.RetryAfterSeconds).To(BeZero())
@@ -194,16 +201,15 @@ func TestUpdateMachineKeepsTheUpdateInProgressWhileManifestsReconcile(t *testing
 		kubeconfig: []byte("kubeconfig-of-test-cluster"),
 	}
 
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	handler := fakeHandler(applier, reader)
 	handler.manifestSyncer = syncer
 
-	handler.CanUpdateMachine(
+	handler.CanUpdateMachine(context.Background(),
 		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"),
 		&runtimehooksv1.CanUpdateMachineResponse{},
 	)
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-1", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -212,11 +218,11 @@ func TestUpdateMachineKeepsTheUpdateInProgressWhileManifestsReconcile(t *testing
 	}
 
 	for range kubernetesComponents {
-		handler.UpdateMachine(request, &runtimehooksv1.UpdateMachineResponse{})
+		handler.UpdateMachine(context.Background(), request, &runtimehooksv1.UpdateMachineResponse{})
 	}
 
 	inProgress := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, inProgress)
+	handler.UpdateMachine(context.Background(), request, inProgress)
 
 	g.Expect(inProgress.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(inProgress.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)))
@@ -226,7 +232,7 @@ func TestUpdateMachineKeepsTheUpdateInProgressWhileManifestsReconcile(t *testing
 	syncer.err = nil
 
 	done := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, done)
+	handler.UpdateMachine(context.Background(), request, done)
 
 	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(done.RetryAfterSeconds).To(BeZero())
@@ -254,7 +260,6 @@ func TestUpdateMachineSyncsBootstrapManifestsAfterARestart(t *testing.T) {
 	}
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-1", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -267,29 +272,29 @@ func TestUpdateMachineSyncsBootstrapManifestsAfterARestart(t *testing.T) {
 	applier.node = controlPlaneNode()
 	applier.nodes = map[string]NodeStatus{"10.0.0.2": controlPlaneNode()}
 
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	handler := fakeHandler(applier, reader)
 	handler.manifestSyncer = syncer
 
-	handler.CanUpdateMachine(
+	handler.CanUpdateMachine(context.Background(),
 		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"),
 		&runtimehooksv1.CanUpdateMachineResponse{},
 	)
 
 	for range kubernetesComponents {
-		handler.UpdateMachine(request, &runtimehooksv1.UpdateMachineResponse{})
+		handler.UpdateMachine(context.Background(), request, &runtimehooksv1.UpdateMachineResponse{})
 	}
 
 	g.Expect(componentsAtTarget(applier.node, "v1.34.0")).To(BeTrue())
 
 	// The extension restarts: this handler knows neither the CanUpdateMachine call nor any
 	// earlier UpdateMachine call.
-	restarted := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	restarted := fakeHandler(applier, reader)
 	restarted.manifestSyncer = syncer
 
 	// The peer still runs the old Kubernetes version, so this Machine completes without
 	// syncing: the sync belongs to the Machine whose peers are already at the target.
 	lagging := &runtimehooksv1.UpdateMachineResponse{}
-	restarted.UpdateMachine(request, lagging)
+	restarted.UpdateMachine(context.Background(), request, lagging)
 
 	g.Expect(lagging.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(lagging.RetryAfterSeconds).To(BeZero())
@@ -297,10 +302,9 @@ func TestUpdateMachineSyncsBootstrapManifestsAfterARestart(t *testing.T) {
 
 	peer := newFakeApplier()
 	peer.node = controlPlaneNode()
-	peerHandler := NewHandlerWithMetadata(peer, logr.Discard(), "", 0, reader)
+	peerHandler := fakeHandler(peer, reader)
 
 	peerRequest := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.2"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-2", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -309,14 +313,14 @@ func TestUpdateMachineSyncsBootstrapManifestsAfterARestart(t *testing.T) {
 	}
 
 	for range kubernetesComponents {
-		peerHandler.UpdateMachine(peerRequest, &runtimehooksv1.UpdateMachineResponse{})
+		peerHandler.UpdateMachine(context.Background(), peerRequest, &runtimehooksv1.UpdateMachineResponse{})
 	}
 
 	applier.nodes["10.0.0.2"] = peer.node
 
 	// Every control-plane Machine is at the target version, so the restarted handler syncs.
 	done := &runtimehooksv1.UpdateMachineResponse{}
-	restarted.UpdateMachine(request, done)
+	restarted.UpdateMachine(context.Background(), request, done)
 
 	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(done.RetryAfterSeconds).To(BeZero())
@@ -337,16 +341,15 @@ func TestUpdateMachineReportsManifestSyncFailure(t *testing.T) {
 		kubeconfig: []byte("kubeconfig-of-test-cluster"),
 	}
 
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	handler := fakeHandler(applier, reader)
 	handler.manifestSyncer = syncer
 
-	handler.CanUpdateMachine(
+	handler.CanUpdateMachine(context.Background(),
 		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"),
 		&runtimehooksv1.CanUpdateMachineResponse{},
 	)
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-1", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -355,11 +358,11 @@ func TestUpdateMachineReportsManifestSyncFailure(t *testing.T) {
 	}
 
 	for range kubernetesComponents {
-		handler.UpdateMachine(request, &runtimehooksv1.UpdateMachineResponse{})
+		handler.UpdateMachine(context.Background(), request, &runtimehooksv1.UpdateMachineResponse{})
 	}
 
 	resp := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, resp)
+	handler.UpdateMachine(context.Background(), request, resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusFailure))
 	g.Expect(resp.Message).To(ContainSubstring("the workload cluster is unreachable"))
@@ -391,16 +394,15 @@ func TestUpdateMachineCompletesWhileTheRestOfTheControlPlaneIsStillAtTheOldVersi
 		kubeconfig: []byte("kubeconfig-of-test-cluster"),
 	}
 
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	handler := fakeHandler(applier, reader)
 	handler.manifestSyncer = syncer
 
-	handler.CanUpdateMachine(
+	handler.CanUpdateMachine(context.Background(),
 		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"),
 		&runtimehooksv1.CanUpdateMachineResponse{},
 	)
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-1", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -409,11 +411,11 @@ func TestUpdateMachineCompletesWhileTheRestOfTheControlPlaneIsStillAtTheOldVersi
 	}
 
 	for range kubernetesComponents {
-		handler.UpdateMachine(request, &runtimehooksv1.UpdateMachineResponse{})
+		handler.UpdateMachine(context.Background(), request, &runtimehooksv1.UpdateMachineResponse{})
 	}
 
 	resp := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, resp)
+	handler.UpdateMachine(context.Background(), request, resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.RetryAfterSeconds).To(BeZero())
@@ -470,16 +472,15 @@ func TestUpdateMachineKeepsTheUpdateInProgressWhenAPeerCannotBeRead(t *testing.T
 		kubeconfig: []byte("kubeconfig-of-test-cluster"),
 	}
 
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, reader)
+	handler := fakeHandler(applier, reader)
 	handler.manifestSyncer = syncer
 
-	handler.CanUpdateMachine(
+	handler.CanUpdateMachine(context.Background(),
 		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", changedConfig), "talos-image", "v1.33.1", "v1.34.0"),
 		&runtimehooksv1.CanUpdateMachineResponse{},
 	)
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.1"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("control-plane-1", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -488,13 +489,13 @@ func TestUpdateMachineKeepsTheUpdateInProgressWhenAPeerCannotBeRead(t *testing.T
 	}
 
 	for range kubernetesComponents {
-		handler.UpdateMachine(request, &runtimehooksv1.UpdateMachineResponse{})
+		handler.UpdateMachine(context.Background(), request, &runtimehooksv1.UpdateMachineResponse{})
 	}
 
 	g.Expect(componentsAtTarget(applier.node, "v1.34.0")).To(BeTrue())
 
 	unreadable := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, unreadable)
+	handler.UpdateMachine(context.Background(), request, unreadable)
 
 	g.Expect(unreadable.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(unreadable.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)), "a peer that cannot be read keeps the update in progress instead of skipping the sync")
@@ -504,7 +505,7 @@ func TestUpdateMachineKeepsTheUpdateInProgressWhenAPeerCannotBeRead(t *testing.T
 	applier.unreachable["10.0.0.2"] = false
 
 	done := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, done)
+	handler.UpdateMachine(context.Background(), request, done)
 
 	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(done.RetryAfterSeconds).To(BeZero())

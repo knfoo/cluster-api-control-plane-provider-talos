@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The Cluster API Runtime SDK extension that updates Talos machines in place.
+// The in-place update hooks the CACPPT manager serves for Talos machines.
 //
 // It answers CanUpdateMachine and UpdateMachine for a single Machine and CanUpdateMachineSet
 // for the worker Machines of a MachineDeployment (pkg/inplaceupdate/machineset.go). The
@@ -20,6 +20,7 @@ package inplaceupdate
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -28,10 +29,12 @@ import (
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
+	talosconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	"sigs.k8s.io/cluster-api/util/secret"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -42,9 +45,14 @@ const (
 	// DefaultRequestTimeout bounds a single call to the Talos API.
 	DefaultRequestTimeout = 30 * time.Second
 
-	// SettingAddress is the ExtensionConfig setting that names the Talos API address
-	// of the machine being updated.
-	SettingAddress = "address"
+	// talosConfigSecretName is the name of the secret the bootstrap provider stores the
+	// talosconfig of a cluster under: clusterName + "-talosconfig"
+	// (github.com/siderolabs/cluster-api-bootstrap-provider-talos controllers/secrets.go).
+	talosConfigSecretName = "-talosconfig"
+
+	// talosConfigSecretKey is the key the bootstrap provider writes the talosconfig under
+	// in that secret (controllers/secrets.go).
+	talosConfigSecretKey = "talosconfig"
 )
 
 // rebootRequiredConfigPaths are machine configuration keys Talos can only change by
@@ -64,12 +72,15 @@ var rebootRequiredConfigPaths = []string{
 
 // Handler answers the in-place update hooks for Talos machines.
 type Handler struct {
-	applier         Applier
-	log             logr.Logger
-	timeout         time.Duration
-	defaultEndpoint string
-	metadata        MetadataReader
-	manifestSyncer  ManifestSyncer
+	log            logr.Logger
+	timeout        time.Duration
+	metadata       MetadataReader
+	manifestSyncer ManifestSyncer
+
+	// newApplier builds the applier that talks to a machine with the talosconfig of its
+	// cluster. NewHandler sets it to NewTalosApplier; a test hands in a fake node, the
+	// way manifestSyncer already is.
+	newApplier func(clusterName string, config *talosconfig.Config) Applier
 
 	// manifestsSynced marks the clusters and Kubernetes versions whose bootstrap manifests
 	// were already synced to the workload cluster. The sync is decided from the state of
@@ -80,37 +91,46 @@ type Handler struct {
 	manifestsSyncedMu sync.Mutex
 }
 
-// NewHandler creates the extension handlers. endpoint is the fallback Talos address
-// used when the request carries none. Without a metadata reader the extension renders
-// only the TalosConfigs that carry their machine configuration in spec.data.
-func NewHandler(applier Applier, log logr.Logger, endpoint string, timeout time.Duration) *Handler {
-	return NewHandlerWithMetadata(applier, log, endpoint, timeout, nil)
+// NewHandler builds the handlers served by the CACPPT manager. client is the manager's
+// client of the management cluster: every hook reads the Machine it is called for, the
+// addresses its infrastructure provider reported in the Machine status and the talosconfig
+// secret the bootstrap provider created for the Machine's cluster. The rules the handlers
+// need are the ones the control plane controller already declares in config/rbac/role.yaml
+// (secrets, machines and machines/status, clusters).
+func NewHandler(client client.Client, log logr.Logger) *Handler {
+	return newHandler(NewKubeMetadataReader(client), log, DefaultRequestTimeout, nil)
 }
 
-// NewHandlerWithMetadata creates the extension handlers with read access to the
-// management cluster objects needed to render a generated machine configuration and a
-// metadata-driven template: the Cluster of the machine, the cluster's Talos secrets
-// bundle and the metadata secrets a TalosConfig's metadataFrom points at.
-func NewHandlerWithMetadata(applier Applier, log logr.Logger, endpoint string, timeout time.Duration, metadata MetadataReader) *Handler {
+// newHandler builds a handler with a given metadata reader and applier factory. The
+// factory is nil in production, where NewTalosApplier talks to the node; a test replaces
+// it with a fake node.
+func newHandler(metadata MetadataReader, log logr.Logger, timeout time.Duration, applierFor func(clusterName string, config *talosconfig.Config) Applier) *Handler {
 	if timeout <= 0 {
 		timeout = DefaultRequestTimeout
 	}
 
+	if applierFor == nil {
+		applierFor = func(_ string, config *talosconfig.Config) Applier {
+			return NewTalosApplier(config)
+		}
+	}
+
 	return &Handler{
-		applier:         applier,
 		log:             log,
 		timeout:         timeout,
-		defaultEndpoint: endpoint,
 		metadata:        metadata,
 		manifestSyncer:  NewKubeManifestSyncer(log),
+		newApplier:      applierFor,
 		manifestsSynced: map[string]bool{},
 	}
 }
 
 // CanUpdateMachine is the CanUpdateMachine hook. It returns a patch for the
 // TalosConfig object only when the whole change is a machine configuration change
-// that Talos applies with mode NO_REBOOT after a DryRun.
-func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, resp *runtimehooksv1.CanUpdateMachineResponse) {
+// that Talos applies with mode NO_REBOOT after a DryRun. ctx is the request context
+// the Runtime SDK server passes to the handler, as in the hook handlers of Cluster
+// API's test extension (test/extension/handlers/inplaceupdate/handlers.go:106).
+func (h *Handler) CanUpdateMachine(ctx context.Context, req *runtimehooksv1.CanUpdateMachineRequest, resp *runtimehooksv1.CanUpdateMachineResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
 	machine := req.Current.Machine.Name
@@ -121,7 +141,7 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	ctx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 
 	plan, err := h.planInPlaceUpdate(ctx, req.Current.BootstrapConfig, req.Desired.BootstrapConfig, req.Current.Machine, req.Desired.Machine)
@@ -138,7 +158,7 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 		return
 	}
 
-	endpoint, err := h.resolveEndpoint(req.Settings, req.Desired.Machine)
+	endpoint, applier, err := h.node(ctx, req.Desired.Machine)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -155,7 +175,7 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 	config := plan.config
 
 	if plan.versionChange {
-		nodeStatus, err := h.applier.NodeStatus(ctx, endpoint)
+		nodeStatus, err := applier.NodeStatus(ctx, endpoint)
 		if err != nil {
 			resp.Status = runtimehooksv1.ResponseStatusFailure
 			resp.Message = err.Error()
@@ -187,7 +207,7 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 
 	// The owner's condition: only a change the node accepts with mode
 	// ApplyConfigurationRequest_NO_REBOOT and DryRun is handled in place.
-	reason, err := h.dryRunReason(ctx, endpoint, config)
+	reason, err := h.dryRunReason(ctx, applier, endpoint, config)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -242,8 +262,9 @@ func (h *Handler) CanUpdateMachine(req *runtimehooksv1.CanUpdateMachineRequest, 
 // configuration applied is the staged one of pkg/inplaceupdate/kubernetes.go, and the
 // update is completed only when the node reports every Kubernetes component it runs -
 // the control-plane components of a control-plane Machine, the kubelet of a worker
-// Machine - at the Machine's version.
-func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
+// Machine - at the Machine's version. ctx is the request context the Runtime SDK server
+// passes to the handler (test/extension/handlers/inplaceupdate/handlers.go:202).
+func (h *Handler) UpdateMachine(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
 	machine := req.Desired.Machine.Name
@@ -256,7 +277,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	ctx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 
 	// CanUpdateMachine already rendered this configuration, so the same render is used
@@ -283,7 +304,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
-	endpoint, err := h.resolveEndpoint(req.Settings, req.Desired.Machine)
+	endpoint, applier, err := h.node(ctx, req.Desired.Machine)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -291,7 +312,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
-	nodeStatus, err := h.applier.NodeStatus(ctx, endpoint)
+	nodeStatus, err := applier.NodeStatus(ctx, endpoint)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -319,7 +340,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		}
 	}
 
-	status, err := h.applier.DryRun(ctx, endpoint, config)
+	status, err := applier.DryRun(ctx, endpoint, config)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
@@ -338,7 +359,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		// the sync is needed is read from the control plane itself, not from anything
 		// CanUpdateMachine recorded, so restarting the provider in the middle of an upgrade
 		// does not skip it.
-		if h.manifestSyncer != nil && h.metadata != nil && staged && nodeStatus.hasControlPlane() {
+		if staged && nodeStatus.hasControlPlane() {
 			key := manifestSyncKey(req.Desired.Machine, target)
 
 			h.manifestsSyncedMu.Lock()
@@ -356,7 +377,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 				// done: its own update is complete and the rollout continues. A peer that cannot
 				// be read at all is not a peer that is not at the target: the sync is not skipped
 				// for it, the Machine stays in progress and Cluster API calls the hook again.
-				atTarget, err := h.controlPlaneAtTarget(ctx, req, target)
+				atTarget, err := h.controlPlaneAtTarget(ctx, req, target, applier)
 				if err != nil {
 					h.log.Info("the Kubernetes version of a control-plane machine cannot be read, so the bootstrap manifests are not synced yet", "machine", machine, "version", target, "error", err.Error())
 					resp.RetryAfterSeconds = DefaultRetryAfterSeconds
@@ -371,7 +392,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 					return
 				}
 
-				if err := h.syncBootstrapManifests(ctx, req, spec, endpoint, target); err != nil {
+				if err := h.syncBootstrapManifests(ctx, req, spec, endpoint, target, applier); err != nil {
 					if errors.Is(err, errManifestsNotReconciled) {
 						h.log.Info("the synced bootstrap manifests are still reconciling in the workload cluster", "machine", machine, "version", target)
 						resp.RetryAfterSeconds = DefaultRetryAfterSeconds
@@ -400,7 +421,7 @@ func (h *Handler) UpdateMachine(req *runtimehooksv1.UpdateMachineRequest, resp *
 		return
 	}
 
-	if err := h.applier.Apply(ctx, endpoint, config); err != nil {
+	if err := applier.Apply(ctx, endpoint, config); err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = err.Error()
 
@@ -431,7 +452,7 @@ func manifestSyncKey(machine clusterv1.Machine, version string) string {
 // answer. That is not the same as a peer that is not at the target yet: the caller keeps
 // the update in progress and retries, instead of skipping a sync the control plane has
 // not finished.
-func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, target string) (bool, error) {
+func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, target string, applier Applier) (bool, error) {
 	reader, ok := h.metadata.(ControlPlaneMachineReader)
 	if !ok {
 		return true, nil
@@ -447,7 +468,7 @@ func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.
 			continue
 		}
 
-		address, err := h.machineAddress(peer)
+		address, err := h.machineAddress(ctx, peer)
 		if err != nil {
 			return false, errors.Wrapf(err, "reading the address of control-plane machine %q", peer.Name)
 		}
@@ -456,7 +477,7 @@ func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.
 			return false, errors.Errorf("control-plane machine %q has no address, so its Kubernetes version cannot be checked", peer.Name)
 		}
 
-		status, err := h.applier.NodeStatus(ctx, address)
+		status, err := applier.NodeStatus(ctx, address)
 		if err != nil {
 			return false, errors.Wrapf(err, "reading the Kubernetes components of control-plane machine %q at %q", peer.Name, address)
 		}
@@ -473,12 +494,16 @@ func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.
 // cluster exactly once per cluster and Kubernetes version. The kubeconfig of the workload
 // cluster is the one Cluster API stores in the secret named <cluster>-kubeconfig (util/secret:
 // secret.Name(clusterName, secret.Kubeconfig), kubeconfig stored under secret.KubeconfigDataName).
-func (h *Handler) syncBootstrapManifests(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, spec cabptv1.TalosConfigSpec, endpoint, target string) error {
+func (h *Handler) syncBootstrapManifests(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, spec cabptv1.TalosConfigSpec, endpoint, target string, applier Applier) error {
 	clusterName := req.Desired.Machine.Spec.ClusterName
 	key := manifestSyncKey(req.Desired.Machine, target)
 
 	h.manifestsSyncedMu.Lock()
 	defer h.manifestsSyncedMu.Unlock()
+
+	if h.manifestSyncer == nil {
+		return nil
+	}
 
 	if h.manifestsSynced[key] {
 		return nil
@@ -500,7 +525,7 @@ func (h *Handler) syncBootstrapManifests(ctx context.Context, req *runtimehooksv
 		return errors.Errorf("the kubeconfig secret %q of cluster %q has no key %q", kubeconfigName, clusterName, secret.KubeconfigDataName)
 	}
 
-	objects, err := h.applier.BootstrapManifests(ctx, endpoint)
+	objects, err := applier.BootstrapManifests(ctx, endpoint)
 	if err != nil {
 		return errors.Wrapf(err, "reading the bootstrap manifests of machine %q", req.Desired.Machine.Name)
 	}
@@ -514,33 +539,6 @@ func (h *Handler) syncBootstrapManifests(ctx context.Context, req *runtimehooksv
 	h.log.Info("the bootstrap manifests were synced to the workload cluster", "cluster", clusterName, "version", target, "manifests", len(objects))
 
 	return nil
-}
-
-// Discovery is the Discovery hook, so the extension can be registered with an
-// ExtensionConfig. The three in-place update hooks of the proposal are implemented:
-// CanUpdateMachine and UpdateMachine for a Machine, CanUpdateMachineSet for a MachineSet.
-// The APIVersion is the one the Runtime SDK catalog uses for the hook requests.
-//
-// Handler names must be unique inside an extension and valid DNS1123 labels: the Runtime
-// SDK client rejects a discovery response with a repeated handler name
-// (sigs.k8s.io/cluster-api/internal/runtime/client/client.go:774-786), so each hook gets
-// its own name rather than the extension name.
-func (h *Handler) Discovery(req *runtimehooksv1.DiscoveryRequest, resp *runtimehooksv1.DiscoveryResponse) {
-	resp.Status = runtimehooksv1.ResponseStatusSuccess
-	resp.Handlers = []runtimehooksv1.ExtensionHandler{
-		{
-			Name:        "can-update-machine",
-			RequestHook: runtimehooksv1.GroupVersionHook{APIVersion: runtimehooksv1.GroupVersion.String(), Hook: "CanUpdateMachine"},
-		},
-		{
-			Name:        "can-update-machine-set",
-			RequestHook: runtimehooksv1.GroupVersionHook{APIVersion: runtimehooksv1.GroupVersion.String(), Hook: "CanUpdateMachineSet"},
-		},
-		{
-			Name:        "update-machine",
-			RequestHook: runtimehooksv1.GroupVersionHook{APIVersion: runtimehooksv1.GroupVersion.String(), Hook: "UpdateMachine"},
-		},
-	}
 }
 
 // rolloutReason returns why the request cannot be handled by a machine
@@ -615,7 +613,7 @@ type inPlacePlan struct {
 // The machine configuration of a TalosConfig and of a TalosConfigTemplate is not the spec:
 // it is the generated or supplied base configuration with the configuration patches and the
 // (template rendered) strategic patches applied, exactly as the bootstrap provider builds
-// it. A configuration the extension cannot render - a generated configuration without access
+// it. A configuration the hooks cannot render - a generated configuration without access
 // to the cluster secrets, a template whose metadata is not available yet - is answered with
 // Success and no patch, which leaves current and desired different and makes Cluster API
 // roll the Machine resp. the MachineSet out; answering with Failure would turn the call into
@@ -669,12 +667,12 @@ func (h *Handler) planInPlaceUpdate(
 
 // dryRunReason is the owner's condition of docs/adr/ADR-0003: a machine configuration change
 // is handled in place only when a node accepts it with mode
-// ApplyConfigurationRequest_NO_REBOOT after a DryRun. It asks the node at endpoint about
-// config and returns why the change has to roll out, or "" when the node accepts it. An error
-// is a failure of the DryRun call itself, which the caller turns into a hook failure or a
+// ApplyConfigurationRequest_NO_REBOOT after a DryRun. It asks the node about config and
+// returns why the change has to roll out, or "" when the node accepts it. An error is a
+// failure of the DryRun call itself, which the caller turns into a hook failure or a
 // rollout reason.
-func (h *Handler) dryRunReason(ctx context.Context, endpoint string, config []byte) (string, error) {
-	status, err := h.applier.DryRun(ctx, endpoint, config)
+func (h *Handler) dryRunReason(ctx context.Context, applier Applier, endpoint string, config []byte) (string, error) {
+	status, err := applier.DryRun(ctx, endpoint, config)
 	if err != nil {
 		return "", err
 	}
@@ -686,49 +684,59 @@ func (h *Handler) dryRunReason(ctx context.Context, endpoint string, config []by
 	return "", nil
 }
 
-// resolveEndpoint returns the Talos API address of a machine. Cluster API copies the
-// addresses of the infrastructure machine into the Machine status
+// node returns the Talos API address of a machine and the applier that reaches it with the
+// talosconfig the bootstrap provider created for the machine's cluster. Cluster API copies
+// the addresses of the infrastructure machine into the Machine status
 // (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses), but a hook request
 // carries only the spec of the objects ("Only spec is provided, status fields are not
 // included", docs/book/src/tasks/experimental-features/runtime-sdk/implement-in-place-update-hooks.md),
-// so the extension reads the Machine from the management cluster when it was started with
-// --kubeconfig. Without a Machine address the settings of the ExtensionConfig, the
-// --endpoint fallback of the binary and the ProviderID of the machine are used.
-func (h *Handler) resolveEndpoint(settings map[string]string, machine clusterv1.Machine) (string, error) {
-	if address, err := h.machineAddress(machine); err != nil {
-		h.log.Info("the addresses of the machine cannot be read from the management cluster", "machine", machine.Name, "error", err.Error())
-	} else if address != "" {
-		return address, nil
+// so the address is read from the Machine in the management cluster. There is no address
+// setting of the ExtensionConfig and no --endpoint flag to fall back to: a Machine whose
+// infrastructure provider has not reported an address cannot be updated in place.
+func (h *Handler) node(ctx context.Context, machine clusterv1.Machine) (string, Applier, error) {
+	address, err := h.machineAddress(ctx, machine)
+	if err != nil {
+		return "", nil, errors.Wrapf(err, "reading the address of machine %q", machine.Name)
 	}
 
-	if address := settings[SettingAddress]; address != "" {
-		return address, nil
+	if address == "" {
+		return "", nil, errors.Errorf("machine %q has no address in its status, so its Talos API cannot be reached", machine.Name)
 	}
 
-	if h.defaultEndpoint != "" {
-		return h.defaultEndpoint, nil
+	config, err := h.clusterTalosConfig(ctx, machine.Namespace, machine.Spec.ClusterName)
+	if err != nil {
+		return "", nil, err
 	}
 
-	if providerID := machine.Spec.ProviderID; strings.HasPrefix(providerID, "talos://") {
-		return strings.TrimPrefix(providerID, "talos://"), nil
-	}
-
-	return "", errors.Errorf("cannot determine the Talos address of machine %q: set the %q setting of the ExtensionConfig or the --endpoint flag of the extension", machine.Name, SettingAddress)
+	return address, h.newApplier(machine.Spec.ClusterName, config), nil
 }
 
-// machineAddress returns the first address the infrastructure provider reported for a
-// machine. Only a reader that implements MachineAddressReader can answer; without one the
-// extension falls back to the settings.
-func (h *Handler) machineAddress(machine clusterv1.Machine) (string, error) {
-	reader, ok := h.metadata.(MachineAddressReader)
-	if !ok {
-		return "", nil
+// clusterTalosConfig reads the talosconfig the bootstrap provider keeps for a cluster: the
+// secret named <cluster>-talosconfig, with the talosconfig under the key "talosconfig"
+// (github.com/siderolabs/cluster-api-bootstrap-provider-talos controllers/secrets.go).
+func (h *Handler) clusterTalosConfig(ctx context.Context, namespace, clusterName string) (*talosconfig.Config, error) {
+	name := clusterName + talosConfigSecretName
+
+	data, err := h.metadata.Secret(ctx, namespace, name)
+	if err != nil {
+		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
-	defer cancel()
+	if data == nil {
+		return nil, errors.Errorf("the talosconfig secret %q of cluster %q does not exist yet, so no machine of the cluster can be reached", name, clusterName)
+	}
 
-	addresses, err := reader.MachineAddresses(ctx, machine.Namespace, machine.Name)
+	config, err := talosconfig.FromBytes(data[talosConfigSecretKey])
+	if err != nil {
+		return nil, errors.Wrapf(err, "decoding the talosconfig in the secret %q of cluster %q", name, clusterName)
+	}
+
+	return config, nil
+}
+
+// machineAddress returns the address the infrastructure provider reported for a machine.
+func (h *Handler) machineAddress(ctx context.Context, machine clusterv1.Machine) (string, error) {
+	addresses, err := h.metadata.MachineAddresses(ctx, machine.Namespace, machine.Name)
 	if err != nil {
 		return "", err
 	}
@@ -736,32 +744,59 @@ func (h *Handler) machineAddress(machine clusterv1.Machine) (string, error) {
 	return pickMachineAddress(addresses), nil
 }
 
-// pickMachineAddress returns the address the extension reaches the node's Talos API at:
-// the internal address the infrastructure provider reported, since Talos serves its API on
-// the node's own network, falling back to any address the provider reported.
+// pickMachineAddress returns the address a hook reaches the node's Talos API at: the
+// internal address the infrastructure provider reported, since Talos serves its API on the
+// node's own network, falling back to any address the provider reported. TalosEndpoint is
+// the rule every Talos API endpoint in the provider is built with, so the link-local rule
+// exists once in the provider.
 func pickMachineAddress(addresses []clusterv1.MachineAddress) string {
 	for _, preferred := range []clusterv1.MachineAddressType{clusterv1.MachineInternalIP, clusterv1.MachineInternalDNS} {
 		for _, address := range addresses {
-			if address.Type == preferred && address.Address != "" {
-				return address.Address
+			if endpoint, ok := TalosEndpoint(address.Address); address.Type == preferred && ok {
+				return endpoint
 			}
 		}
 	}
 
 	for _, address := range addresses {
-		if address.Address != "" {
-			return address.Address
+		if endpoint, ok := TalosEndpoint(address.Address); ok {
+			return endpoint
 		}
 	}
 
 	return ""
 }
 
+// TalosEndpoint returns the address to use as a Talos API endpoint, and false if the address
+// can't be one.
+//
+// Link-local addresses are skipped: they are only reachable on the link of the node, and an
+// IPv6 link-local address carries a zone (e.g. "fe80::1%eth0") that is not valid in the gRPC
+// target the Talos client builds from its endpoints, so a single one of them breaks the
+// client for every endpoint. Infrastructure providers such as Metal3 report them in the
+// Machine addresses. Addresses that are not IPs (host names) are kept as they are.
+func TalosEndpoint(address string) (string, bool) {
+	if address == "" {
+		return "", false
+	}
+
+	ip, err := netip.ParseAddr(address)
+	if err != nil {
+		return address, true
+	}
+
+	if ip.IsLinkLocalUnicast() {
+		return "", false
+	}
+
+	return ip.WithZone("").String(), true
+}
+
 // renderMachineConfig builds the machine configuration a TalosConfig describes with the
 // bootstrap provider's exported pkg/machineconfig: Generate for a generateType TalosConfig,
 // then ApplyPatches for the RFC 6902 configPatches and the strategicPatches, whose
 // templates are rendered with the metadata of metadataFrom and the templateVariables.
-// The extension gathers only the inputs - the Cluster, the cluster's Talos secrets bundle
+// The hooks gather only the inputs - the Cluster, the cluster's Talos secrets bundle
 // and the metadata secret - and passes them, so the generated configuration and the
 // rendered templates are identical to what the bootstrap controller writes.
 //

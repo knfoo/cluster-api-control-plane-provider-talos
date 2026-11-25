@@ -2,13 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Talking to the Talos API of one machine.
+// Talking to the Talos API of one machine. An applier is built per hook request from the
+// talosconfig of the machine's cluster, so no applier outlives a request.
 package inplaceupdate
 
 import (
 	"context"
 	"strings"
-	"sync"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/resource/meta"
@@ -52,7 +52,7 @@ func (s NodeStatus) hasControlPlane() bool {
 // applyConfigurationRequest builds the Talos API request for a machine
 // configuration. The owner's condition for in-place updates (ADR-0003) is that
 // Talos must accept the change with mode ApplyConfigurationRequest_NO_REBOOT after
-// a DryRun, so every request this extension sends is a NO_REBOOT request and the
+// a DryRun, so every request the hooks send is a NO_REBOOT request and the
 // DryRun flag distinguishes the check from the real apply.
 func applyConfigurationRequest(data []byte, dryRun bool) *machineapi.ApplyConfigurationRequest {
 	return &machineapi.ApplyConfigurationRequest{
@@ -80,7 +80,7 @@ type Applier interface {
 	DryRun(ctx context.Context, endpoint string, config []byte) (ApplyStatus, error)
 	// Apply sends the configuration to the node with mode NO_REBOOT.
 	Apply(ctx context.Context, endpoint string, config []byte) error
-	// NodeStatus reports the Kubernetes components the node runs, so the extension can
+	// NodeStatus reports the Kubernetes components the node runs, so the hooks can
 	// tell whether a machine has to be upgraded component by component and how far the
 	// upgrade has come.
 	NodeStatus(ctx context.Context, endpoint string) (NodeStatus, error)
@@ -91,38 +91,23 @@ type Applier interface {
 	BootstrapManifests(ctx context.Context, endpoint string) ([]*unstructured.Unstructured, error)
 }
 
-// TalosApplier talks to real Talos nodes.
+// TalosApplier talks to real Talos nodes. The node itself reports whether it already runs
+// the configuration, so the applier keeps no state between hook requests: a repeated
+// UpdateMachine call for the same desired configuration is reported as finished by the
+// DryRun of the node.
 type TalosApplier struct {
 	config *talosconfig.Config
-
-	// applied holds the exact configuration last successfully applied to an
-	// endpoint, so a repeated UpdateMachine call for the same desired
-	// configuration is reported as finished instead of applied twice.
-	mu      sync.Mutex
-	applied map[string]string
 }
 
-// NewTalosApplier creates an applier for the given talosconfig.
+// NewTalosApplier creates an applier for the talosconfig of one cluster.
 func NewTalosApplier(config *talosconfig.Config) *TalosApplier {
 	return &TalosApplier{
-		config:  config,
-		applied: map[string]string{},
+		config: config,
 	}
 }
 
 func (a *TalosApplier) DryRun(ctx context.Context, endpoint string, config []byte) (ApplyStatus, error) {
-	status, err := a.request(ctx, endpoint, config, true)
-	if err != nil {
-		return ApplyStatus{}, err
-	}
-
-	a.mu.Lock()
-	if a.applied[endpoint] == string(config) {
-		status.NoChanges = true
-	}
-	a.mu.Unlock()
-
-	return status, nil
+	return a.request(ctx, endpoint, config, true)
 }
 
 func (a *TalosApplier) Apply(ctx context.Context, endpoint string, config []byte) error {
@@ -134,10 +119,6 @@ func (a *TalosApplier) Apply(ctx context.Context, endpoint string, config []byte
 	if status.RebootRequired {
 		return errors.Errorf("node %q needs a reboot to apply the configuration: %s", endpoint, status.Details)
 	}
-
-	a.mu.Lock()
-	a.applied[endpoint] = string(config)
-	a.mu.Unlock()
 
 	return nil
 }

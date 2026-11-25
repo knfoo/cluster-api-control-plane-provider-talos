@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The addresses the extension reads from the Machine status to reach a node's Talos API.
+// The addresses the manager hooks read from the Machine status to reach a node's Talos API.
 package inplaceupdate
 
 import (
@@ -34,7 +34,7 @@ func TestMachineAddressesReadsTheAddressObjectsOfAMachine(t *testing.T) {
 		},
 	}
 
-	addresses, err := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(machine).Build()).(MachineAddressReader).MachineAddresses(context.Background(), "default", "worker-1")
+	addresses, err := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(machine).Build()).MachineAddresses(context.Background(), "default", "worker-1")
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(addresses).To(Equal([]clusterv1.MachineAddress{
@@ -45,7 +45,7 @@ func TestMachineAddressesReadsTheAddressObjectsOfAMachine(t *testing.T) {
 
 // TestMachineAddressesOfAMachineWithoutAddresses checks that a Machine that does not exist
 // yet, or has no addresses in its status, is answered with no addresses and no error, so the
-// extension falls back to the settings instead of failing the hook.
+// hook can report the missing address as a machine-specific failure.
 func TestMachineAddressesOfAMachineWithoutAddresses(t *testing.T) {
 	g := NewWithT(t)
 
@@ -57,19 +57,19 @@ func TestMachineAddressesOfAMachineWithoutAddresses(t *testing.T) {
 
 	reader := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(machine).Build())
 
-	addresses, err := reader.(MachineAddressReader).MachineAddresses(context.Background(), "default", "worker-2")
+	addresses, err := reader.MachineAddresses(context.Background(), "default", "worker-2")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(addresses).To(BeEmpty())
 
-	addresses, err = reader.(MachineAddressReader).MachineAddresses(context.Background(), "default", "worker-that-does-not-exist")
+	addresses, err = reader.MachineAddresses(context.Background(), "default", "worker-that-does-not-exist")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(addresses).To(BeEmpty())
 }
 
-// TestPickMachineAddressPrefersTheInternalAddress checks which of the reported addresses the
-// extension addresses the Talos API at: Talos serves its API on the node's own network, so
-// the internal address comes before an external one, and any address is used when the
-// provider reports no internal one.
+// TestPickMachineAddressPrefersTheInternalAddress checks which of the reported addresses a
+// hook addresses the Talos API at: Talos serves its API on the node's own network, so the
+// internal address comes before an external one, and any address is used when the provider
+// reports no internal one.
 func TestPickMachineAddressPrefersTheInternalAddress(t *testing.T) {
 	g := NewWithT(t)
 
@@ -88,6 +88,29 @@ func TestPickMachineAddressPrefersTheInternalAddress(t *testing.T) {
 	})).To(Equal("203.0.113.10"))
 
 	g.Expect(pickMachineAddress(nil)).To(BeEmpty())
+}
+
+// TestPickMachineAddressSkipsLinkLocalAddresses checks the rule the provider applies to every
+// Talos API endpoint (pkg/inplaceupdate TalosEndpoint, used by controllers/configs.go too): a
+// link-local address is only reachable on the node's own link and an IPv6 link-local address
+// carries a zone the Talos client's gRPC target cannot take, so a hook never uses one, even
+// when Metal3 reports it as the only internal address of the Machine.
+func TestPickMachineAddressSkipsLinkLocalAddresses(t *testing.T) {
+	g := NewWithT(t)
+
+	g.Expect(pickMachineAddress([]clusterv1.MachineAddress{
+		{Type: clusterv1.MachineInternalIP, Address: "fe80::1%eth0"},
+		{Type: clusterv1.MachineInternalIP, Address: "10.0.0.5"},
+	})).To(Equal("10.0.0.5"))
+
+	g.Expect(pickMachineAddress([]clusterv1.MachineAddress{
+		{Type: clusterv1.MachineInternalIP, Address: "169.254.1.1"},
+		{Type: clusterv1.MachineExternalIP, Address: "203.0.113.10"},
+	})).To(Equal("203.0.113.10"))
+
+	g.Expect(pickMachineAddress([]clusterv1.MachineAddress{
+		{Type: clusterv1.MachineInternalIP, Address: "169.254.1.1"},
+	})).To(BeEmpty())
 }
 
 // TestMachineSetMachinesReadsTheMachinesOfAMachineSet checks the capability CanUpdateMachineSet

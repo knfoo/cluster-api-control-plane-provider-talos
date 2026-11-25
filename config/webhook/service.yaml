@@ -6,7 +6,13 @@ metadata:
   namespace: system
 spec:
   ports:
-    - port: 443
+    - name: webhook-server
+      port: 443
       targetPort: 9443
+    # The in-place update hooks (CanUpdateMachine, CanUpdateMachineSet, UpdateMachine) are
+    # served by the manager on --runtime-extension-port, default 9444.
+    - name: runtime-extension
+      port: 9444
+      targetPort: runtime-extension
   selector:
     control-plane: controller-manager

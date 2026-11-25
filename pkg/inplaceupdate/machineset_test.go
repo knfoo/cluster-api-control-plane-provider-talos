@@ -13,7 +13,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -119,7 +118,7 @@ func unmarshalPatch(patch []byte) []jsonPatchOp {
 func TestCanUpdateMachineSetInPlaceForTemplateChange(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := fakeHandler(applier, clusterMetadata())
 
 	request := canUpdateMachineSetRequest(
 		workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
@@ -130,7 +129,7 @@ func TestCanUpdateMachineSetInPlaceForTemplateChange(t *testing.T) {
 	)
 
 	resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-	handler.CanUpdateMachineSet(request, resp)
+	handler.CanUpdateMachineSet(context.Background(), request, resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.BootstrapConfigTemplatePatch.PatchType).To(Equal(runtimehooksv1.JSONPatchType))
@@ -148,7 +147,7 @@ func TestCanUpdateMachineSetInPlaceForTemplateChange(t *testing.T) {
 func TestCanUpdateMachineSetInPlaceForKubernetesVersion(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := fakeHandler(applier, clusterMetadata())
 
 	request := canUpdateMachineSetRequest(
 		workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
@@ -159,7 +158,7 @@ func TestCanUpdateMachineSetInPlaceForKubernetesVersion(t *testing.T) {
 	)
 
 	resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-	handler.CanUpdateMachineSet(request, resp)
+	handler.CanUpdateMachineSet(context.Background(), request, resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.MachineSetPatch.PatchType).To(Equal(runtimehooksv1.JSONPatchType))
@@ -174,7 +173,7 @@ func TestCanUpdateMachineSetInPlaceForKubernetesVersion(t *testing.T) {
 func TestCanUpdateMachineSetInPlaceForTemplateAndKubernetesVersion(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := fakeHandler(applier, clusterMetadata())
 
 	request := canUpdateMachineSetRequest(
 		workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
@@ -185,7 +184,7 @@ func TestCanUpdateMachineSetInPlaceForTemplateAndKubernetesVersion(t *testing.T)
 	)
 
 	resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-	handler.CanUpdateMachineSet(request, resp)
+	handler.CanUpdateMachineSet(context.Background(), request, resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.BootstrapConfigTemplatePatch.Patch).NotTo(BeEmpty())
@@ -199,7 +198,7 @@ func TestCanUpdateMachineSetInPlaceForTemplateAndKubernetesVersion(t *testing.T)
 func TestCanUpdateMachineSetRendersAGeneratedTemplate(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, clusterMetadata())
+	handler := fakeHandler(applier, clusterMetadata())
 
 	current := talosConfigTemplateRaw("talosconfig-1", map[string]any{
 		"talosVersion":     "v1.14.0",
@@ -213,7 +212,7 @@ func TestCanUpdateMachineSetRendersAGeneratedTemplate(t *testing.T) {
 	})
 
 	resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-	handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+	handler.CanUpdateMachineSet(context.Background(), canUpdateMachineSetRequest(
 		workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
 		workerMachineSet("workers", "v1.33.1", "talosconfig-2"),
 		current,
@@ -253,10 +252,10 @@ func TestCanUpdateMachineSetNoPatchForRolloutChanges(t *testing.T) {
 		{name: "no change at all", currentTemplate: talosConfigTemplate("talosconfig-1", baseConfig), desiredTemplate: talosConfigTemplate("talosconfig-2", baseConfig), infraTemplate: infraMachineTemplate("infra-template", "talos-image"), version: "v1.33.1", desiredVersion: "v1.33.1"},
 	} {
 		applier := newFakeApplier()
-		handler := NewHandler(applier, logr.Discard(), "", 0)
+		handler := fakeHandler(applier, clusterMetadata())
 
 		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+		handler.CanUpdateMachineSet(context.Background(), canUpdateMachineSetRequest(
 			workerMachineSet("workers", test.version, "talosconfig-1"),
 			workerMachineSet("workers", test.desiredVersion, "talosconfig-2"),
 			test.currentTemplate,
@@ -302,10 +301,10 @@ func TestCanUpdateMachineSetNoPatchWithoutATalosConfigTemplate(t *testing.T) {
 		},
 	} {
 		applier := newFakeApplier()
-		handler := NewHandler(applier, logr.Discard(), "", 0)
+		handler := fakeHandler(applier, clusterMetadata())
 
 		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+		handler.CanUpdateMachineSet(context.Background(), canUpdateMachineSetRequest(
 			test.currentSet,
 			test.desiredSet,
 			test.currentTemplate,
@@ -352,7 +351,7 @@ func TestCanUpdateMachineWorkerMachineConfigChange(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
 	applier.node = NodeStatus{Kubelet: "ghcr.io/siderolabs/kubelet:v1.33.1-fat"}
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := fakeHandler(applier, clusterMetadata())
 
 	current := machine("worker-1", "v1.33.1")
 	current.Spec.ProviderID = "talos://10.0.0.2"
@@ -374,7 +373,7 @@ func TestCanUpdateMachineWorkerMachineConfigChange(t *testing.T) {
 	}
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
-	handler.CanUpdateMachine(request, resp)
+	handler.CanUpdateMachine(context.Background(), request, resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
@@ -392,10 +391,9 @@ func TestUpdateMachineWorkerKubernetesVersionUpgradesKubeletOnly(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
 	applier.node = NodeStatus{Kubelet: "ghcr.io/siderolabs/kubelet:v1.33.1-fat"}
-	handler := NewHandler(applier, logr.Discard(), "", 0)
+	handler := fakeHandler(applier, clusterMetadata())
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.2"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("worker-1", "v1.34.0"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -404,7 +402,7 @@ func TestUpdateMachineWorkerKubernetesVersionUpgradesKubeletOnly(t *testing.T) {
 	}
 
 	first := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, first)
+	handler.UpdateMachine(context.Background(), request, first)
 
 	g.Expect(first.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(first.RetryAfterSeconds).To(Equal(int32(DefaultRetryAfterSeconds)))
@@ -417,7 +415,7 @@ func TestUpdateMachineWorkerKubernetesVersionUpgradesKubeletOnly(t *testing.T) {
 	g.Expect(componentsAtTarget(applier.node, "v1.34.0")).To(BeTrue())
 
 	done := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, done)
+	handler.UpdateMachine(context.Background(), request, done)
 
 	g.Expect(done.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(done.RetryAfterSeconds).To(BeZero())
@@ -438,7 +436,7 @@ func TestUpdateMachineUsesTheAddressOfTheMachine(t *testing.T) {
 		{Type: clusterv1.MachineInternalIP, Address: "10.0.0.5"},
 	}}
 
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "10.0.0.9", 0, metadata)
+	handler := fakeHandler(applier, metadata)
 
 	worker := machine("worker-1", "v1.33.1")
 	worker.Spec.ProviderID = "talos://10.0.0.2"
@@ -452,7 +450,7 @@ func TestUpdateMachineUsesTheAddressOfTheMachine(t *testing.T) {
 	}
 
 	resp := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, resp)
+	handler.UpdateMachine(context.Background(), request, resp)
 
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(applier.endpoints).NotTo(BeEmpty())
@@ -463,7 +461,7 @@ func TestUpdateMachineUsesTheAddressOfTheMachine(t *testing.T) {
 }
 
 // fakeMetadataWithAddresses is the fake management cluster of render_test.go plus the
-// Machine status addresses the extension reads to reach a node.
+// Machine status addresses the hooks read to reach a node.
 type fakeMetadataWithAddresses struct {
 	*fakeMetadata
 
@@ -479,15 +477,14 @@ func (f *fakeMetadataWithAddresses) MachineAddresses(_ context.Context, _, _ str
 	return f.addresses, nil
 }
 
-// TestUpdateMachineFallsBackWhenTheMachineHasNoAddress checks that a reader that reports no
-// addresses does not break the settings and ProviderID fallbacks.
-func TestUpdateMachineFallsBackWhenTheMachineHasNoAddress(t *testing.T) {
+// TestUpdateMachineFailsWhenTheMachineHasNoAddress checks that a Machine status without
+// addresses is not replaced by an ExtensionConfig setting or a ProviderID fallback.
+func TestUpdateMachineFailsWhenTheMachineHasNoAddress(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
-	handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, &fakeMetadataWithAddresses{fakeMetadata: clusterMetadata()})
+	handler := fakeHandler(applier, &fakeMetadataWithAddresses{fakeMetadata: clusterMetadata()})
 
 	request := &runtimehooksv1.UpdateMachineRequest{
-		CommonRequest: runtimehooksv1.CommonRequest{Settings: map[string]string{SettingAddress: "10.0.0.2"}},
 		Desired: runtimehooksv1.UpdateMachineRequestObjects{
 			Machine:               machine("worker-1", "v1.33.1"),
 			InfrastructureMachine: infraMachine("talos-image"),
@@ -496,14 +493,12 @@ func TestUpdateMachineFallsBackWhenTheMachineHasNoAddress(t *testing.T) {
 	}
 
 	resp := &runtimehooksv1.UpdateMachineResponse{}
-	handler.UpdateMachine(request, resp)
+	handler.UpdateMachine(context.Background(), request, resp)
 
-	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
-	g.Expect(applier.endpoints).NotTo(BeEmpty())
-
-	for _, endpoint := range applier.endpoints {
-		g.Expect(endpoint).To(Equal("10.0.0.2"), "the node was addressed at %q instead of the address of the ExtensionConfig setting", endpoint)
-	}
+	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusFailure))
+	g.Expect(resp.Message).To(ContainSubstring("has no address in its status"))
+	g.Expect(applier.endpoints).To(BeEmpty())
+	g.Expect(applier.applyRuns).To(BeZero())
 }
 
 // machineEnvConfig is the machine configuration of the reboot-required step of the in-place
@@ -595,10 +590,10 @@ func TestCanUpdateMachineSetDryRunsTheMachineConfigurationAgainstItsNodes(t *tes
 			},
 		}
 
-		handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, nodes)
+		handler := fakeHandler(applier, nodes)
 
 		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+		handler.CanUpdateMachineSet(context.Background(), canUpdateMachineSetRequest(
 			workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
 			workerMachineSet("workers", "v1.33.1", "talosconfig-2"),
 			talosConfigTemplateRaw("talosconfig-1", map[string]any{"talosVersion": "v1.12.12", "data": baseConfig}),
@@ -637,10 +632,10 @@ func TestCanUpdateMachineSetPatchesWithoutALiveMachine(t *testing.T) {
 		{name: "the extension has no reader for the machines of the machine set", metadata: clusterMetadata()},
 	} {
 		applier := newFakeApplier()
-		handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, test.metadata)
+		handler := fakeHandler(applier, test.metadata)
 
 		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+		handler.CanUpdateMachineSet(context.Background(), canUpdateMachineSetRequest(
 			workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
 			workerMachineSet("workers", "v1.33.1", "talosconfig-2"),
 			talosConfigTemplateRaw("talosconfig-1", map[string]any{"talosVersion": "v1.12.12", "data": baseConfig}),
@@ -682,10 +677,10 @@ func TestCanUpdateMachineSetRollsOutWhenNoNodeIsDryRun(t *testing.T) {
 		},
 	} {
 		applier := newFakeApplier()
-		handler := NewHandlerWithMetadata(applier, logr.Discard(), "", 0, test.metadata)
+		handler := fakeHandler(applier, test.metadata)
 
 		resp := &runtimehooksv1.CanUpdateMachineSetResponse{}
-		handler.CanUpdateMachineSet(canUpdateMachineSetRequest(
+		handler.CanUpdateMachineSet(context.Background(), canUpdateMachineSetRequest(
 			workerMachineSet("workers", "v1.33.1", "talosconfig-1"),
 			workerMachineSet("workers", "v1.33.1", "talosconfig-2"),
 			talosConfigTemplateRaw("talosconfig-1", map[string]any{"talosVersion": "v1.12.12", "data": baseConfig}),
