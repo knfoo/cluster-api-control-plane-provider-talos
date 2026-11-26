@@ -297,7 +297,7 @@ func Test_MarkAsPending(t *testing.T) {
 }
 
 // TestTriggerInPlaceUpdateLeavesLabelsToMetadataManager checks that the in-place trigger owns only the
-// spec and the update-in-progress annotation (issue #67). The machine template's labels and annotations
+// spec and the update-in-progress annotation. The machine template's labels and annotations
 // stay owned by the metadata field manager capi-taloscontrolplane-metadata (machine_apply.go:138-165),
 // so a label removed from the machine template and dropped by applyMetadata is gone from the InfraMachine
 // and the TalosConfig after an in-place update, instead of being kept by the trigger's field manager.

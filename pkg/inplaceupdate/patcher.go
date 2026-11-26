@@ -193,9 +193,14 @@ func documents(data []byte) ([]map[string]any, error) {
 }
 
 // configDiff computes the operations that turn one machine configuration into another. Talos
-// machine configurations generated for a Talos version with multidoc support carry the machine
-// and cluster settings in the first document and the extension documents after it, so every
-// document is diffed; only the first one addresses the paths Talos keys by machine and cluster.
+// machine configurations are multi-document: the v1alpha1 document carries the machine and
+// cluster settings, and the documents after it each have a kind (config.Document Kind(),
+// github.com/siderolabs/talos/pkg/machinery/config/config) and, when they are named documents
+// (config.NamedDocument Name()), a name. Documents are paired by that identity rather than by
+// position, so a reordered configuration is no change and a document present on one side only
+// is an add or a remove operation. Only the v1alpha1 document addresses the paths Talos keys by
+// machine and cluster; the operations of the other documents are reported under their kind and
+// name, which the reboot guard does not match.
 func configDiff(current, desired []byte) ([]jsonPatchOp, error) {
 	currentDocs, err := documents(current)
 	if err != nil {
@@ -207,40 +212,97 @@ func configDiff(current, desired []byte) ([]jsonPatchOp, error) {
 		return nil, err
 	}
 
-	if len(currentDocs) != len(desiredDocs) {
-		return nil, fmt.Errorf("the machine configuration documents differ in count: %d and %d", len(currentDocs), len(desiredDocs))
+	currentByKey := make(map[string]map[string]any, len(currentDocs))
+	for _, doc := range currentDocs {
+		currentByKey[documentKey(doc)] = doc
+	}
+
+	desiredByKey := make(map[string]map[string]any, len(desiredDocs))
+	for _, doc := range desiredDocs {
+		desiredByKey[documentKey(doc)] = doc
 	}
 
 	ops := []jsonPatchOp{}
 
-	for index := range currentDocs {
-		prefix := ""
-		if index > 0 {
-			prefix = fmt.Sprintf("/document%d", index)
-		}
+	for _, doc := range currentDocs {
+		key := documentKey(doc)
 
-		currentJSON, err := json.Marshal(currentDocs[index])
-		if err != nil {
-			return nil, fmt.Errorf("decoding machine configuration document: %w", err)
-		}
-
-		desiredJSON, err := json.Marshal(desiredDocs[index])
-		if err != nil {
-			return nil, fmt.Errorf("encoding desired machine configuration document: %w", err)
-		}
-
-		docOps, err := jsonpatch.CreatePatch(currentJSON, desiredJSON)
-		if err != nil {
-			return nil, fmt.Errorf("computing machine configuration patch: %w", err)
-		}
-
-		for _, op := range docOps {
-			if prefix != "" {
-				op.Path = prefix + op.Path
+		if desiredDoc, ok := desiredByKey[key]; ok {
+			docOps, err := documentPatch(key, doc, desiredDoc)
+			if err != nil {
+				return nil, err
 			}
 
-			ops = append(ops, patchOperation(op))
+			ops = append(ops, docOps...)
+
+			continue
 		}
+
+		ops = append(ops, jsonPatchOp{Op: "remove", Path: documentPath(key)})
+	}
+
+	for _, doc := range desiredDocs {
+		key := documentKey(doc)
+
+		if _, ok := currentByKey[key]; !ok {
+			ops = append(ops, jsonPatchOp{Op: "add", Path: documentPath(key), Value: doc})
+		}
+	}
+
+	return ops, nil
+}
+
+// documentKey identifies a machine configuration document: the v1alpha1 document, the only one
+// without a kind, stands for itself, every other document is identified by its kind and name.
+func documentKey(doc map[string]any) string {
+	kind, _ := doc["kind"].(string)
+	if kind == "" {
+		return ""
+	}
+
+	name, _ := doc["name"].(string)
+
+	return kind + "/" + name
+}
+
+// documentPath is the path the operations of a machine configuration document are reported
+// under. The v1alpha1 document keeps the paths Talos keys its settings by.
+func documentPath(key string) string {
+	if key == "" {
+		return ""
+	}
+
+	return "/document/" + key
+}
+
+// documentPatch computes the operations that turn one machine configuration document into
+// another, prefixing the paths of a document other than the v1alpha1 one with its identity.
+func documentPatch(key string, current, desired map[string]any) ([]jsonPatchOp, error) {
+	prefix := documentPath(key)
+
+	currentJSON, err := json.Marshal(current)
+	if err != nil {
+		return nil, fmt.Errorf("decoding machine configuration document: %w", err)
+	}
+
+	desiredJSON, err := json.Marshal(desired)
+	if err != nil {
+		return nil, fmt.Errorf("encoding desired machine configuration document: %w", err)
+	}
+
+	docOps, err := jsonpatch.CreatePatch(currentJSON, desiredJSON)
+	if err != nil {
+		return nil, fmt.Errorf("computing machine configuration patch: %w", err)
+	}
+
+	ops := make([]jsonPatchOp, 0, len(docOps))
+
+	for _, op := range docOps {
+		if prefix != "" {
+			op.Path = prefix + op.Path
+		}
+
+		ops = append(ops, patchOperation(op))
 	}
 
 	return ops, nil

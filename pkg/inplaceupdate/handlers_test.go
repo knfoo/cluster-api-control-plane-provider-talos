@@ -276,6 +276,40 @@ cluster:
   token: bootstrap-token
 `
 
+// volumeConfig is a machine configuration with an extension document besides the v1alpha1 one:
+// a generated machine configuration carries the machine and cluster settings in the v1alpha1
+// document and one document per volume, link or Kubernetes component configuration after it.
+const volumeConfig = baseConfig + `---
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: nvme
+provisioning:
+  local:
+    path: /dev/disk/by-label/system
+`
+
+// changedVolumeConfig changes only that extension document.
+const changedVolumeConfig = baseConfig + `---
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: nvme
+provisioning:
+  local:
+    path: /dev/disk/by-label/data
+`
+
+// clusterTokenConfig changes the cluster token, which Talos only applies after a reboot.
+const clusterTokenConfig = `version: v1alpha1
+machine:
+  network:
+    hostname: control-plane-1
+  files:
+    - path: /var/inplace/first
+      content: original
+cluster:
+  token: new-bootstrap-token
+`
+
 func talosConfigRaw(name string, spec map[string]any) runtime.RawExtension {
 	raw, err := json.Marshal(map[string]any{
 		"apiVersion": "bootstrap.cluster.x-k8s.io/v1alpha3",
@@ -990,6 +1024,71 @@ func TestRebootRequiredReasonIsNotTalosVersionAware(t *testing.T) {
 	g.Expect(rebootRequiredReason(envChange)).To(BeEmpty(), "machine/env is decided by the DryRun of the node, not by its Talos version")
 
 	g.Expect(rebootRequiredReason([]jsonPatchOp{{Op: "replace", Path: "/machine/install/image", Value: "ghcr.io/siderolabs/talos:v1.14.6"}})).NotTo(BeEmpty())
+}
+
+// TestRebootRequiredReasonOnlyGuardsWhatTalosCannotJudge checks the paths the guard in front of
+// the DryRun keeps: the machine install image and the cluster identity, which configDiff reports
+// with the paths Talos keys its settings by. A change in any other machine configuration document
+// is left to the DryRun of the node.
+func TestRebootRequiredReasonOnlyGuardsWhatTalosCannotJudge(t *testing.T) {
+	g := NewWithT(t)
+
+	ops, err := configDiff([]byte(baseConfig), []byte(clusterTokenConfig))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(rebootRequiredReason(ops)).NotTo(BeEmpty(), "a change of cluster/token rolls out")
+
+	ops, err = configDiff([]byte(baseConfig), []byte(rebootConfig))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(rebootRequiredReason(ops)).NotTo(BeEmpty(), "a change of machine/install rolls out")
+
+	for _, path := range []string{"/machine/install", "/cluster/id", "/cluster/secret", "/cluster/token"} {
+		g.Expect(rebootRequiredReason([]jsonPatchOp{{Op: "replace", Path: path, Value: "changed"}})).NotTo(BeEmpty(), path+" is a change Talos cannot apply without a reboot")
+	}
+
+	// machine/boot and machine/swap are not keys of the v1alpha1 machine configuration of the
+	// Talos machinery release the provider pins, so the guard has no entry for them.
+	for _, path := range []string{"/machine/boot", "/machine/swap"} {
+		g.Expect(rebootRequiredReason([]jsonPatchOp{{Op: "replace", Path: path, Value: "changed"}})).To(BeEmpty(), path+" is decided by the DryRun of the node")
+	}
+
+	g.Expect(rebootRequiredReason([]jsonPatchOp{{Op: "add", Path: "/document/VolumeConfig/nvme", Value: map[string]any{}}})).To(BeEmpty(), "a document other than the machine and cluster settings is decided by the DryRun")
+}
+
+// TestCanUpdateMachineDryRunForExtensionDocumentChange checks that a change to a machine
+// configuration document other than the machine and cluster settings is not refused by the reboot
+// guard: it reaches the DryRun of the node, which decides it.
+func TestCanUpdateMachineDryRunForExtensionDocumentChange(t *testing.T) {
+	g := NewWithT(t)
+
+	applier := newFakeApplier()
+	handler := fakeHandler(applier, clusterMetadata())
+
+	resp := &runtimehooksv1.CanUpdateMachineResponse{}
+	handler.CanUpdateMachine(context.Background(),
+		canUpdateRequest(talosConfig("talosconfig-1", volumeConfig), talosConfig("talosconfig-1", changedVolumeConfig), "talos-image", "v1.33.1", "v1.33.1"),
+		resp,
+	)
+
+	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
+	g.Expect(applier.dryRunRuns).To(Equal(1), "the DryRun of the node decides a change in an extension document")
+}
+
+// TestCanUpdateMachineNoPatchForClusterIdentity checks the reboot guard still refuses the changes
+// Talos can only apply after a reboot: the cluster identity of the v1alpha1 document.
+func TestCanUpdateMachineNoPatchForClusterIdentity(t *testing.T) {
+	g := NewWithT(t)
+
+	applier := newFakeApplier()
+	handler := fakeHandler(applier, clusterMetadata())
+
+	resp := &runtimehooksv1.CanUpdateMachineResponse{}
+	handler.CanUpdateMachine(context.Background(),
+		canUpdateRequest(talosConfig("talosconfig-1", baseConfig), talosConfig("talosconfig-1", clusterTokenConfig), "talos-image", "v1.33.1", "v1.33.1"),
+		resp,
+	)
+
+	expectNoInPlaceUpdate(g, resp, applier)
 }
 
 // TestUpdateMachineWaitsForMetadataBeforeApplyingConfiguration covers the two-phase bootstrap

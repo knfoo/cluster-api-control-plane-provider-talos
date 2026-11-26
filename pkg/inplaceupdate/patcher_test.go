@@ -105,3 +105,86 @@ func TestObjectPatch(t *testing.T) {
 	g.Expect(ops).To(ContainElement(jsonPatchOp{Op: "remove", Path: "/spec/dropped"}))
 	g.Expect(ops).To(ContainElement(jsonPatchOp{Op: "add", Path: "/spec/added", Value: "new"}))
 }
+
+// TestConfigDiffPairsDocumentsByKindAndName checks how the documents of a machine configuration
+// are matched: the v1alpha1 document with the machine and cluster settings pairs with the
+// v1alpha1 document, every other document with the document of its kind and name, so the order
+// of the documents is not a change and a document present on one side only is an add or a
+// remove operation rather than an error.
+func TestConfigDiffPairsDocumentsByKindAndName(t *testing.T) {
+	g := NewWithT(t)
+
+	current := `version: v1alpha1
+machine:
+  network:
+    hostname: control-plane-1
+cluster:
+  token: bootstrap-token
+---
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: nvme
+---
+apiVersion: v1alpha1
+kind: LinkConfig
+name: eth0
+`
+
+	reordered := `apiVersion: v1alpha1
+kind: LinkConfig
+name: eth0
+---
+version: v1alpha1
+machine:
+  network:
+    hostname: control-plane-1
+cluster:
+  token: bootstrap-token
+---
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: nvme
+`
+
+	ops, err := configDiff([]byte(current), []byte(reordered))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ops).To(BeEmpty(), "documents paired by kind and name are not changed by their order")
+
+	// A link configuration is replaced by another one, so the documents differ in count: each
+	// document on one side only is an operation, not a reason to refuse the diff.
+	desired := `version: v1alpha1
+machine:
+  network:
+    hostname: control-plane-1
+cluster:
+  token: bootstrap-token
+---
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: nvme
+---
+apiVersion: v1alpha1
+kind: LinkConfig
+name: eth1
+`
+
+	ops, err = configDiff([]byte(current), []byte(desired))
+	g.Expect(err).NotTo(HaveOccurred())
+
+	adds := []jsonPatchOp{}
+	removes := []jsonPatchOp{}
+
+	for _, op := range ops {
+		switch op.Op {
+		case "add":
+			adds = append(adds, op)
+		case "remove":
+			removes = append(removes, op)
+		}
+	}
+
+	g.Expect(adds).To(HaveLen(1))
+	g.Expect(adds[0].Path).To(Equal("/document/LinkConfig/eth1"))
+	g.Expect(removes).To(HaveLen(1))
+	g.Expect(removes[0].Path).To(Equal("/document/LinkConfig/eth0"))
+}

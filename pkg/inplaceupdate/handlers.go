@@ -55,16 +55,14 @@ const (
 	talosConfigSecretKey = "talosconfig"
 )
 
-// rebootRequiredConfigPaths are machine configuration keys Talos can only change by
-// booting the node again. They are a cheap guard in front of the DryRun: the DryRun
-// is the authoritative answer, but these changes never need to reach a node. Everything
-// else, including machine/env, is decided by the DryRun, because whether Talos applies a
-// given change with mode ApplyConfigurationRequest_NO_REBOOT depends on the Talos version
-// of the node.
+// rebootRequiredConfigPaths are the machine configuration keys Talos can only change by booting
+// the node again: the machine install image and the cluster identity. They are the cheap guard in
+// front of the DryRun, so these changes never need to reach a node. Every other change, in any
+// document of the machine configuration, is decided by the DryRun with mode
+// ApplyConfigurationRequest_NO_REBOOT, which is the authoritative answer: whether Talos applies a
+// given change live depends on the Talos version the node runs.
 var rebootRequiredConfigPaths = []string{
 	"machine/install",
-	"machine/boot",
-	"machine/swap",
 	"cluster/id",
 	"cluster/secret",
 	"cluster/token",
@@ -568,10 +566,11 @@ func rolloutReason(req *runtimehooksv1.CanUpdateMachineRequest) string {
 	return ""
 }
 
-// rebootRequiredReason returns the first machine configuration path in the diff that
-// Talos can only apply after a reboot. It is only the cheap guard in front of the DryRun:
-// every other change, machine/env included, is decided by the node, whose Talos version
-// says whether it accepts the change with mode ApplyConfigurationRequest_NO_REBOOT.
+// rebootRequiredReason returns the first machine configuration path in the diff that Talos can
+// only apply after a reboot. It matches the machine install image and the cluster identity of the
+// v1alpha1 document and nothing else: every other change, in any document of the machine
+// configuration, is decided by the DryRun of the node, whose Talos version says whether it accepts
+// the change with mode ApplyConfigurationRequest_NO_REBOOT.
 func rebootRequiredReason(ops []jsonPatchOp) string {
 	for _, op := range ops {
 		path := strings.TrimPrefix(op.Path, "/")
