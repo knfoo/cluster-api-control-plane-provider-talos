@@ -161,12 +161,11 @@ func Test_inPlaceUpdateResultKeepsTheVersionOfAnUpToDateMachine(t *testing.T) {
 	g.Expect(result.DesiredMachine.Spec.Version).To(Equal(machine.Spec.Version))
 }
 
-// Test_tryInPlaceUpdateWritesTheControlPlaneVersionToTheMachine reproduces the failure of e2e run
-// a0892e4-03356e7 end to end, without envtest, the way KubeadmControlPlane tests the decision in
-// inplace_test.go: a Machine of a control plane that has a newer Kubernetes version than the Machine,
-// the fake client holding the Machine and its objects, and the test seams of the in-place path
-// (inplace.go:403-406) standing in for the extension, which patches the Machine's version when the
-// request carries a Kubernetes version change (pkg/inplaceupdate/handlers.go:181, 235).
+// Test_tryInPlaceUpdateWritesTheControlPlaneVersionToTheMachine checks the in-place update decision
+// end to end, without envtest, the way KubeadmControlPlane tests it: a Machine of a control plane that
+// has a newer Kubernetes version than the Machine, the fake client holding the Machine and its objects,
+// and the test seams of the in-place path standing in for the extension, which patches the Machine's
+// version when the request carries a Kubernetes version change.
 //
 // Without the fix the desired Machine has the version of the existing Machine: the extension sees no
 // change, canUpdateMachine reports the Machine as up to date, the trigger writes nothing and the

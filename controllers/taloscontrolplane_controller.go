@@ -84,12 +84,10 @@ type TalosControlPlaneReconciler struct {
 	RuntimeClient RuntimeClient
 
 	// controller is the TalosControlPlane controller, needed to defer a reconcile until the cache
-	// observed an object the controller wrote, as KubeadmControlPlane does for in-place updates
-	// (inplace_trigger.go:61-63, 134).
+	// observed an object the controller wrote, as KubeadmControlPlane does for in-place updates.
 	controller capicontrollerutil.Controller
 
-	// recorder writes the events of the in-place update path, e.g. SuccessfulStartInPlaceUpdate
-	// (inplace_trigger.go:137).
+	// recorder writes the events of the in-place update path, e.g. SuccessfulStartInPlaceUpdate.
 	recorder record.EventRecorder
 
 	// etcd runs etcd operations on individual machines; nil means through the Talos API.
@@ -102,8 +100,7 @@ type TalosControlPlaneReconciler struct {
 	// managed fields are handed over when a Machine is adopted for server-side apply.
 	classicManager string
 
-	// Only used for testing, as in KubeadmControlPlane (kubeadmcontrolplane_controller.go:121-127 of
-	// the Cluster API v1.14.4 reference), whose tests set them (inplace_test.go:81,85). They are nil
+	// Only used for testing, as KubeadmControlPlane does with its in-place update seams. They are nil
 	// otherwise, so the production path always runs canUpdateMachine, tryInPlaceUpdate and
 	// triggerInPlaceUpdate.
 	overrideTryInPlaceUpdate     func(ctx context.Context, controlPlane *ControlPlane, machineToInPlaceUpdate *clusterv1.Machine, machineUpToDateResult UpToDateResult) (bool, error)
@@ -1510,8 +1507,7 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 
 	// Complete the trigger of an in-place update that was interrupted between writing the
 	// UpdateInProgressAnnotation and marking the UpdateMachine hook pending, before anything else is
-	// rolled out. Same reentrancy step as KubeadmControlPlane
-	// (kubeadmcontrolplane_controller.go:501-511 of the Cluster API v1.14.4 reference).
+	// rolled out. This is the same reentrancy step KubeadmControlPlane performs.
 	if machines := controlPlane.MachinesToCompleteTriggerInPlaceUpdate(); len(machines) > 0 {
 		logger.Info("completing the trigger of an in-place update", "machines", machines.Names())
 
@@ -1530,8 +1526,8 @@ func (r *TalosControlPlaneReconciler) reconcileMachines(ctx context.Context, clu
 	}
 
 	// Wait for the in-place update of a Machine to finish before rolling out the next one, like
-	// KubeadmControlPlane does (kubeadmcontrolplane_controller.go:517-523 of the Cluster API v1.14.4
-	// reference). Without this wait a changed TalosControlPlane triggers triggerInPlaceUpdate for every
+	// KubeadmControlPlane does. Without this wait a changed TalosControlPlane triggers
+	// triggerInPlaceUpdate for every
 	// Machine that is not up to date, one per reconcile, so the whole control plane is updated in place
 	// at the same time instead of one Machine after the other.
 	if machines := controlPlane.MachinesToCompleteInPlaceUpdate(); len(machines) > 0 {

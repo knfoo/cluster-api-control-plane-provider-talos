@@ -92,11 +92,9 @@ func (c *extensionRuntimeClient) GetAllExtensions(ctx context.Context, hook runt
 			if handler.RequestHook.Hook != hookName {
 				continue
 			}
-			// Status.Handlers[].Name is already canonical ("HANDLER_NAME.EXTENSION_NAME"): discovery writes it
-			// with NameForHandler (sigs.k8s.io/cluster-api/internal/runtime/client/client.go:217-223) and the
-			// upstream runtime hook registry keys its registrations by it
-			// (sigs.k8s.io/cluster-api/internal/runtime/registry/registry.go:255), so GetAllExtensions returns
-			// it unchanged (client.go:306).
+			// Status.Handlers[].Name is already canonical ("HANDLER_NAME.EXTENSION_NAME"): discovery
+			// writes it that way and the runtime hook registry keys its registrations by it, so
+			// GetAllExtensions returns it unchanged.
 			handlers = append(handlers, handler.Name)
 		}
 	}
@@ -135,10 +133,9 @@ func (c *extensionRuntimeClient) CallExtension(ctx context.Context, hook runtime
 		return errors.Wrapf(err, "failed to call extension handler %q", handler)
 	}
 
-	// An ExtensionConfig is namespaced, so the object behind a handler name is found by listing, like
-	// upstream builds its handler registry from the ExtensionConfig list
-	// (sigs.k8s.io/cluster-api/internal/runtime/registry/registry.go:236-261). A Get by name alone cannot
-	// resolve a namespaced object.
+	// An ExtensionConfig is namespaced, so the object behind a handler name is found by listing, the
+	// way the runtime hook registry builds its registrations from the ExtensionConfig list. A Get by
+	// name alone cannot resolve a namespaced object.
 	extensionConfigs := &runtimev1beta2.ExtensionConfigList{}
 	if err := c.client.List(ctx, extensionConfigs); err != nil {
 		return errors.Wrapf(err, "failed to call extension handler %q: failed to list ExtensionConfig objects", handler)
@@ -160,8 +157,8 @@ func (c *extensionRuntimeClient) CallExtension(ctx context.Context, hook runtime
 		}
 
 		for _, handlerRegistration := range config.Status.Handlers {
-			// handler is the canonical name returned by GetAllExtensions and Status.Handlers[].Name is already
-			// canonical (discovery, client.go:217-223), so they are compared directly.
+			// handler is the canonical name returned by GetAllExtensions and Status.Handlers[].Name is
+			// already canonical, so they are compared directly.
 			if handlerRegistration.Name == handler {
 				extensionConfig = config
 				registration = handlerRegistration
@@ -215,9 +212,8 @@ func (c *extensionRuntimeClient) CallExtension(ctx context.Context, hook runtime
 		return errors.Wrapf(err, "failed to call extension handler %q", handler)
 	}
 
-	// The pinned server name is the host without the port, as createHTTPClient is called with
-	// extensionURL.Hostname() upstream (client.go:531); a ServerName carrying the port never matches the
-	// extension certificate.
+	// The pinned server name is the host without the port, as the runtime client calls its http client
+	// with the URL hostname: a ServerName carrying the port never matches the extension certificate.
 	httpClient, err := extensionHTTPClient(extensionConfig.Spec.ClientConfig.CABundle, extensionURL.Hostname())
 	if err != nil {
 		return errors.Wrapf(err, "failed to call extension handler %q: failed to create the http client", handler)
@@ -383,8 +379,8 @@ func validateResponseStatus(response runtimehooksv1.ResponseObject, operationNam
 }
 
 // UpToDateResult carries the current and desired objects of one control plane Machine that is not up
-// to date, the fork's counterpart of the UpToDateResult KubeadmControlPlane builds before it decides
-// between an in-place update and a rollout (inplace.go:44-53, inplace_trigger.go:81-84).
+// to date, the counterpart of the UpToDateResult KubeadmControlPlane builds before it decides between
+// an in-place update and a rollout.
 //
 // A nil DesiredInfraMachine or DesiredTalosConfig means the objects the in-place update would write
 // could not be computed, which makes the Machine roll out like today.
@@ -397,7 +393,7 @@ type UpToDateResult struct {
 }
 
 // tryInPlaceUpdate decides between an in-place update and the scale down that rolls a Machine out,
-// following tryInPlaceUpdate in inplace.go:44-53.
+// following KubeadmControlPlane's tryInPlaceUpdate.
 //
 // It returns fallbackToScaleDown, which tells the caller to delete the Machine as today. Once the
 // UpdateInProgressAnnotation is written the in-place update is in progress and the Machine is never
@@ -414,7 +410,7 @@ func (r *TalosControlPlaneReconciler) tryInPlaceUpdate(
 	}
 
 	// A Machine cannot be updated in-place when one of the objects the update would write is missing,
-	// e.g. when the InfraMachine or the TalosConfig was deleted (inplace_canupdatemachine.go:58-63).
+	// e.g. when the InfraMachine or the TalosConfig was deleted.
 	if machineUpToDateResult.DesiredMachine == nil ||
 		machineUpToDateResult.CurrentInfraMachine == nil ||
 		machineUpToDateResult.DesiredInfraMachine == nil ||

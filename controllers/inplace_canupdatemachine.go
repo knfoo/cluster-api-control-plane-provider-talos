@@ -25,13 +25,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// canUpdateMachine decides whether a Machine can be updated in place instead of being rolled out. It
-// ports canUpdateMachine of KubeadmControlPlane (inplace_canupdatemachine.go:44-87): after the feature
-// gate and the single-extension rules, the registered CanUpdateMachine extension is called with the
-// current and the desired objects of the Machine, and the answer is true only when the patches the
-// extension returns make the current objects equal the desired ones.
+// canUpdateMachine decides whether a Machine can be updated in place instead of being rolled out,
+// following KubeadmControlPlane's canUpdateMachine: after the feature gate and the single-extension
+// rules, the registered CanUpdateMachine extension is called with the current and the desired objects
+// of the Machine, and the answer is true only when the patches the extension returns make the current
+// objects equal the desired ones.
 //
-// Nothing calls this while the InPlaceUpdates feature gate is off, which is the default (ADR-0003).
+// Nothing calls this while the InPlaceUpdates feature gate is off, which is the default.
 func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) (bool, error) {
 	if r.overrideCanUpdateMachine != nil {
 		return r.overrideCanUpdateMachine(ctx, machine)
@@ -39,7 +39,6 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", klog.KObj(machine))
 
-	// Machine cannot be updated in-place if the feature gate is not enabled (inplace_canupdatemachine.go:52).
 	if !feature.Gates.Enabled(feature.InPlaceUpdates) {
 		return false, nil
 	}
@@ -48,9 +47,9 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 		return false, nil
 	}
 
-	// Machine cannot be updated in-place if the update could not compute all the objects it would
-	// write, e.g. because the InfraMachine or the TalosConfig was deleted (inplace_canupdatemachine.go:58-64).
-	// The guard runs before the extension lookup, as in the reference.
+	// The update cannot run when it could not compute all the objects it would write, e.g. because
+	// the InfraMachine or the TalosConfig was deleted. The guard runs before the extension lookup,
+	// like KubeadmControlPlane's.
 	if machineUpToDateResult.DesiredMachine == nil ||
 		machineUpToDateResult.CurrentInfraMachine == nil ||
 		machineUpToDateResult.DesiredInfraMachine == nil ||
@@ -59,7 +58,6 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 		return false, nil
 	}
 
-	// Machine cannot be updated in-place if no CanUpdateMachine extensions are registered (inplace_canupdatemachine.go:66-73).
 	extensionHandlers, err := r.RuntimeClient.GetAllExtensions(ctx, runtimehooksv1.CanUpdateMachine, machine)
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to get CanUpdateMachine extensions for Machine %s", machine.Name)
@@ -67,7 +65,6 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 	if len(extensionHandlers) == 0 {
 		return false, nil
 	}
-	// Only one extension per hook is supported (inplace_canupdatemachine.go:74-76).
 	if len(extensionHandlers) > 1 {
 		return false, errors.Errorf("found multiple CanUpdateMachine hooks (%s): only one hook is supported", strings.Join(extensionHandlers, ","))
 	}
@@ -76,8 +73,7 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to generate CanUpdateMachine request")
 	}
-	// The dry-run of the InfraMachine can itself rule out an in-place update, as in
-	// inplace_canupdatemachine.go:169-183.
+	// The dry-run of the InfraMachine can itself rule out an in-place update.
 	if reason != "" {
 		log.Info(fmt.Sprintf("Machine %s cannot be updated in-place", klog.KObj(machine)), "reason", reason)
 
@@ -98,7 +94,7 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 }
 
 // canExtensionsUpdateMachine calls the CanUpdateMachine extension and compares the patched current
-// objects with the desired ones, following canExtensionsUpdateMachine in inplace_canupdatemachine.go:92-134.
+// objects with the desired ones, following KubeadmControlPlane's canExtensionsUpdateMachine.
 // A failed call is an error, as in KubeadmControlPlane.
 func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Context, machine *clusterv1.Machine, req *runtimehooksv1.CanUpdateMachineRequest, extensionHandlers []string) (bool, []string, error) {
 	log := ctrl.LoggerFrom(ctx)
@@ -113,8 +109,7 @@ func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Con
 			return false, nil, err
 		}
 
-		// Apply the patches the extension returned to the current objects of the request
-		// (inplace_canupdatemachine.go:116-119).
+		// Apply the patches the extension returned to the current objects of the request.
 		if err := applyPatchesToRequest(req, resp); err != nil {
 			return false, nil, errors.Wrapf(err, "failed to apply patches from extension %s to the CanUpdateMachine request", extensionHandler)
 		}
@@ -136,15 +131,15 @@ func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Con
 }
 
 // createCanUpdateMachineRequest builds the CanUpdateMachine request from the current and desired
-// objects of the Machine, cleaning them up the way createRequest in inplace_canupdatemachine.go:136-221
-// does: only the GVK, name, namespace, labels, annotations and spec are sent, and the current objects
-// take the labels and annotations of the desired ones because the Machine controller syncs them and
-// they are not part of the in-place update (inplace_canupdatemachine.go:146-152).
+// objects of the Machine, cleaning them up the way KubeadmControlPlane's createRequest does: only the
+// GVK, name, namespace, labels, annotations and spec are sent, and the current objects take the labels
+// and annotations of the desired ones because the Machine controller syncs them and they are not part
+// of the in-place update.
 //
 // KubeadmControlPlane additionally runs a server-side apply dry-run on the Machine and the InfraMachine
-// to pick up defaulting (inplace_canupdatemachine.go:160-185). The TalosConfig has no defaulting webhook
-// (no +kubebuilder:default in the bootstrap provider's v1alpha3 API types), so the fork compares the
-// TalosConfig as computed. The InfraMachine is compared with the dry-run, like in the reference: the
+// to pick up defaulting. The TalosConfig has no defaulting webhook (no +kubebuilder:default in the
+// bootstrap provider's v1alpha3 API types), so this provider compares the TalosConfig as computed. The
+// InfraMachine is compared with the dry-run, like KubeadmControlPlane does: the
 // infrastructure provider writes fields - e.g. providerID - on the InfraMachine that the object computed
 // from the InfraMachine template does not have, and without the dry-run they read as a change the
 // in-place update would have to make.
@@ -166,7 +161,7 @@ func createCanUpdateMachineRequest(ctx context.Context, c client.Client, machine
 	currentInfraMachine.SetAnnotations(desiredInfraMachine.GetAnnotations())
 
 	// Apply the defaulting and the fields other controllers wrote on the InfraMachine to both sides of
-	// the diff, so only a real change in the InfraMachine spec counts as a rollout (inplace_canupdatemachine.go:169-183).
+	// the diff, so only a real change in the InfraMachine spec counts as a rollout.
 	if err := dryRunApply(ctx, c, currentInfraMachine); err != nil {
 		// A validating webhook that rejects the InfraMachine also rejects the apply the in-place update
 		// would have to make, so the Machine is rolled out instead.
@@ -231,7 +226,7 @@ func dryRunApply(ctx context.Context, c client.Client, obj *unstructured.Unstruc
 	return c.Apply(ctx, client.ApplyConfigurationFromUnstructured(obj), client.DryRunAll, client.FieldOwner(tcpManagerName))
 }
 
-// cleanupMachine mirrors cleanupMachine of inplace_canupdatemachine.go:223-238.
+// cleanupMachine mirrors KubeadmControlPlane's cleanupMachine.
 func cleanupMachine(machine *clusterv1.Machine) *clusterv1.Machine {
 	return &clusterv1.Machine{
 		// Set GVK because the object is later marshalled with json.Marshal.
@@ -249,7 +244,7 @@ func cleanupMachine(machine *clusterv1.Machine) *clusterv1.Machine {
 	}
 }
 
-// cleanupTalosConfig mirrors cleanupKubeadmConfig of inplace_canupdatemachine.go:240-255 for the
+// cleanupTalosConfig mirrors KubeadmControlPlane's cleanupKubeadmConfig for the
 // TalosConfig of the bootstrap provider: the status is dropped and only the spec is sent.
 func cleanupTalosConfig(talosConfig *cabptv1.TalosConfig) map[string]any {
 	metadata := map[string]any{
@@ -271,7 +266,7 @@ func cleanupTalosConfig(talosConfig *cabptv1.TalosConfig) map[string]any {
 	}
 }
 
-// cleanupUnstructured mirrors cleanupUnstructured of inplace_canupdatemachine.go:257-270.
+// cleanupUnstructured mirrors KubeadmControlPlane's cleanupUnstructured.
 func cleanupUnstructured(u *unstructured.Unstructured) *unstructured.Unstructured {
 	cleanedUpU := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -300,7 +295,7 @@ func convertToRawExtension(obj any) (runtime.RawExtension, error) {
 }
 
 // applyPatchesToRequest applies the patches of the CanUpdateMachine response to the current objects
-// of the request, mirroring applyPatchesToRequest of inplace_canupdatemachine.go:272-292. Only the
+// of the request, mirroring KubeadmControlPlane's applyPatchesToRequest. Only the
 // spec of an object may be patched, as the hook contract requires.
 func applyPatchesToRequest(req *runtimehooksv1.CanUpdateMachineRequest, resp *runtimehooksv1.CanUpdateMachineResponse) error {
 	if resp.MachinePatch.IsDefined() {
@@ -407,8 +402,7 @@ func applyPatch(object map[string]any, patch runtimehooksv1.Patch) error {
 }
 
 // checkPatchOnlyTouchesSpec rejects patches that write outside the spec of an object, the restriction
-// KubeadmControlPlane enforces with the allowed paths of its patch helper
-// (inplace_canupdatemachine.go:274, 281, 286).
+// KubeadmControlPlane enforces with the allowed paths of its patch helper.
 func checkPatchOnlyTouchesSpec(patch runtimehooksv1.Patch) error {
 	switch patch.PatchType {
 	case runtimehooksv1.JSONPatchType:
@@ -444,12 +438,12 @@ func checkPatchOnlyTouchesSpec(patch runtimehooksv1.Patch) error {
 }
 
 // matchesMachine reports whether the patched current objects of the request equal the desired ones,
-// following matchesMachine of inplace_canupdatemachine.go:294-323.
+// following KubeadmControlPlane's matchesMachine.
 func matchesMachine(req *runtimehooksv1.CanUpdateMachineRequest) (bool, []string, error) {
 	var reasons []string
 
-	// The Machine spec is compared after CleanupMachineSpecForDiff (inplace_canupdatemachine.go:325-335),
-	// because fields the Machine controller writes (e.g. bootstrap.dataSecretName) are never the reason
+	// The Machine spec is compared after cleanupMachineSpecForDiff, because fields the Machine
+	// controller writes (e.g. bootstrap.dataSecretName) are never the reason
 	// for an in-place update.
 	match, diff, err := specDiff(cleanupMachineSpecForDiff(&req.Current.Machine.Spec), cleanupMachineSpecForDiff(&req.Desired.Machine.Spec))
 	if err != nil {
@@ -482,9 +476,9 @@ func matchesMachine(req *runtimehooksv1.CanUpdateMachineRequest) (bool, []string
 	return true, nil, nil
 }
 
-// cleanupMachineSpecForDiff mirrors CleanupMachineSpecForDiff of
-// sigs.k8s.io/cluster-api/internal/util/inplace (inplace_canupdatemachine.go:325-335): fields that are
-// never the reason for an in-place update are zeroed before the Machine spec is compared.
+// cleanupMachineSpecForDiff mirrors Cluster API's CleanupMachineSpecForDiff, a helper of its
+// internal in-place update utility that a provider cannot import: fields that are never the reason
+// for an in-place update are zeroed before the Machine spec is compared.
 func cleanupMachineSpecForDiff(spec *clusterv1.MachineSpec) *clusterv1.MachineSpec {
 	spec = spec.DeepCopy()
 

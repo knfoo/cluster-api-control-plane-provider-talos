@@ -5,16 +5,14 @@
 // The in-place update hooks the CACPPT manager serves for Talos machines.
 //
 // It answers CanUpdateMachine and UpdateMachine for a single Machine and CanUpdateMachineSet
-// for the worker Machines of a MachineDeployment (pkg/inplaceupdate/machineset.go). The
-// condition (docs/adr/ADR-0003, amended 2026-11-15) is that a TalosConfig change is handled
-// in place only when it is a machine configuration change that Talos accepts with
-// ApplyConfiguration mode ApplyConfigurationRequest_NO_REBOOT after a DryRun. A Kubernetes
-// version change is handled in place as well, one component at a time the way talosctl
-// upgrade-k8s does it (pkg/inplaceupdate/kubernetes.go): the control-plane components of a
-// control-plane Machine, the kubelet of a worker Machine. Everything else - a Talos version
-// change, a Kubernetes version change that is not the next minor version, an infrastructure
-// change, or a change Talos says needs a reboot - gets no patch, so Cluster API rolls the
-// machine out.
+// for the worker Machines of a MachineDeployment. A TalosConfig change is handled in place
+// only when it is a machine configuration change that Talos accepts with ApplyConfiguration
+// mode ApplyConfigurationRequest_NO_REBOOT after a DryRun. A Kubernetes version change is
+// handled in place as well, one component at a time the way talosctl upgrade-k8s does it: the
+// control-plane components of a control-plane Machine, the kubelet of a worker Machine.
+// Everything else - a Talos version change, a Kubernetes version change that is not the next
+// minor version, an infrastructure change, or a change Talos says needs a reboot - gets no
+// patch, so Cluster API rolls the machine out.
 package inplaceupdate
 
 import (
@@ -125,9 +123,7 @@ func newHandler(metadata MetadataReader, log logr.Logger, timeout time.Duration,
 
 // CanUpdateMachine is the CanUpdateMachine hook. It returns a patch for the
 // TalosConfig object only when the whole change is a machine configuration change
-// that Talos applies with mode NO_REBOOT after a DryRun. ctx is the request context
-// the Runtime SDK server passes to the handler, as in the hook handlers of Cluster
-// API's test extension (test/extension/handlers/inplaceupdate/handlers.go:106).
+// that Talos applies with mode NO_REBOOT after a DryRun.
 func (h *Handler) CanUpdateMachine(ctx context.Context, req *runtimehooksv1.CanUpdateMachineRequest, resp *runtimehooksv1.CanUpdateMachineResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
@@ -164,11 +160,10 @@ func (h *Handler) CanUpdateMachine(ctx context.Context, req *runtimehooksv1.CanU
 		return
 	}
 
-	// The owner's condition (docs/adr/ADR-0003 as amended on 2026-11-15): a Kubernetes
-	// version change of a control-plane Machine is handled in place too, as the
-	// proposal's kcp-version-update example does. The Machine patch carries spec.version,
-	// and the machine configuration the node has to accept is the rendered desired
-	// configuration with the control-plane component images patched step by step, so the
+	// A Kubernetes version change of a control-plane Machine is handled in place too, the way
+	// Cluster API's in-place update hooks for KubeadmControlPlane handle it. The Machine patch
+	// carries spec.version, and the machine configuration the node has to accept is the rendered
+	// desired configuration with the control-plane component images patched step by step, so the
 	// DryRun below covers both changes.
 	config := plan.config
 
@@ -257,11 +252,10 @@ func (h *Handler) CanUpdateMachine(ctx context.Context, req *runtimehooksv1.CanU
 // UpdateMachine is the UpdateMachine hook. It applies the machine configuration with
 // mode NO_REBOOT and is idempotent: a second call with the same desired configuration
 // reports the update as completed. When the node runs Kubernetes components, the
-// configuration applied is the staged one of pkg/inplaceupdate/kubernetes.go, and the
+// configuration applied is the staged one, and the
 // update is completed only when the node reports every Kubernetes component it runs -
 // the control-plane components of a control-plane Machine, the kubelet of a worker
-// Machine - at the Machine's version. ctx is the request context the Runtime SDK server
-// passes to the handler (test/extension/handlers/inplaceupdate/handlers.go:202).
+// Machine - at the Machine's version.
 func (h *Handler) UpdateMachine(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
@@ -553,12 +547,11 @@ func rolloutReason(req *runtimehooksv1.CanUpdateMachineRequest) string {
 	// Machine.Spec.Bootstrap is deliberately not compared. spec.bootstrap.dataSecretName
 	// is written by the Machine controller from the bootstrap config's status, so the
 	// current and the desired Machine differ there for every control-plane Machine even
-	// though nothing about the bootstrap configuration is being rolled out. Cluster API
-	// zeroes the whole bootstrap spec before comparing Machine specs,
-	// inplace_canupdatemachine.go:329-334, which CACPPT mirrors in
-	// controllers/inplace_canupdatemachine.go:441-451. The bootstrap configuration an
-	// in-place update has to apply is the TalosConfig in req.{Current,Desired}.BootstrapConfig,
-	// compared from the rendered machine configuration below.
+	// though nothing about the bootstrap configuration is being rolled out. Cluster API zeroes
+	// the whole bootstrap spec before comparing Machine specs, as this hook does. The bootstrap
+	// configuration an in-place update has to apply is the TalosConfig in
+	// req.{Current,Desired}.BootstrapConfig, compared from the rendered machine configuration
+	// below.
 	if !equalJSON(infraSpec(req.Current.InfrastructureMachine), infraSpec(req.Desired.InfrastructureMachine)) {
 		return "the infrastructure machine spec changes"
 	}
@@ -664,8 +657,8 @@ func (h *Handler) planInPlaceUpdate(
 	return inPlacePlan{ops: ops, config: desiredConfig, versionChange: currentVersion != desiredVersion}, nil
 }
 
-// dryRunReason is the owner's condition of docs/adr/ADR-0003: a machine configuration change
-// is handled in place only when a node accepts it with mode
+// dryRunReason is the rule of the in-place hooks: a machine configuration change is handled
+// in place only when a node accepts it with mode
 // ApplyConfigurationRequest_NO_REBOOT after a DryRun. It asks the node about config and
 // returns why the change has to roll out, or "" when the node accepts it. An error is a
 // failure of the DryRun call itself, which the caller turns into a hook failure or a
@@ -685,11 +678,9 @@ func (h *Handler) dryRunReason(ctx context.Context, applier Applier, endpoint st
 
 // node returns the Talos API address of a machine and the applier that reaches it with the
 // talosconfig the bootstrap provider created for the machine's cluster. Cluster API copies
-// the addresses of the infrastructure machine into the Machine status
-// (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses), but a hook request
-// carries only the spec of the objects ("Only spec is provided, status fields are not
-// included", docs/book/src/tasks/experimental-features/runtime-sdk/implement-in-place-update-hooks.md),
-// so the address is read from the Machine in the management cluster. There is no address
+// the addresses of the infrastructure machine into the Machine status, but a hook request
+// carries only the spec of the objects, so the address is read from the Machine in the
+// management cluster. There is no address
 // setting of the ExtensionConfig and no --endpoint flag to fall back to: a Machine whose
 // infrastructure provider has not reported an address cannot be updated in place.
 func (h *Handler) node(ctx context.Context, machine clusterv1.Machine) (string, Applier, error) {
@@ -806,10 +797,8 @@ func TalosEndpoint(address string) (string, bool) {
 // diff and to patch an object with, but it must never be applied to a node - see
 // UpdateMachine.
 //
-// Follows the bootstrap provider's reconcileGenerate
-// (controllers/talosconfig_controller.go:501-597), which calls the same
-// pkg/machineconfig.Generate and pkg/machineconfig.ApplyPatches, reached
-// through the go.mod replace.
+// Follows the bootstrap provider's reconcileGenerate, which calls the same
+// pkg/machineconfig.Generate and pkg/machineconfig.ApplyPatches.
 func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine) ([]byte, bool, error) {
 	base, standardPatches, err := h.machineConfigBase(ctx, spec, machine)
 	if err != nil {

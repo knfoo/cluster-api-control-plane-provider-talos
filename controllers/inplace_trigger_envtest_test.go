@@ -232,8 +232,8 @@ func Test_inPlaceUpdateEnvtest(t *testing.T) {
 	g.Expect(c.Create(ctx, extensionConfig)).To(Succeed())
 
 	// The discovered extension makes the CanUpdateMachine hook answer yes; calling the hook is not part
-	// of this test, so the override seam stands in for the extension's reply, as in KubeadmControlPlane's
-	// tests (inplace_test.go:40-66).
+	// of this test, so the override seam stands in for the extension's reply, as KubeadmControlPlane's
+	// tests do.
 	r := &TalosControlPlaneReconciler{
 		Client: c,
 		Scheme: scheme,

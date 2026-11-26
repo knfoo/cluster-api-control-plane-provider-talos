@@ -19,7 +19,7 @@ import (
 )
 
 // deferredWrite records one DeferNextReconcileUntilCacheUpToDate call, the cache wait
-// KubeadmControlPlane performs after an in-place update is triggered (inplace_trigger.go:61-63, 134).
+// KubeadmControlPlane performs after an in-place update is triggered.
 type deferredWrite struct {
 	reconciledObject string
 	writtenKind      string
@@ -43,7 +43,7 @@ func (c *recordingController) DeferNextReconcileUntilCacheUpToDate(reconciledObj
 }
 
 // Test_triggerInPlaceUpdateEventAndCacheWait checks the two parts KubeadmControlPlane adds around the
-// trigger writes (inplace_trigger.go:61-63, 134-137): the SuccessfulStartInPlaceUpdate event and the
+// trigger writes: the SuccessfulStartInPlaceUpdate event and the
 // wait for the cache to observe the Machine the trigger wrote.
 func Test_triggerInPlaceUpdateEventAndCacheWait(t *testing.T) {
 	g := NewWithT(t)

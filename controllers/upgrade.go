@@ -41,7 +41,7 @@ func (r *TalosControlPlaneReconciler) upgradeControlPlane(
 		}
 
 		// Without the feature gate, which is off by default, a Machine that is not up to date is
-		// rolled out exactly as before (inplace.go:44-53).
+		// rolled out exactly as before.
 		if !feature.Gates.Enabled(feature.InPlaceUpdates) {
 			return r.scaleDownControlPlane(ctx, cluster, tcp, controlPlane, machinesRequireUpgrade)
 		}

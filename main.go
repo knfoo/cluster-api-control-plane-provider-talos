@@ -86,7 +86,7 @@ func InitFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&healthAddr, "health-addr", ":9440",
 		"The address the health endpoint binds to.")
 	// The manager reads the Cluster API feature gates (InPlaceUpdates among them) from --feature-gates,
-	// as KubeadmControlPlane does (controlplane/kubeadm/main.go:216).
+	// as KubeadmControlPlane does.
 	feature.MutableGates.AddFlag(fs)
 	flags.AddManagerOptions(fs, &managerOptions)
 }

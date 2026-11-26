@@ -50,9 +50,9 @@ func (s NodeStatus) hasControlPlane() bool {
 }
 
 // applyConfigurationRequest builds the Talos API request for a machine
-// configuration. The owner's condition for in-place updates (ADR-0003) is that
-// Talos must accept the change with mode ApplyConfigurationRequest_NO_REBOOT after
-// a DryRun, so every request the hooks send is a NO_REBOOT request and the
+// configuration. A machine configuration is changed in place only when Talos accepts
+// it with mode ApplyConfigurationRequest_NO_REBOOT after a DryRun, so every request the
+// hooks send is a NO_REBOOT request and the
 // DryRun flag distinguishes the check from the real apply.
 func applyConfigurationRequest(data []byte, dryRun bool) *machineapi.ApplyConfigurationRequest {
 	return &machineapi.ApplyConfigurationRequest{

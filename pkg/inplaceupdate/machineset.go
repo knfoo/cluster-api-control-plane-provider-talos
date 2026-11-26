@@ -5,26 +5,20 @@
 // CanUpdateMachineSet, the MachineDeployment hook that plans the in-place update of a
 // MachineSet, i.e. of the worker Machines of a MachineDeployment.
 //
-// The MachineDeployment controller calls CanUpdateMachineSet when a MachineSet is rolled
-// out ("This hook is called by the MachineDeployment controller when performing the 'can
-// update in-place' for all the Machines controlled by a MachineSet",
-// docs/book/src/tasks/experimental-features/runtime-sdk/implement-in-place-update-hooks.md),
-// applies the returned patches to the current objects of the request and then compares
-// current and desired (machinedeployment_canupdatemachineset.go: canExtensionsUpdateMachineSet,
-// applyPatchesToRequest, matchesMachineSet). Only the spec of the objects is compared, the
-// bootstrap config reference of the MachineSet spec is cleaned up before the diff, so the
-// hook patches the TalosConfigTemplate's spec.template.spec and the Kubernetes version
-// of the MachineSet template. Everything else - an infrastructure machine template, a
-// Talos version, a machine configuration change Talos can only apply with a reboot - gets
-// no patch, which leaves current and desired different and makes Cluster API roll the
-// MachineSet out (docs/adr/ADR-0003).
+// The MachineDeployment controller calls CanUpdateMachineSet before rolling out a MachineSet,
+// applies the returned patches to the current objects of the request and then compares current
+// and desired. Only the spec of the objects is compared and the bootstrap config reference of
+// the MachineSet spec is cleaned up before the diff, so the hook patches the
+// TalosConfigTemplate's spec.template.spec and the Kubernetes version of the MachineSet
+// template. Everything else - an infrastructure machine template, a Talos version, a machine
+// configuration change Talos can only apply with a reboot - gets no patch, which leaves
+// current and desired different and makes Cluster API roll the MachineSet out.
 //
 // The request carries no Machine objects, so the machine configuration of the rollout is
-// rendered from the MachineSet template spec and the Machines of the machine set are read
-// from the management cluster through the MachineSetNameLabel (pkg/inplaceupdate/metadata.go).
-// The rendered desired configuration is DryRun against a live Machine of the machine set,
-// the owner's condition of docs/adr/ADR-0003 that a change is handled in place only when
-// Talos accepts it with mode ApplyConfigurationRequest_NO_REBOOT: a node that needs a
+// rendered from the MachineSet template spec and the Machines of the machine set are read from
+// the management cluster through the MachineSetNameLabel. The rendered desired configuration is
+// DryRun against a live Machine of the machine set: a change is handled in place only when
+// Talos accepts it with mode ApplyConfigurationRequest_NO_REBOOT, so a node that needs a
 // reboot, or that refuses the configuration in immediate mode, gets no patch and the
 // MachineSet is rolled out.
 package inplaceupdate
@@ -39,13 +33,10 @@ import (
 )
 
 // CanUpdateMachineSet is the CanUpdateMachineSet hook. It shares the pipeline of the
-// CanUpdateMachine hook (pkg/inplaceupdate/handlers.go: planInPlaceUpdate): decode the
-// machine configuration spec of the current and the desired TalosConfigTemplate, render the
-// machine configuration, diff it and check the reboot guard; only the DryRun against a node
-// of the machine set is specific to a MachineSet rollout.
-// ctx is the request context the Runtime SDK server passes to the handler, as in the
-// handlers of Cluster API's test extension
-// (test/extension/handlers/inplaceupdate/handlers.go:153).
+// CanUpdateMachine hook, planInPlaceUpdate: decode the machine configuration spec of the
+// current and the desired TalosConfigTemplate, render the machine configuration, diff it and
+// check the reboot guard; only the DryRun against a node of the machine set is specific to a
+// MachineSet rollout.
 func (h *Handler) CanUpdateMachineSet(ctx context.Context, req *runtimehooksv1.CanUpdateMachineSetRequest, resp *runtimehooksv1.CanUpdateMachineSetResponse) {
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 

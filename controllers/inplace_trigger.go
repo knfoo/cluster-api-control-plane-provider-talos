@@ -29,8 +29,7 @@ import (
 // triggerInPlaceUpdate writes the desired Machine, InfraMachine and TalosConfig of a control plane
 // Machine, marks all of them with the UpdateInProgressAnnotation and marks the UpdateMachine hook
 // pending on the Machine, which is what the control plane contract asks of a provider that supports
-// in-place updates (control-plane.md:717-722). It follows triggerInPlaceUpdate of KubeadmControlPlane
-// (inplace_trigger.go:46-137).
+// in-place updates. It follows KubeadmControlPlane's triggerInPlaceUpdate.
 //
 // Nothing calls it while the InPlaceUpdates feature gate is off, which is the default.
 func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, controlPlane *ControlPlane, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) error {
@@ -41,7 +40,7 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 	log := ctrl.LoggerFrom(ctx).WithValues("Machine", klog.KObj(machine))
 	log.Info(fmt.Sprintf("Triggering in-place update for Machine %s", klog.KObj(machine)))
 
-	// Mark the Machine for the in-place update (inplace_trigger.go:51-63). Intentionally a MergeFrom
+	// Mark the Machine for the in-place update. Intentionally a MergeFrom
 	// patch and not server-side apply: the Machine controller removes the annotation when the update
 	// is done, and an apply would race with it over the ownership of the annotation.
 	if _, ok := machine.Annotations[clusterv1.UpdateInProgressAnnotation]; !ok {
@@ -56,8 +55,7 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 		}
 
 		// Wait until the cache observed the Machine with the UpdateInProgressAnnotation, so that the next
-		// reconcile sees it and does not trigger a second in-place update concurrently
-		// (inplace_trigger.go:61-63).
+		// reconcile sees it and does not trigger a second in-place update concurrently.
 		r.deferUntilCacheUpToDate(controlPlane, capicontrollerutil.StructuredObject(clusterv1.GroupVersion, "Machine"), machine.ResourceVersion)
 	}
 
@@ -66,7 +64,7 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 	desiredTalosConfig := machineUpToDateResult.DesiredTalosConfig
 
 	// The Machine cannot be updated in-place if the desired objects could not be computed, e.g.
-	// because the InfraMachine or the TalosConfig was deleted (inplace_trigger.go:86-91).
+	// because the InfraMachine or the TalosConfig was deleted.
 	if desiredInfraMachine == nil {
 		return errors.Errorf("failed to complete triggering in-place update for Machine %s, could not compute desired InfraMachine", klog.KObj(machine))
 	}
@@ -74,7 +72,7 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 		return errors.Errorf("failed to complete triggering in-place update for Machine %s, could not compute desired TalosConfig", klog.KObj(machine))
 	}
 
-	// Write the InfraMachine first: it is the write most likely to fail (inplace_trigger.go:92-104).
+	// Write the InfraMachine first: it is the write most likely to fail.
 	// The Machine controller waits for the UpdateInProgressAnnotation on the Machine and its related
 	// objects before starting the in-place update.
 	if err := r.applyOwned(ctx, withUpdateInProgressAnnotation(desiredInfraMachine)); err != nil {
@@ -92,18 +90,18 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 	}
 
 	// Once the pending hook is written the Machine controller starts the in-place update, and the
-	// UpdateMachine hook is called by the registered extension (inplace_trigger.go:127-132).
+	// UpdateMachine hook is called by the registered extension.
 	if err := MarkAsPending(ctx, r.Client, desiredMachine, true, runtimehooksv1.UpdateMachine); err != nil {
 		return errors.Wrapf(err, "failed to complete triggering in-place update for Machine %s", klog.KObj(machine))
 	}
 
 	// MarkAsPending patched the Machine, so its resource version changed. Waiting for the cache to
-	// observe it keeps the next reconcile from acting on a stale Machine (inplace_trigger.go:130-134).
+	// observe it keeps the next reconcile from acting on a stale Machine.
 	r.deferUntilCacheUpToDate(controlPlane, capicontrollerutil.StructuredObject(clusterv1.GroupVersion, "Machine"), desiredMachine.ResourceVersion)
 
 	log.Info(fmt.Sprintf("Completed triggering in-place update for Machine %s", klog.KObj(machine)))
 
-	// The event KubeadmControlPlane emits when an in-place update is triggered (inplace_trigger.go:137).
+	// The event KubeadmControlPlane emits when an in-place update is triggered.
 	if r.recorder != nil {
 		r.recorder.Event(machine, corev1.EventTypeNormal, "SuccessfulStartInPlaceUpdate", "Machine starting in-place update")
 	}
@@ -113,7 +111,7 @@ func (r *TalosControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context, 
 
 // deferUntilCacheUpToDate tells the controller not to reconcile the TalosControlPlane again before the
 // cache observed the object the in-place update just wrote, mirroring KubeadmControlPlane's
-// DeferNextReconcileUntilCacheUpToDate calls (inplace_trigger.go:61-63, 134).
+// DeferNextReconcileUntilCacheUpToDate calls.
 //
 // Both handles are nil when the reconciler was built without a manager, which is how the tests of this
 // fork construct it, and then there is nothing to defer.
@@ -148,15 +146,15 @@ func withUpdateInProgressAnnotation(obj client.Object) client.Object {
 // under the field manager of the TalosControlPlane, forcing ownership of the fields it sets.
 //
 // The trigger owns only the spec and the UpdateInProgressAnnotation, the way KubeadmControlPlane's
-// trigger writes the spec and the annotations it manages and nothing else (inplace_trigger.go:89-114).
-// The machine template's labels and annotations are applied by the metadata field manager,
-// capi-taloscontrolplane-metadata (machine_apply.go:138-165), so they are deliberately left out of
+// trigger writes the spec and the annotations it manages and nothing else. The machine template's
+// labels and annotations are applied by the metadata field manager,
+// capi-taloscontrolplane-metadata, so they are deliberately left out of
 // this apply: the two managers never own the same fields, and a label or annotation removed from the
 // template is removed from the object by the metadata manager rather than left behind by the trigger.
 //
 // InfraMachines and TalosConfigs are created with Create by this controller, so their spec is owned by
 // the manager that created them; an apply that is not forced would conflict with it and could not
-// unset fields (20240807-in-place-updates-implementation-notes.md:194-227).
+// unset fields.
 func (r *TalosControlPlaneReconciler) applyOwned(ctx context.Context, obj client.Object) error {
 	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
@@ -185,8 +183,8 @@ func (r *TalosControlPlaneReconciler) applyOwned(ctx context.Context, obj client
 
 	// Only the update-in-progress annotation and the annotations that record the template the object was
 	// cloned from are owned here; the labels and the rest of the annotations belong to the metadata field
-	// manager (machine_apply.go:138-165). KubeadmControlPlane's trigger keeps the cloned-from annotations
-	// for the same reason (inplace_trigger.go:92-99): rollouts match machines by their infrastructure
+	// manager. KubeadmControlPlane's trigger keeps the cloned-from annotations for the same
+	// reason: rollouts match machines by their infrastructure
 	// template through them.
 	annotations := map[string]string{}
 	for key, value := range obj.GetAnnotations() {

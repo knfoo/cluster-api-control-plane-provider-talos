@@ -36,10 +36,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// fakeRuntimeClient stands in for the fake RuntimeClient of Cluster API's Runtime SDK
-// (NewRuntimeClientBuilder().WithGetAllExtensionResponses(...).Build(), used at
-// inplace_canupdatemachine_test.go:154 in the KCP reference). Cluster API keeps that fake in an
-// internal/ package a provider cannot import, so the fork carries its own.
+// fakeRuntimeClient stands in for the fake RuntimeClient of Cluster API's Runtime SDK. Cluster API
+// keeps that fake in an internal package a provider cannot import, so this provider carries its own.
 type fakeRuntimeClient struct {
 	getAllExtensions map[string][]string
 	err              error
@@ -57,17 +55,16 @@ func (f *fakeRuntimeClient) GetAllExtensions(_ context.Context, hook runtimecata
 	return f.getAllExtensions[runtimecatalog.HookName(hook)], nil
 }
 
-// CallExtension is the fake counterpart of the Runtime SDK fake that Cluster API keeps in an internal/
-// package (inplace_canupdatemachine_test.go:154). The CanUpdateMachine hook call is exercised by the
-// fake in inplace_canupdatemachine_test.go.
+// CallExtension is the fake counterpart of the Runtime SDK fake that Cluster API keeps in an internal
+// package. The CanUpdateMachine hook call is exercised in inplace_canupdatemachine_test.go.
 func (f *fakeRuntimeClient) CallExtension(_ context.Context, _ runtimecatalog.Hook, _ client.Object, _ string, _ runtimehooksv1.RequestObject, response runtimehooksv1.ResponseObject) error {
 	response.SetStatus(runtimehooksv1.ResponseStatusSuccess)
 
 	return nil
 }
 
-// TestCanUpdateMachine mirrors the KCP canUpdateMachine test cases (inplace_canupdatemachine_test.go:86-145):
-// the feature gate, zero extensions and more than one extension.
+// TestCanUpdateMachine mirrors KubeadmControlPlane's canUpdateMachine test cases: the feature gate,
+// zero extensions and more than one extension.
 func TestCanUpdateMachine(t *testing.T) {
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
@@ -352,8 +349,8 @@ func fullUpToDateResult() UpToDateResult {
 	}
 }
 
-// Test_tryInPlaceUpdate mirrors the tryInPlaceUpdate test of KubeadmControlPlane (inplace_test.go:40-66):
-// the decision and the trigger are overridden, and the test checks that a Machine that cannot be
+// Test_tryInPlaceUpdate mirrors the tryInPlaceUpdate test of KubeadmControlPlane: the decision and the
+// trigger are overridden, and the test checks that a Machine that cannot be
 // updated in place falls back to the scale down that rolls it out, while one that can is triggered.
 func Test_tryInPlaceUpdate(t *testing.T) {
 	machineToInPlaceUpdate := &clusterv1.Machine{
@@ -459,9 +456,9 @@ func Test_tryInPlaceUpdate(t *testing.T) {
 	}
 }
 
-// rollingUpdateControlPlane returns a three-Machine control plane whose TalosConfig is outdated on every
-// Machine, the state the e2e run e2e-849a0df-0928bcc reached when the in-place update step failed, along
-// with the MachineList reconcileMachines expects.
+// rollingUpdateControlPlane returns a three-Machine control plane whose TalosConfig is outdated on
+// every Machine, the state a rolling update of an outdated control plane reaches, along with the
+// MachineList reconcileMachines expects.
 func rollingUpdateControlPlane(machines []*clusterv1.Machine) (*clusterv1.Cluster, *controlplanev1.TalosControlPlane, *ControlPlane, *clusterv1.MachineList) {
 	tcp := &controlplanev1.TalosControlPlane{
 		ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: metav1.NamespaceDefault},
@@ -492,12 +489,11 @@ func rollingUpdateControlPlane(machines []*clusterv1.Machine) (*clusterv1.Cluste
 	}, &machineList
 }
 
-// TestReconcileMachinesWaitsForInProgressInPlaceUpdate covers the failure of e2e run
-// e2e-849a0df-0928bcc: the in-place update step failed because the reconciler started an in-place update
-// for every Machine that is not up to date, one per reconcile, so all control plane Machines were marked
-// in-progress at the same time. KubeadmControlPlane waits for the update in progress to finish before
-// rolling out the next Machine (kubeadmcontrolplane_controller.go:517-523 of the Cluster API v1.14.4
-// reference); without that wait a second Machine is triggered while the first is still being updated.
+// TestReconcileMachinesWaitsForInProgressInPlaceUpdate checks that the reconciler does not start an
+// in-place update for every Machine that is not up to date, one per reconcile, which would mark all
+// control plane Machines in progress at the same time. KubeadmControlPlane waits for the update in
+// progress to finish before rolling out the next Machine; without that wait a second Machine is
+// triggered while the first is still being updated.
 func TestReconcileMachinesWaitsForInProgressInPlaceUpdate(t *testing.T) {
 
 	g := NewWithT(t)
@@ -542,8 +538,8 @@ func TestReconcileMachinesWaitsForInProgressInPlaceUpdate(t *testing.T) {
 }
 
 // TestReconcileMachinesCompletesInterruptedInPlaceUpdateTrigger covers the reentrancy step of
-// KubeadmControlPlane (kubeadmcontrolplane_controller.go:501-511 of the Cluster API v1.14.4 reference):
-// if triggerInPlaceUpdate failed after writing the UpdateInProgressAnnotation and before marking the
+// KubeadmControlPlane: if triggerInPlaceUpdate failed after writing the UpdateInProgressAnnotation and
+// before marking the
 // UpdateMachine hook pending, the next reconcile completes the trigger instead of waiting forever for an
 // update that never started.
 func TestReconcileMachinesCompletesInterruptedInPlaceUpdateTrigger(t *testing.T) {

@@ -24,9 +24,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// hookRuntimeClient is the fork's counterpart of the fake RuntimeClient of Cluster API's Runtime SDK,
-// which KubeadmControlPlane uses in canUpdateMachine tests (inplace_canupdatemachine_test.go:154). It
-// answers both GetAllExtensions and CallExtension.
+// hookRuntimeClient is the counterpart of the fake RuntimeClient of Cluster API's Runtime SDK that
+// KubeadmControlPlane uses in its canUpdateMachine tests. It answers both GetAllExtensions and
+// CallExtension.
 type hookRuntimeClient struct {
 	handlers []string
 	getErr   error
@@ -141,8 +141,8 @@ func testUpToDateResult() UpToDateResult {
 	}
 }
 
-// TestCanUpdateMachineIgnoresFieldsTheMachineControllerWrites mirrors the reference behaviour: the
-// Machine spec is compared after CleanupMachineSpecForDiff (inplace_canupdatemachine.go:325-335), so a
+// TestCanUpdateMachineIgnoresFieldsTheMachineControllerWrites mirrors KubeadmControlPlane: the
+// Machine spec is compared after cleanupMachineSpecForDiff, so a
 // field the Machine controller writes on the current Machine, such as bootstrap.dataSecretName, does not
 // force a rollout when the extension only patches the TalosConfig.
 func TestCanUpdateMachineIgnoresFieldsTheMachineControllerWrites(t *testing.T) {
@@ -152,7 +152,7 @@ func TestCanUpdateMachineIgnoresFieldsTheMachineControllerWrites(t *testing.T) {
 
 	machine := testCurrentMachine()
 	// The Machine controller writes bootstrap.dataSecretName on the Machine as the API server holds it;
-	// computeDesiredMachine (controllers/machine_apply.go:58-70) does not set it.
+	// computeDesiredMachine does not set it.
 	dataSecretName := "machine-to-in-place-update-bootstrap-secret"
 	machine.Spec.Bootstrap.DataSecretName = &dataSecretName
 
@@ -260,8 +260,8 @@ func TestCanUpdateMachineHookCall(t *testing.T) {
 
 			result := testUpToDateResult()
 			if tt.alreadyEqual {
-				// Mirror the reference's nonEmptyMachineUpToDateResult (inplace_canupdatemachine_test.go:59-67):
-				// the current and the desired objects are equal, so an extension that returns no patch answers true.
+				// As in KubeadmControlPlane's canUpdateMachine tests: the current and the desired
+				// objects are equal, so an extension that returns no patch answers true.
 				result.DesiredInfraMachine.Object["spec"] = result.CurrentInfraMachine.Object["spec"]
 				result.DesiredTalosConfig.Spec = *result.CurrentTalosConfig.Spec.DeepCopy()
 			}
@@ -281,9 +281,8 @@ func TestCanUpdateMachineHookCall(t *testing.T) {
 	}
 }
 
-// TestCanUpdateMachineNilObjects checks the guard that runs before the extension lookup
-// (inplace_canupdatemachine.go:58-64): when the update could not compute all the objects, the Machine
-// is a rollout and no extension is looked up.
+// TestCanUpdateMachineNilObjects checks the guard that runs before the extension lookup: when the
+// update could not compute all the objects, the Machine is a rollout and no extension is looked up.
 func TestCanUpdateMachineNilObjects(t *testing.T) {
 	g := NewWithT(t)
 
@@ -305,9 +304,9 @@ func TestCanUpdateMachineNilObjects(t *testing.T) {
 	g.Expect(r.RuntimeClient.(*hookRuntimeClient).callExtensionCalls).To(Equal(0))
 }
 
-// TestCanUpdateMachineInfraMachineWithoutDryRun covers the fork's deviation from KubeadmControlPlane:
-// the InfraMachine is compared without the SSA dry-run KCP uses for defaulting
-// (inplace_canupdatemachine.go:160-185). An InfraMachine whose spec carries fields the infrastructure
+// TestCanUpdateMachineInfraMachineWithoutDryRun covers the deviation from KubeadmControlPlane: the
+// InfraMachine is compared without the SSA dry-run KubeadmControlPlane uses for defaulting. An
+// InfraMachine whose spec carries fields the infrastructure
 // provider wrote is still matched when the extension patches them.
 func TestCanUpdateMachineInfraMachineWithoutDryRun(t *testing.T) {
 	g := NewWithT(t)
@@ -387,8 +386,8 @@ func TestCanUpdateMachineInfraMachineProviderWrittenFields(t *testing.T) {
 	g.Expect(canUpdateMachine).To(BeTrue())
 	g.Expect(r.RuntimeClient.(*hookRuntimeClient).callExtensionCalls).To(Equal(1))
 }
-// GVK, metadata and spec of the objects, the cleanup KubeadmControlPlane applies before calling the hook
-// (inplace_canupdatemachine.go:136-221).
+// TestCanUpdateMachineRequestIsCleanedUp checks that the request carries only the GVK, metadata and
+// spec of the objects, the cleanup KubeadmControlPlane applies before calling the hook.
 func TestCanUpdateMachineRequestIsCleanedUp(t *testing.T) {
 	g := NewWithT(t)
 

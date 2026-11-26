@@ -45,21 +45,18 @@ type MetadataReader interface {
 
 	// MachineAddresses returns the addresses of a machine in the order Cluster API reports
 	// them in Machine status.addresses, or nil when the Machine does not exist yet or has no
-	// addresses. Machine status.addresses is a list of MachineAddress objects (type and
-	// address), not a list of strings. Cluster API copies them from the infrastructure
-	// provider reference (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineStatus.Addresses)
-	// and a hook request carries only the spec of the objects ("Only spec is provided, status
-	// fields are not included", docs/book/src/tasks/experimental-features/runtime-sdk/
-	// implement-in-place-update-hooks.md), so this is how a hook reaches a node.
+	// addresses. Machine status.addresses is a list of MachineAddress objects, not a list of
+	// strings, and a hook request carries only the spec of the objects, not their status, so
+	// this is how a hook reaches a node.
 	MachineAddresses(ctx context.Context, namespace, name string) ([]clusterv1.MachineAddress, error)
 }
 
 // ControlPlaneMachineReader lists the control-plane Machines of a cluster. It is an
 // optional capability of a MetadataReader: the bootstrap provider's control-plane controller
-// labels every control-plane Machine with the cluster name and the control-plane label
-// (controllers/taloscontrolplane_controller.go:669-670), so the hook can find the peers of
-// the machine it is updating and wait for the whole control plane to reach the target
-// Kubernetes version before syncing the bootstrap manifests to the workload cluster.
+// labels every control-plane Machine with the cluster name and the control-plane label, so the
+// hook can find the peers of the machine it is updating and wait for the whole control plane to
+// reach the target Kubernetes version before syncing the bootstrap manifests to the workload
+// cluster.
 type ControlPlaneMachineReader interface {
 	// ControlPlaneMachines returns the Machines of the cluster's control plane.
 	ControlPlaneMachines(ctx context.Context, namespace, clusterName string) ([]clusterv1.Machine, error)
@@ -67,12 +64,10 @@ type ControlPlaneMachineReader interface {
 
 // MachineSetMachineReader lists the Machines Cluster API currently assigns to a machine
 // set. It is an optional capability of a MetadataReader, like ControlPlaneMachineReader: the
-// CanUpdateMachineSet request carries no Machine objects ("Only spec is provided, status
-// fields are not included", docs/book/src/tasks/experimental-features/runtime-sdk/
-// implement-in-place-update-hooks.md), so the hook has to read the management cluster to
-// find a live Machine of the machine set it can DryRun the machine configuration against.
-// Cluster API labels every Machine of a machine set with the name of the set
-// (sigs.k8s.io/cluster-api/api/core/v1beta2.MachineSetNameLabel).
+// CanUpdateMachineSet request carries no Machine objects, so the hook has to read the
+// management cluster to find a live Machine of the machine set it can DryRun the machine
+// configuration against. Cluster API labels every Machine of a machine set with the name of
+// the set.
 type MachineSetMachineReader interface {
 	// MachineSetMachines returns the Machines of the machine set, or an empty list when the
 	// machine set has no Machines yet.
@@ -168,7 +163,7 @@ func metadataSecret(spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine
 }
 
 // secretsBundleSecretName is the name the bootstrap provider stores the cluster's
-// Talos secrets bundle under: controllers/secrets.go:53 of the bootstrap provider.
+// Talos secrets bundle under.
 func secretsBundleSecretName(clusterName string) string {
 	return clusterName + "-talos"
 }
@@ -181,9 +176,7 @@ func secretsBundleSecretName(clusterName string) string {
 // Talos secrets bundle, the Kubernetes version and the hostname source) and hands them to
 // Generate.
 //
-// Follows the bootstrap provider's generateConfigs
-// (controllers/talosconfig_controller.go:754-824) and its secrets bundle loading
-// (controllers/secrets.go:63-104).
+// Follows the bootstrap provider's generateConfigs and its secrets bundle loading.
 func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine) (string, []string, error) {
 	switch spec.GenerateType {
 	case "none", "":
@@ -209,7 +202,7 @@ func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1beta1.Talos
 	}
 
 	// The hostname is only set for machines, not machine pools, and the hook request
-	// always carries a Machine (controllers/talosconfig_controller.go:780-789).
+	// always carries a Machine.
 	hostname := ""
 
 	switch spec.Hostname.Source {
@@ -237,8 +230,7 @@ func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1beta1.Talos
 // clusterSecretsBundle reads the Talos secrets bundle the bootstrap provider generated for
 // the cluster. The hooks never create a bundle: without one the machine configuration
 // cannot be rendered and the machine is rolled out instead.
-// Ported from the read branch of the bootstrap provider's getSecretsBundle
-// (controllers/secrets.go:83-104).
+// Ported from the read branch of the bootstrap provider's getSecretsBundle.
 func (h *Handler) clusterSecretsBundle(ctx context.Context, cluster *clusterv1.Cluster, namespace string) (*secrets.Bundle, error) {
 	name := secretsBundleSecretName(cluster.Name)
 
@@ -262,7 +254,7 @@ func (h *Handler) clusterSecretsBundle(ctx context.Context, cluster *clusterv1.C
 	}
 
 	// The legacy bundle format, still present on clusters bootstrapped before the bundle
-	// key was introduced (controllers/secrets.go:92-103).
+	// key was introduced.
 	if err := yaml.Unmarshal(data["certs"], &bundle.Certs); err != nil {
 		return nil, errors.Wrapf(err, "decoding the Talos certificates of cluster %q", cluster.Name)
 	}
@@ -281,10 +273,10 @@ func (h *Handler) clusterSecretsBundle(ctx context.Context, cluster *clusterv1.C
 }
 
 // templateContext builds the data pkg/machineconfig.TemplateData renders the strategicPatches
-// templates with, following resolveTemplateData of the bootstrap provider
-// (controllers/talosconfig_controller.go:606-644). It returns nil when the TalosConfig uses
-// no templates, and metadataPending=true while the metadata secret metadataFrom names, which
-// the infrastructure provider (Metal3/CAPM3) creates after the bootstrap data, does not exist.
+// templates with, following resolveTemplateData of the bootstrap provider. It returns nil when
+// the TalosConfig uses no templates, and metadataPending=true while the metadata secret
+// metadataFrom names, which the infrastructure provider (Metal3/CAPM3) creates after the
+// bootstrap data, does not exist.
 func (h *Handler) templateContext(ctx context.Context, spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine) (map[string]any, bool, error) {
 	if spec.MetadataFrom == nil && len(spec.TemplateVariables) == 0 {
 		return nil, false, nil

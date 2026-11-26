@@ -183,7 +183,7 @@ func inPlaceUpdateScheme() (*runtime.Scheme, error) {
 	return scheme, nil
 }
 
-// Test_triggerInPlaceUpdate mirrors the trigger test of KubeadmControlPlane (inplace_trigger_test.go):
+// Test_triggerInPlaceUpdate mirrors the in-place update trigger test of KubeadmControlPlane:
 // the Machine, its InfraMachine and its TalosConfig carry the UpdateInProgressAnnotation, the
 // UpdateMachine hook is marked pending on the Machine, and no Machine is deleted.
 func Test_triggerInPlaceUpdate(t *testing.T) {
@@ -298,8 +298,8 @@ func Test_MarkAsPending(t *testing.T) {
 
 // TestTriggerInPlaceUpdateLeavesLabelsToMetadataManager checks that the in-place trigger owns only the
 // spec and the update-in-progress annotation. The machine template's labels and annotations
-// stay owned by the metadata field manager capi-taloscontrolplane-metadata (machine_apply.go:138-165),
-// so a label removed from the machine template and dropped by applyMetadata is gone from the InfraMachine
+// stay owned by the metadata field manager capi-taloscontrolplane-metadata, so a label removed from
+// the machine template and dropped by applyMetadata is gone from the InfraMachine
 // and the TalosConfig after an in-place update, instead of being kept by the trigger's field manager.
 // envtest is required because the fake client does not track managed fields.
 func TestTriggerInPlaceUpdateLeavesLabelsToMetadataManager(t *testing.T) {
@@ -366,7 +366,7 @@ func TestTriggerInPlaceUpdateLeavesLabelsToMetadataManager(t *testing.T) {
 
 	// Create the InfraMachine and the TalosConfig the way the controller does: the spec under the
 	// TalosControlPlane field manager, the machine template's labels and annotations under the metadata
-	// field manager (machine_apply.go:138-165).
+	// field manager.
 	infraForCreate := infraMachine.DeepCopy()
 	infraForCreate.SetLabels(nil)
 	infraForCreate.SetAnnotations(withoutKeys(infraForCreate.GetAnnotations(), templateAnnotations))

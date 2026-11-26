@@ -381,12 +381,10 @@ func TestCanUpdateMachineWorkerMachineConfigChange(t *testing.T) {
 	g.Expect(applier.endpoints).To(ContainElement("10.0.0.2"))
 }
 
-// TestUpdateMachineWorkerKubernetesVersionUpgradesKubeletOnly checks the worker half of the
-// owner's condition (ADR-0003 as amended on 2026-11-15): the Kubernetes version of a worker
-// Machine is changed in place, and the configuration applied to the node patches the kubelet
-// only - the components of a control plane are not touched, as talosctl upgrade-k8s does for
-// a node without control-plane components
-// (talosctl upgrade-k8s: upgradeKubeletOnNode).
+// TestUpdateMachineWorkerKubernetesVersionUpgradesKubeletOnly checks that the Kubernetes
+// version of a worker Machine is changed in place and that the configuration applied to the
+// node patches the kubelet only: the components of a control plane are not touched, as
+// talosctl upgrade-k8s does for a node without control-plane components.
 func TestUpdateMachineWorkerKubernetesVersionUpgradesKubeletOnly(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
@@ -558,10 +556,9 @@ func (f *machineSetNodes) MachineAddresses(_ context.Context, _, name string) ([
 	return nil, nil
 }
 
-// TestCanUpdateMachineSetDryRunsTheMachineConfigurationAgainstItsNodes checks the owner's
-// condition of docs/adr/ADR-0003 for a machine set: the hook asks a live Machine of the
-// machine set whether the rendered desired configuration is accepted with mode
-// ApplyConfigurationRequest_NO_REBOOT, and a node that needs a reboot or that refuses the
+// TestCanUpdateMachineSetDryRunsTheMachineConfigurationAgainstItsNodes checks that the hook
+// asks a live Machine of the machine set whether the rendered desired configuration is accepted
+// with mode ApplyConfigurationRequest_NO_REBOOT, and a node that needs a reboot or that refuses
 // configuration in immediate mode - machine/env on Talos v1.12, "this config change can't be
 // applied in immediate mode" - gets no patch, so Cluster API rolls the MachineSet out instead
 // of starting an in-place update the node can never finish. The Talos version of the template

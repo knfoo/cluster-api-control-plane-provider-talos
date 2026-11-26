@@ -92,8 +92,7 @@ func (c *ControlPlane) UnhealthyMachines() collections.Machines {
 // MachinesToCompleteTriggerInPlaceUpdate returns the Machines for which triggering the in-place update
 // stopped after the UpdateInProgressAnnotation was written and before the UpdateMachine hook was marked
 // pending, i.e. the trigger has to be completed on the next reconcile. It mirrors
-// MachinesToCompleteTriggerInPlaceUpdate of KubeadmControlPlane (pkg/control_plane.go:206-213 of the
-// Cluster API v1.14.4 reference).
+// KubeadmControlPlane's MachinesToCompleteTriggerInPlaceUpdate.
 func (c *ControlPlane) MachinesToCompleteTriggerInPlaceUpdate() collections.Machines {
 	return c.Machines.Filter(func(machine *clusterv1.Machine) bool {
 		_, ok := machine.Annotations[clusterv1.UpdateInProgressAnnotation]
@@ -105,8 +104,7 @@ func (c *ControlPlane) MachinesToCompleteTriggerInPlaceUpdate() collections.Mach
 // MachinesToCompleteInPlaceUpdate returns the Machines whose in-place update was triggered and has not
 // finished. The Machine controller removes the UpdateInProgressAnnotation once the UpdateMachine hook is
 // done, so the annotation is the marker of an update in progress. It mirrors
-// MachinesToCompleteInPlaceUpdate of KubeadmControlPlane (pkg/control_plane.go:216-219 of the Cluster
-// API v1.14.4 reference), which filters with inplace.IsUpdateInProgress.
+// KubeadmControlPlane's MachinesToCompleteInPlaceUpdate.
 func (c *ControlPlane) MachinesToCompleteInPlaceUpdate() collections.Machines {
 	return c.Machines.Filter(func(machine *clusterv1.Machine) bool {
 		_, ok := machine.Annotations[clusterv1.UpdateInProgressAnnotation]
@@ -366,8 +364,8 @@ func metadataDefaults(cfg cabptv1.TalosConfigSpec, infraRefName string) (cabptv1
 }
 
 // inPlaceUpdateResult computes the objects an in-place update of one Machine would write, the way
-// KubeadmControlPlane builds its UpToDateResult before calling tryInPlaceUpdate (inplace.go:44-53):
-// the desired Machine from the machine template, the desired InfraMachine cloned from the
+// KubeadmControlPlane builds its UpToDateResult before calling tryInPlaceUpdate: the desired Machine
+// from the machine template, the desired InfraMachine cloned from the
 // infrastructure template and the desired TalosConfig carrying the control plane configuration.
 //
 // A nil desired object means the update cannot be computed, which makes the Machine roll out as today:
@@ -383,8 +381,7 @@ func (c *ControlPlane) inPlaceUpdateResult(machine *clusterv1.Machine) (UpToDate
 	// computeDesiredMachine keeps the Machine's version, which only changes through a rollout, so the
 	// in-place update has to carry the Kubernetes version of the TalosControlPlane itself: a Machine
 	// whose version differs from the TalosControlPlane's is exactly the Machine that is not up to date
-	// and has to be updated in place. KubeadmControlPlane does the same in matchesMachineSpec
-	// (pkg/filters.go:141 of the Cluster API reference).
+	// and has to be updated in place. KubeadmControlPlane does the same in its matchesMachineSpec filter.
 	result.DesiredMachine.Spec.Version = c.TCP.Spec.Version
 
 	if c.infraTemplate == nil || result.CurrentInfraMachine == nil || result.CurrentTalosConfig == nil {

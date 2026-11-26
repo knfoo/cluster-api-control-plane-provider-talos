@@ -32,8 +32,7 @@ func patchOperation(op jsonpatch.Operation) jsonPatchOp {
 
 // ApplyJSONPatch applies an RFC 6902 patch document to a decoded object. The control plane
 // controller uses it to apply the patches a CanUpdateMachine extension returns to the objects
-// of its request, the way KubeadmControlPlane does with the patch helper in
-// sigs.k8s.io/cluster-api/internal/util/patch (patch.go:93-107): decode the patch with
+// of its request, the way KubeadmControlPlane's patch helper does: decode the patch with
 // github.com/evanphx/json-patch/v5 and apply it to the marshalled object.
 func ApplyJSONPatch(object map[string]any, patch []byte) error {
 	current, err := json.Marshal(object)
@@ -55,7 +54,7 @@ func ApplyJSONPatch(object map[string]any, patch []byte) error {
 }
 
 // ApplyJSONMergePatch applies an RFC 7396 JSON merge patch to a decoded object, as the patch
-// helper of KubeadmControlPlane does with jsonpatch.MergePatch (patch.go:116).
+// helper of KubeadmControlPlane does with jsonpatch.MergePatch.
 func ApplyJSONMergePatch(object map[string]any, patch []byte) error {
 	current, err := json.Marshal(object)
 	if err != nil {
@@ -73,8 +72,7 @@ func ApplyJSONMergePatch(object map[string]any, patch []byte) error {
 // JSONPatchBetween returns the RFC 6902 operations that turn current into desired, as a patch
 // document. The controller uses it to report which parts of an object still differ after a
 // CanUpdateMachine call. The patch is built with gomodules.xyz/jsonpatch/v2 CreatePatch, the
-// way Cluster API's in-place update test extension builds its response patches
-// (test/extension/handlers/inplaceupdate/handlers.go:350-366).
+// way Cluster API's in-place update extension builds its response patches.
 func JSONPatchBetween(current, desired any) ([]byte, error) {
 	currentJSON, err := json.Marshal(current)
 	if err != nil {

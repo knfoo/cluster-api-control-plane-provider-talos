@@ -5,13 +5,11 @@
 // Syncing the bootstrap manifests of a Talos control-plane node (kube-proxy, CoreDNS) to
 // the Kubernetes cluster the node belongs to.
 //
-// The staged Kubernetes update of pkg/inplaceupdate/kubernetes.go patches the machine
-// configuration of every control-plane Machine, so the node's BootstrapManifestsConfig
-// carries the kube-proxy manifest of the new Kubernetes version, but the kube-proxy DaemonSet
-// of the workload cluster is only updated when those manifests are synced to it - the step
-// talosctl upgrade-k8s performs last with PerformManifestsSync (PerformManifestsSync and
-// syncManifestsSSA in pkg/cluster/kubernetes of Talos v1.14). Talos >= v1.13 syncs with a
-// server-side-apply inventory managed by
+// The staged Kubernetes update patches the machine configuration of every control-plane
+// Machine, so the node's BootstrapManifestsConfig carries the kube-proxy manifest of the new
+// Kubernetes version, but the kube-proxy DaemonSet of the workload cluster is only updated when
+// those manifests are synced to it - the step talosctl upgrade-k8s performs last. Talos >= v1.13
+// syncs with a server-side-apply inventory managed by
 // github.com/siderolabs/go-kubernetes/kubernetes/ssa; Talos v1.12 has no SSA manifest support
 // (compatibility.TalosVersion.SupportsSSAManifestSync) and falls back to the legacy
 // manifests.SyncWithLog.
