@@ -12,10 +12,23 @@ import (
 	. "github.com/onsi/gomega"
 	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+// metadataClient is the fake client of these tests. Like the manager's client it has the
+// Cluster API and core Kubernetes types registered, which the reader's typed reads need.
+func metadataClient(objects ...client.Object) client.Client {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
+
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+}
 
 // TestMachineAddressesReadsTheAddressObjectsOfAMachine checks the shape Cluster API writes:
 // Machine status.addresses is a list of MachineAddress objects with a type and an address
@@ -24,19 +37,17 @@ import (
 func TestMachineAddressesReadsTheAddressObjectsOfAMachine(t *testing.T) {
 	g := NewWithT(t)
 
-	machine := &unstructured.Unstructured{}
-
-	machine.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Machine"))
-	machine.SetName("worker-1")
-	machine.SetNamespace("default")
-	machine.Object["status"] = map[string]any{
-		"addresses": []any{
-			map[string]any{"type": "ExternalIP", "address": "203.0.113.10"},
-			map[string]any{"type": "InternalIP", "address": "10.0.0.5"},
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-1", Namespace: "default"},
+		Status: clusterv1.MachineStatus{
+			Addresses: clusterv1.MachineAddresses{
+				{Type: clusterv1.MachineExternalIP, Address: "203.0.113.10"},
+				{Type: clusterv1.MachineInternalIP, Address: "10.0.0.5"},
+			},
 		},
 	}
 
-	addresses, err := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(machine).Build()).MachineAddresses(context.Background(), "default", "worker-1")
+	addresses, err := NewKubeMetadataReader(metadataClient(machine)).MachineAddresses(context.Background(), "default", "worker-1")
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(addresses).To(Equal([]clusterv1.MachineAddress{
@@ -51,13 +62,9 @@ func TestMachineAddressesReadsTheAddressObjectsOfAMachine(t *testing.T) {
 func TestMachineAddressesOfAMachineWithoutAddresses(t *testing.T) {
 	g := NewWithT(t)
 
-	machine := &unstructured.Unstructured{}
+	machine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Name: "worker-2", Namespace: "default"}}
 
-	machine.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Machine"))
-	machine.SetName("worker-2")
-	machine.SetNamespace("default")
-
-	reader := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(machine).Build())
+	reader := NewKubeMetadataReader(metadataClient(machine))
 
 	addresses, err := reader.MachineAddresses(context.Background(), "default", "worker-2")
 	g.Expect(err).NotTo(HaveOccurred())
@@ -142,25 +149,24 @@ func TestMetadataSecretResolvesThroughTheBootstrapProvider(t *testing.T) {
 func TestMachineSetMachinesReadsTheMachinesOfAMachineSet(t *testing.T) {
 	g := NewWithT(t)
 
-	worker := func(name, machineSet string) *unstructured.Unstructured {
-		object := &unstructured.Unstructured{}
-
-		object.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Machine"))
-		object.SetName(name)
-		object.SetNamespace("default")
-		object.SetLabels(map[string]string{
-			clusterv1.ClusterNameLabel:    "test-cluster",
-			clusterv1.MachineSetNameLabel: machineSet,
-		})
-
-		return object
+	worker := func(name, machineSet string) *clusterv1.Machine {
+		return &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels: map[string]string{
+					clusterv1.ClusterNameLabel:    "test-cluster",
+					clusterv1.MachineSetNameLabel: machineSet,
+				},
+			},
+		}
 	}
 
-	reader := NewKubeMetadataReader(fake.NewClientBuilder().WithObjects(
+	reader := NewKubeMetadataReader(metadataClient(
 		worker("worker-1", "workers-abc123"),
 		worker("worker-2", "workers-abc123"),
 		worker("worker-3", "workers-def456"),
-	).Build())
+	))
 
 	machines, err := reader.(MachineSetMachineReader).MachineSetMachines(context.Background(), "default", "workers-abc123")
 	g.Expect(err).NotTo(HaveOccurred())

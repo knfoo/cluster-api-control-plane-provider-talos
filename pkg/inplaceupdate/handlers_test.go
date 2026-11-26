@@ -21,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 // fakeHandler builds a handler around a fake node. The metadata reader stands in for the
@@ -875,12 +874,12 @@ func TestManagerHooksReadTheTalosConfigAndAddressOfTheirCluster(t *testing.T) {
 
 	configs := map[string]*talosconfig.Config{}
 
-	client := fake.NewClientBuilder().WithObjects(
+	client := metadataClient(
 		statusMachine("control-plane-a", "cluster-a", "10.0.0.5"),
 		statusMachine("control-plane-b", "cluster-b", "10.0.0.6"),
 		talosConfigSecret("cluster-a", "10.0.0.5"),
 		talosConfigSecret("cluster-b", "10.0.0.6"),
-	).Build()
+	)
 
 	handler := newHandler(NewKubeMetadataReader(client), logr.Discard(), 0, func(clusterName string, config *talosconfig.Config) Applier {
 		configs[clusterName] = config
@@ -913,20 +912,16 @@ func TestManagerHooksReadTheTalosConfigAndAddressOfTheirCluster(t *testing.T) {
 	g.Expect(appliers["cluster-b"].endpoints).To(ContainElement("10.0.0.6"))
 }
 
-func statusMachine(name, clusterName, address string) *unstructured.Unstructured {
-	machine := &unstructured.Unstructured{}
-
-	machine.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Machine"))
-	machine.SetName(name)
-	machine.SetNamespace("default")
-	machine.Object["spec"] = map[string]any{"clusterName": clusterName}
-	machine.Object["status"] = map[string]any{
-		"addresses": []any{
-			map[string]any{"type": "InternalIP", "address": address},
+func statusMachine(name, clusterName, address string) *clusterv1.Machine {
+	return &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       clusterv1.MachineSpec{ClusterName: clusterName},
+		Status: clusterv1.MachineStatus{
+			Addresses: clusterv1.MachineAddresses{
+				{Type: clusterv1.MachineInternalIP, Address: address},
+			},
 		},
 	}
-
-	return machine
 }
 
 func talosConfigSecret(clusterName, endpoint string) *corev1.Secret {

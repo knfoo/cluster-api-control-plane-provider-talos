@@ -28,8 +28,6 @@ import (
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -93,32 +91,19 @@ type kubeMetadataReader struct {
 }
 
 func (r *kubeMetadataReader) Cluster(ctx context.Context, namespace, name string) (*clusterv1.Cluster, error) {
-	// The Cluster is read unstructured so the reader does not depend on which
-	// Cluster API version the cluster's CRD is served in.
-	object := &unstructured.Unstructured{}
-
-	object.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Cluster"))
-
-	if err := r.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, object); err != nil {
-		return nil, errors.Wrapf(err, "reading the Cluster %q of namespace %q", name, namespace)
-	}
-
 	cluster := &clusterv1.Cluster{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.Object, cluster); err != nil {
-		return nil, errors.Wrapf(err, "decoding the Cluster %q of namespace %q", name, namespace)
+
+	if err := r.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cluster); err != nil {
+		return nil, errors.Wrapf(err, "reading the Cluster %q of namespace %q", name, namespace)
 	}
 
 	return cluster, nil
 }
 
 func (r *kubeMetadataReader) MachineAddresses(ctx context.Context, namespace, name string) ([]clusterv1.MachineAddress, error) {
-	// The Machine is read unstructured so the reader does not depend on which Cluster API
-	// version the cluster's CRD is served in. Only status.addresses is used.
-	object := &unstructured.Unstructured{}
+	machine := &clusterv1.Machine{}
 
-	object.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("Machine"))
-
-	if err := r.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, object); err != nil {
+	if err := r.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, machine); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil
 		}
@@ -126,91 +111,39 @@ func (r *kubeMetadataReader) MachineAddresses(ctx context.Context, namespace, na
 		return nil, errors.Wrapf(err, "reading the Machine %q of namespace %q", name, namespace)
 	}
 
-	// Machine status.addresses is a list of MachineAddress objects with a type and an
-	// address, not a list of strings.
-	addresses, found, err := unstructured.NestedSlice(object.Object, "status", "addresses")
-	if err != nil || !found {
-		return nil, nil
-	}
-
-	machineAddresses := []clusterv1.MachineAddress{}
-
-	for _, item := range addresses {
-		address, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		value, _ := address["address"].(string)
-		if value == "" {
-			continue
-		}
-
-		type_, _ := address["type"].(string)
-
-		machineAddresses = append(machineAddresses, clusterv1.MachineAddress{
-			Type:    clusterv1.MachineAddressType(type_),
-			Address: value,
-		})
-	}
-
-	return machineAddresses, nil
+	return machine.Status.Addresses, nil
 }
 
 func (r *kubeMetadataReader) ControlPlaneMachines(ctx context.Context, namespace, clusterName string) ([]clusterv1.Machine, error) {
-	// Like the other reads, the Machines are read unstructured so the reader does not
-	// depend on which Cluster API version the cluster's CRD is served in.
-	list := &unstructured.UnstructuredList{}
-
-	list.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineList"))
-
-	if err := r.client.List(ctx, list, client.MatchingLabels{
+	machines, err := r.listMachines(ctx, map[string]string{
 		clusterv1.ClusterNameLabel:         clusterName,
 		clusterv1.MachineControlPlaneLabel: "",
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, errors.Wrapf(err, "listing the control-plane machines of cluster %q", clusterName)
-	}
-
-	machines := make([]clusterv1.Machine, 0, len(list.Items))
-
-	for i := range list.Items {
-		machine := &clusterv1.Machine{}
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(list.Items[i].Object, machine); err != nil {
-			return nil, errors.Wrapf(err, "decoding the Machine %q of cluster %q", list.Items[i].GetName(), clusterName)
-		}
-
-		machines = append(machines, *machine)
 	}
 
 	return machines, nil
 }
 
 func (r *kubeMetadataReader) MachineSetMachines(ctx context.Context, namespace, machineSetName string) ([]clusterv1.Machine, error) {
-	// Like the other reads, the Machines are read unstructured so the reader does not
-	// depend on which Cluster API version the cluster's CRD is served in. The MachineSet
-	// controller labels every Machine it creates with the name of the machine set.
-	list := &unstructured.UnstructuredList{}
-
-	list.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineList"))
-
-	if err := r.client.List(ctx, list, client.MatchingLabels{
-		clusterv1.MachineSetNameLabel: machineSetName,
-	}); err != nil {
+	machines, err := r.listMachines(ctx, map[string]string{clusterv1.MachineSetNameLabel: machineSetName})
+	if err != nil {
 		return nil, errors.Wrapf(err, "listing the machines of machine set %q", machineSetName)
 	}
 
-	machines := make([]clusterv1.Machine, 0, len(list.Items))
+	return machines, nil
+}
 
-	for i := range list.Items {
-		machine := &clusterv1.Machine{}
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(list.Items[i].Object, machine); err != nil {
-			return nil, errors.Wrapf(err, "decoding the Machine %q of machine set %q", list.Items[i].GetName(), machineSetName)
-		}
+// listMachines reads the Machines carrying the given labels.
+func (r *kubeMetadataReader) listMachines(ctx context.Context, labels map[string]string) ([]clusterv1.Machine, error) {
+	list := &clusterv1.MachineList{}
 
-		machines = append(machines, *machine)
+	if err := r.client.List(ctx, list, client.MatchingLabels(labels)); err != nil {
+		return nil, err
 	}
 
-	return machines, nil
+	return list.Items, nil
 }
 
 func (r *kubeMetadataReader) Secret(ctx context.Context, namespace, name string) (map[string][]byte, error) {
