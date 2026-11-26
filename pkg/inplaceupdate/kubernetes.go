@@ -15,7 +15,6 @@
 package inplaceupdate
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -24,6 +23,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/stdpatches"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"k8s.io/apimachinery/pkg/util/version"
 )
 
 // kubernetesComponent is one control-plane component of a Talos machine.
@@ -104,42 +104,17 @@ func upgradeComponents(status NodeStatus) []kubernetesComponent {
 // supports the versions around the one it ships (compatibility.SupportedKubernetesVersions),
 // so a jump of more than one minor version stays a rollout.
 func kubernetesVersionUpgrade(current, desired string) bool {
-	currentMajor, currentMinor, err := kubernetesMinor(current)
+	currentVersion, err := version.Parse(current)
 	if err != nil {
 		return false
 	}
 
-	desiredMajor, desiredMinor, err := kubernetesMinor(desired)
+	desiredVersion, err := version.Parse(desired)
 	if err != nil {
 		return false
 	}
 
-	return desiredMajor == currentMajor && desiredMinor == currentMinor+1
-}
-
-// kubernetesMinor splits a Kubernetes version into its major and minor number.
-func kubernetesMinor(version string) (int, int, error) {
-	parsed, err := compatibility.ParseKubernetesVersion(version)
-	if err != nil {
-		return 0, 0, errors.Wrapf(err, "parsing Kubernetes version %q", version)
-	}
-
-	parts := strings.Split(parsed.String(), ".")
-	if len(parts) < 2 {
-		return 0, 0, errors.Errorf("Kubernetes version %q has no minor version", version)
-	}
-
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, 0, errors.Wrapf(err, "parsing the major version of %q", version)
-	}
-
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, 0, errors.Wrapf(err, "parsing the minor version of %q", version)
-	}
-
-	return major, minor, nil
+	return currentVersion.Major() == desiredVersion.Major() && desiredVersion.Minor() == currentVersion.Minor()+1
 }
 
 // componentsAtTarget reports whether every Kubernetes component the node runs already
