@@ -451,7 +451,7 @@ func matchesMachine(req *runtimehooksv1.CanUpdateMachineRequest) (bool, []string
 	// The Machine spec is compared after CleanupMachineSpecForDiff (inplace_canupdatemachine.go:325-335),
 	// because fields the Machine controller writes (e.g. bootstrap.dataSecretName) are never the reason
 	// for an in-place update.
-	match, diff, err := matchSpec(cleanupMachineSpecForDiff(&req.Current.Machine.Spec), cleanupMachineSpecForDiff(&req.Desired.Machine.Spec))
+	match, diff, err := specDiff(cleanupMachineSpecForDiff(&req.Current.Machine.Spec), cleanupMachineSpecForDiff(&req.Desired.Machine.Spec))
 	if err != nil {
 		return false, nil, errors.Wrapf(err, "failed to match Machine")
 	}
@@ -511,21 +511,6 @@ func cleanupMachineSpecForDiff(spec *clusterv1.MachineSpec) *clusterv1.MachineSp
 	return spec
 }
 
-// matchSpec compares two specs and returns the operations that would still be needed as the diff.
-func matchSpec(patched, desired any) (bool, string, error) {
-	patchedSpec, err := decodeSpec(patched)
-	if err != nil {
-		return false, "", err
-	}
-
-	desiredSpec, err := decodeSpec(desired)
-	if err != nil {
-		return false, "", err
-	}
-
-	return specDiff(patchedSpec, desiredSpec)
-}
-
 // matchRawExtensionSpec compares the spec of two objects carried as RawExtension.
 func matchRawExtensionSpec(patched, desired runtime.RawExtension) (bool, string, error) {
 	patchedSpec, err := specOfRawExtension(patched)
@@ -566,21 +551,7 @@ func specOfRawExtension(raw runtime.RawExtension) (map[string]any, error) {
 	return spec, nil
 }
 
-func decodeSpec(obj any) (map[string]any, error) {
-	data, err := json.Marshal(obj)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal object")
-	}
-
-	spec := map[string]any{}
-	if err := json.Unmarshal(data, &spec); err != nil {
-		return nil, errors.Wrap(err, "failed to decode object")
-	}
-
-	return spec, nil
-}
-
-func specDiff(patched, desired map[string]any) (bool, string, error) {
+func specDiff(patched, desired any) (bool, string, error) {
 	patchedJSON, err := json.Marshal(patched)
 	if err != nil {
 		return false, "", errors.Wrap(err, "failed to marshal patched spec")
