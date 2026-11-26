@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 
 	"github.com/pkg/errors"
-	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -91,21 +90,23 @@ func configSpec(raw runtime.RawExtension) (map[string]any, string, error) {
 }
 
 // talosConfigSpec reads the machine configuration spec of a TalosConfig or TalosConfigTemplate
-// object of a hook request as the bootstrap provider's typed spec.
-func talosConfigSpec(raw runtime.RawExtension) (cabptv1.TalosConfigSpec, error) {
+// object of a hook request. The spec is read as the bootstrap provider's v1beta1 type, which is
+// the one pkg/machineconfig generates and patches machine configurations with; the TalosConfig
+// of a request is served in its v1alpha3 API, whose spec has the same fields.
+func talosConfigSpec(raw runtime.RawExtension) (cabptv1beta1.TalosConfigSpec, error) {
 	spec, _, err := configSpec(raw)
 	if err != nil {
-		return cabptv1.TalosConfigSpec{}, err
+		return cabptv1beta1.TalosConfigSpec{}, err
 	}
 
 	data, err := json.Marshal(spec)
 	if err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.WithStack(err)
+		return cabptv1beta1.TalosConfigSpec{}, errors.WithStack(err)
 	}
 
-	talosSpec := cabptv1.TalosConfigSpec{}
+	talosSpec := cabptv1beta1.TalosConfigSpec{}
 	if err := json.Unmarshal(data, &talosSpec); err != nil {
-		return cabptv1.TalosConfigSpec{}, errors.Wrap(err, "decoding the machine configuration spec of the request")
+		return cabptv1beta1.TalosConfigSpec{}, errors.Wrap(err, "decoding the machine configuration spec of the request")
 	}
 
 	return talosSpec, nil
@@ -146,18 +147,4 @@ func infraSpec(raw runtime.RawExtension) any {
 	}
 
 	return object["spec"]
-}
-
-// machineConfigPatches converts the RFC 6902 configPatches of the TalosConfig the request
-// carries into the type the bootstrap provider's pkg/machineconfig.ApplyPatches takes. The
-// two API versions define the same fields, as the provider's own generated conversion
-// (api/v1alpha3/zz_generated.conversion.go:172-177) shows.
-func machineConfigPatches(patches []cabptv1.ConfigPatches) []cabptv1beta1.ConfigPatches {
-	out := make([]cabptv1beta1.ConfigPatches, 0, len(patches))
-
-	for _, patch := range patches {
-		out = append(out, cabptv1beta1.ConfigPatches{Op: patch.Op, Path: patch.Path, Value: patch.Value})
-	}
-
-	return out
 }

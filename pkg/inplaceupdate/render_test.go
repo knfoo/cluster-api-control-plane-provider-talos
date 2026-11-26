@@ -4,8 +4,9 @@
 
 // Rendering of the machine configuration a TalosConfig describes: a TalosConfig created
 // with generateType is generated the way the bootstrap provider generates it, and its
-// strategicPatches are rendered through the bootstrap provider's pkg/templatepatch engine
-// before the configuration is diffed.
+// strategicPatches are rendered with the data the bootstrap provider's pkg/machineconfig
+// builds from the metadata secret, the Cluster and the Machine before the configuration
+// is diffed.
 package inplaceupdate
 
 import (
@@ -32,14 +33,9 @@ type fakeMetadata struct {
 	cluster          *clusterv1.Cluster
 	secrets          map[string]map[string][]byte
 	machineAddresses map[string][]clusterv1.MachineAddress
-	clusterErr       error
 }
 
 func (f *fakeMetadata) Cluster(_ context.Context, _, name string) (*clusterv1.Cluster, error) {
-	if f.clusterErr != nil {
-		return nil, f.clusterErr
-	}
-
 	if f.cluster == nil || f.cluster.Name != name {
 		return nil, errors.Errorf("cluster %q does not exist", name)
 	}
@@ -112,7 +108,11 @@ func generatedConfig(patches []string, variables map[string]string) runtime.RawE
 }
 
 // hostnamePatch renders the hostname of the machine from the template context.
-const hostnamePatch = "machine:\n  network:\n    hostname: {{ get \"hostname\" }}\n"
+const hostnamePatch = "machine:\n  network:\n    hostname: {{ .hostname }}\n"
+
+// clusterNamePatch renders the hostname from the cluster name under .cluster, which the
+// template data carries only when the hooks pass the Cluster.
+const clusterNamePatch = "machine:\n  network:\n    hostname: {{ .cluster.name }}-{{ .hostname }}\n"
 
 // TestCanUpdateMachineRendersGeneratedConfig checks that two TalosConfigs generated with
 // generateType render to the same machine configuration, so the extension does not see a
@@ -156,7 +156,7 @@ func TestCanUpdateMachineRendersMetadata(t *testing.T) {
 	metadata := clusterMetadata().withMetadata("infra-machine-metadata", "hostname: control-plane-1\nrole: controlplane\n")
 	handler := fakeHandler(applier, metadata)
 
-	patch := "machine:\n  network:\n    hostname: {{ get \"hostname\" }}-{{ get \"role\" }}\n"
+	patch := "machine:\n  network:\n    hostname: {{ .hostname }}-{{ .role }}\n"
 
 	current := talosConfigRaw("talosconfig-1", map[string]any{
 		"talosVersion":     "v1.14.0",
@@ -169,7 +169,7 @@ func TestCanUpdateMachineRendersMetadata(t *testing.T) {
 		"talosVersion":     "v1.14.0",
 		"generateType":     "controlplane",
 		"metadataFrom":     map[string]any{"infrastructureMachine": map[string]any{}},
-		"strategicPatches": []string{"machine:\n  network:\n    hostname: {{ get \"cluster.name\" }}-{{ get \"role\" }}\n"},
+		"strategicPatches": []string{"machine:\n  network:\n    hostname: {{ .cluster.name }}-{{ .role }}\n"},
 	})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
@@ -178,6 +178,23 @@ func TestCanUpdateMachineRendersMetadata(t *testing.T) {
 	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
 	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
 	g.Expect(applier.dryRunRuns).To(Equal(1))
+}
+
+// TestCanUpdateMachineRendersClusterWithoutMetadata checks that a TalosConfig with only
+// templateVariables still gets the Cluster in the template data, as the bootstrap provider
+// does: a patch reading .cluster.name renders, so the strategic patch is applied in place.
+func TestCanUpdateMachineRendersClusterWithoutMetadata(t *testing.T) {
+	g := NewWithT(t)
+	handler := fakeHandler(newFakeApplier(), clusterMetadata())
+
+	current := generatedConfig([]string{clusterNamePatch}, map[string]string{"hostname": "control-plane-1"})
+	desired := generatedConfig([]string{clusterNamePatch}, map[string]string{"hostname": "control-plane-2"})
+
+	resp := &runtimehooksv1.CanUpdateMachineResponse{}
+	handler.CanUpdateMachine(context.Background(), canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)
+
+	g.Expect(resp.Status).To(Equal(runtimehooksv1.ResponseStatusSuccess))
+	g.Expect(resp.BootstrapConfigPatch.Patch).NotTo(BeEmpty())
 }
 
 // TestCanUpdateMachineRolloutForMetadataNotYetAvailable checks the two-phase bootstrap of
@@ -236,7 +253,7 @@ func TestCanUpdateMachineRolloutForTemplateError(t *testing.T) {
 	current := generatedConfig([]string{hostnamePatch}, map[string]string{"hostname": "control-plane-1"})
 	desired := generatedConfig([]string{`machine:
   network:
-    hostname: {{ get "hostname" `}, map[string]string{"hostname": "control-plane-2"})
+    hostname: {{ .hostname `}, map[string]string{"hostname": "control-plane-2"})
 
 	resp := &runtimehooksv1.CanUpdateMachineResponse{}
 	handler.CanUpdateMachine(context.Background(), canUpdateRequest(current, desired, "talos-image", "v1.33.1", "v1.33.1"), resp)

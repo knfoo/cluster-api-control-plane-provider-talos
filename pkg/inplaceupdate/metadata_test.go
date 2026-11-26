@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
+	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -122,14 +122,14 @@ func TestMetadataSecretResolvesThroughTheBootstrapProvider(t *testing.T) {
 	g := NewWithT(t)
 	machine := clusterv1.Machine{Spec: clusterv1.MachineSpec{InfrastructureRef: clusterv1.ContractVersionedObjectReference{Name: "worker-abc123"}}}
 
-	name, key, err := metadataSecret(cabptv1.TalosConfigSpec{MetadataFrom: &cabptv1.MetadataFrom{InfrastructureMachine: &cabptv1.InfrastructureMachineMetadata{}}}, machine)
+	name, key, err := metadataSecret(cabptv1beta1.TalosConfigSpec{MetadataFrom: &cabptv1beta1.MetadataFrom{InfrastructureMachine: &cabptv1beta1.InfrastructureMachineMetadata{}}}, machine)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(name).To(Equal("worker-abc123" + machineconfig.MetadataSecretSuffix))
 	g.Expect(key).To(Equal(machineconfig.MetadataDataKey))
 
-	_, _, err = metadataSecret(cabptv1.TalosConfigSpec{MetadataFrom: &cabptv1.MetadataFrom{
-		SecretRef:             &cabptv1.MetadataSecretRef{Name: "metal3-data-0"},
-		InfrastructureMachine: &cabptv1.InfrastructureMachineMetadata{},
+	_, _, err = metadataSecret(cabptv1beta1.TalosConfigSpec{MetadataFrom: &cabptv1beta1.MetadataFrom{
+		SecretRef:             &cabptv1beta1.MetadataSecretRef{Name: "metal3-data-0"},
+		InfrastructureMachine: &cabptv1beta1.InfrastructureMachineMetadata{},
 	}}, machine)
 	g.Expect(err).To(HaveOccurred())
 }

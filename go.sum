@@ -180,8 +180,8 @@ github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnr
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
 github.com/klauspost/compress v1.20.3 h1:zWNoFqq/lSuYQRim3dUXlXeA0IqwuZGicdG5ZTfY5j4=
 github.com/klauspost/compress v1.20.3/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
-github.com/knfoo/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261121214632-08fd4dff053e h1:Ss/7te1FhRAoPGaOGv+7FdDyWP6xmP1QtGiWImYs0EI=
-github.com/knfoo/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261121214632-08fd4dff053e/go.mod h1:LXDCykgtMlwI6y7jg9ZSnbhE6wnDxhj4qydUnCSoNjo=
+github.com/knfoo/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261126095240-7fd37fab96e1 h1:5komOq7v6vrpPoZxH0zgyDHcuSbyXG6XuvftC+oqOCc=
+github.com/knfoo/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261126095240-7fd37fab96e1/go.mod h1:LXDCykgtMlwI6y7jg9ZSnbhE6wnDxhj4qydUnCSoNjo=
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
 github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
 github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=

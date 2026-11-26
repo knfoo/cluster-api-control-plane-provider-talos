@@ -113,8 +113,8 @@ spec:
                       metadataFrom:
                         description: |-
                           MetadataFrom specifies where to read infrastructure metadata for template
-                          processing. When set, StrategicPatches are rendered through Go's
-                          text/template engine. Supports flat key:value, YAML, or JSON formats.
+                          processing. The metadata secret data is read as YAML and keeps its nesting.
+                          When set, StrategicPatches are rendered through Go's text/template engine.
                         properties:
                           infrastructureMachine:
                             description: |-
@@ -159,8 +159,9 @@ spec:
                         additionalProperties:
                           type: string
                         description: |-
-                          TemplateVariables are inline key-value pairs merged into the template
-                          context alongside metadata from MetadataFrom.
+                          TemplateVariables are inline key-value pairs available in StrategicPatches
+                          as top-level keys, for example {{ .installerImage }}. They override metadata
+                          values of the same name.
                         type: object
                     required:
                     - generateType
@@ -208,8 +209,8 @@ spec:
                       metadataFrom:
                         description: |-
                           MetadataFrom specifies where to read infrastructure metadata for template
-                          processing. When set, StrategicPatches are rendered through Go's
-                          text/template engine. Supports flat key:value, YAML, or JSON formats.
+                          processing. The metadata secret data is read as YAML and keeps its nesting.
+                          When set, StrategicPatches are rendered through Go's text/template engine.
                         properties:
                           infrastructureMachine:
                             description: |-
@@ -254,8 +255,9 @@ spec:
                         additionalProperties:
                           type: string
                         description: |-
-                          TemplateVariables are inline key-value pairs merged into the template
-                          context alongside metadata from MetadataFrom.
+                          TemplateVariables are inline key-value pairs available in StrategicPatches
+                          as top-level keys, for example {{ .installerImage }}. They override metadata
+                          values of the same name.
                         type: object
                     required:
                     - generateType
@@ -683,8 +685,8 @@ spec:
                       metadataFrom:
                         description: |-
                           MetadataFrom specifies where to read infrastructure metadata for template
-                          processing. When set, StrategicPatches are rendered through Go's
-                          text/template engine. Supports flat key:value, YAML, or JSON formats.
+                          processing. The metadata secret data is read as YAML and keeps its nesting.
+                          When set, StrategicPatches are rendered through Go's text/template engine.
                         properties:
                           infrastructureMachine:
                             description: |-
@@ -729,8 +731,9 @@ spec:
                         additionalProperties:
                           type: string
                         description: |-
-                          TemplateVariables are inline key-value pairs merged into the template
-                          context alongside metadata from MetadataFrom.
+                          TemplateVariables are inline key-value pairs available in StrategicPatches
+                          as top-level keys, for example {{ .installerImage }}. They override metadata
+                          values of the same name.
                         type: object
                     required:
                     - generateType
@@ -778,8 +781,8 @@ spec:
                       metadataFrom:
                         description: |-
                           MetadataFrom specifies where to read infrastructure metadata for template
-                          processing. When set, StrategicPatches are rendered through Go's
-                          text/template engine. Supports flat key:value, YAML, or JSON formats.
+                          processing. The metadata secret data is read as YAML and keeps its nesting.
+                          When set, StrategicPatches are rendered through Go's text/template engine.
                         properties:
                           infrastructureMachine:
                             description: |-
@@ -824,8 +827,9 @@ spec:
                         additionalProperties:
                           type: string
                         description: |-
-                          TemplateVariables are inline key-value pairs merged into the template
-                          context alongside metadata from MetadataFrom.
+                          TemplateVariables are inline key-value pairs available in StrategicPatches
+                          as top-level keys, for example {{ .installerImage }}. They override metadata
+                          values of the same name.
                         type: object
                     required:
                     - generateType

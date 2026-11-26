@@ -21,10 +21,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
-	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/templatepatch"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	talosmachine "github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"gopkg.in/yaml.v3"
@@ -231,16 +229,9 @@ func (r *kubeMetadataReader) Secret(ctx context.Context, namespace, name string)
 
 // metadataSecret resolves the metadata secret a TalosConfig's metadataFrom points at with the
 // bootstrap provider's exported pkg/machineconfig.MetadataSecret, so the hooks and the bootstrap
-// controller read the same secret with the same defaults. The hook request carries the spec in the
-// provider's v1alpha3 API; its generated conversion maps it to the v1beta1 spec MetadataSecret takes.
-func metadataSecret(spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) (string, string, error) {
-	talosConfig := cabptv1beta1.TalosConfigSpec{}
-
-	if err := cabptv1.Convert_v1alpha3_TalosConfigSpec_To_v1beta1_TalosConfigSpec(&spec, &talosConfig, nil); err != nil {
-		return "", "", errors.Wrap(err, "converting the TalosConfig spec to read metadataFrom")
-	}
-
-	return machineconfig.MetadataSecret(&talosConfig, machine.Spec.InfrastructureRef.Name)
+// controller read the same secret with the same defaults.
+func metadataSecret(spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine) (string, string, error) {
+	return machineconfig.MetadataSecret(&spec, machine.Spec.InfrastructureRef.Name)
 }
 
 // secretsBundleSecretName is the name the bootstrap provider stores the cluster's
@@ -260,7 +251,7 @@ func secretsBundleSecretName(clusterName string) string {
 // Follows the bootstrap provider's generateConfigs
 // (controllers/talosconfig_controller.go:754-824) and its secrets bundle loading
 // (controllers/secrets.go:63-104).
-func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) (string, []string, error) {
+func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine) (string, []string, error) {
 	switch spec.GenerateType {
 	case "none", "":
 		return spec.Data, nil, nil
@@ -289,10 +280,10 @@ func (h *Handler) machineConfigBase(ctx context.Context, spec cabptv1.TalosConfi
 	hostname := ""
 
 	switch spec.Hostname.Source {
-	case cabptv1.HostnameSourceMachineName:
+	case cabptv1beta1.HostnameSourceMachineName:
 		hostname = machine.Name
 
-	case cabptv1.HostnameSourceInfrastructureName:
+	case cabptv1beta1.HostnameSourceInfrastructureName:
 		hostname = machine.Spec.InfrastructureRef.Name
 	}
 
@@ -356,23 +347,24 @@ func (h *Handler) clusterSecretsBundle(ctx context.Context, cluster *clusterv1.C
 	return bundle, nil
 }
 
-// templateContext builds the metadata the bootstrap provider's pkg/templatepatch engine
-// renders the strategicPatches with, following resolveMetadata
-// (controllers/talosconfig_controller.go:679-751). It returns nil metadata when the
-// TalosConfig uses no templates, and metadataPending=true when metadataFrom is set but the
-// infrastructure provider (Metal3/CAPM3) has not created the metadata claim yet. The
-// templateVariables are passed to ApplyPatches, which merges them into the context.
-func (h *Handler) templateContext(ctx context.Context, spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) (map[string]string, bool, error) {
-	hasMetadata := spec.MetadataFrom != nil
-	hasVariables := len(spec.TemplateVariables) > 0
-
-	if !hasMetadata && !hasVariables {
+// templateContext builds the data pkg/machineconfig.TemplateData renders the strategicPatches
+// templates with, following resolveTemplateData of the bootstrap provider
+// (controllers/talosconfig_controller.go:606-644). It returns nil when the TalosConfig uses
+// no templates, and metadataPending=true while the metadata secret metadataFrom names, which
+// the infrastructure provider (Metal3/CAPM3) creates after the bootstrap data, does not exist.
+func (h *Handler) templateContext(ctx context.Context, spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine) (map[string]any, bool, error) {
+	if spec.MetadataFrom == nil && len(spec.TemplateVariables) == 0 {
 		return nil, false, nil
 	}
 
-	metadata := map[string]string{}
+	cluster, err := h.metadata.Cluster(ctx, machine.Namespace, machine.Spec.ClusterName)
+	if err != nil {
+		return nil, false, err
+	}
 
-	if hasMetadata {
+	var raw []byte
+
+	if spec.MetadataFrom != nil {
 		name, key, err := metadataSecret(spec, machine)
 		if err != nil {
 			return nil, false, err
@@ -384,30 +376,21 @@ func (h *Handler) templateContext(ctx context.Context, spec cabptv1.TalosConfigS
 		}
 
 		if data == nil {
-			// The metadata claim is created after the bootstrap data, so the secret is
-			// transiently absent. The bootstrap provider writes the configuration without
-			// the rendered patches in that case (two-phase bootstrap, phase 1) and skips the
-			// patches that still contain template expressions; the hooks render the
-			// same configuration.
 			return nil, true, nil
 		}
 
-		raw, ok := data[key]
-		if !ok {
+		metadata, found := data[key]
+		if !found {
 			return nil, false, errors.Errorf("the metadata secret %q of machine %q has no key %q", name, machine.Name, key)
 		}
 
-		metadata = templatepatch.ParseMetadata(raw)
-
-		cluster, err := h.metadata.Cluster(ctx, machine.Namespace, machine.Spec.ClusterName)
-		if err != nil {
-			return nil, false, err
-		}
-
-		templatepatch.EnrichWithCluster(metadata, cluster)
+		raw = metadata
 	}
 
-	templatepatch.EnrichWithMachine(metadata, machine.Name, machine.Spec.InfrastructureRef.Name)
+	data, err := machineconfig.TemplateData(raw, cluster, machine.Name, machine.Spec.InfrastructureRef.Name, spec.TemplateVariables)
+	if err != nil {
+		return nil, false, err
+	}
 
-	return metadata, false, nil
+	return data, false, nil
 }

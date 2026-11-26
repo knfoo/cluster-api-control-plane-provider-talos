@@ -762,9 +762,9 @@ func TestExtensionRBAC(t *testing.T) {
 	g.Expect(string(role)).To(ContainSubstring("- namespaces"))
 }
 
-// TestCanUpdateMachineRendersStrategicPatches checks the owner's condition (issue #56 item 2):
-// the strategicPatches of a generated TalosConfig are rendered through CABPT's pkg/templatepatch
-// engine and patched in place, instead of being refused.
+// TestCanUpdateMachineRendersStrategicPatches checks that the strategicPatches of a
+// generated TalosConfig are rendered with the template data the bootstrap provider builds
+// and patched in place, instead of being refused.
 func TestCanUpdateMachineRendersStrategicPatches(t *testing.T) {
 	g := NewWithT(t)
 	applier := newFakeApplier()
@@ -1011,7 +1011,7 @@ func TestUpdateMachineWaitsForMetadataBeforeApplyingConfiguration(t *testing.T) 
 		"data":         baseConfig,
 		"metadataFrom": map[string]any{"secretRef": map[string]any{"name": "workers-metadata"}},
 		"strategicPatches": []string{
-			"machine:\n  sysctls:\n    net.ipv4.tcp_keepalive_time: \"{{ get \"keepalive\" }}\"\n",
+			"machine:\n  sysctls:\n    net.ipv4.tcp_keepalive_time: \"{{ .keepalive }}\"\n",
 		},
 	})
 

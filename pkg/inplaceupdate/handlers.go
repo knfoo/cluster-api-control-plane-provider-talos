@@ -27,7 +27,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
-	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
+	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
 	talosconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -494,7 +494,7 @@ func (h *Handler) controlPlaneAtTarget(ctx context.Context, req *runtimehooksv1.
 // cluster exactly once per cluster and Kubernetes version. The kubeconfig of the workload
 // cluster is the one Cluster API stores in the secret named <cluster>-kubeconfig (util/secret:
 // secret.Name(clusterName, secret.Kubeconfig), kubeconfig stored under secret.KubeconfigDataName).
-func (h *Handler) syncBootstrapManifests(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, spec cabptv1.TalosConfigSpec, endpoint, target string, applier Applier) error {
+func (h *Handler) syncBootstrapManifests(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, spec cabptv1beta1.TalosConfigSpec, endpoint, target string, applier Applier) error {
 	clusterName := req.Desired.Machine.Spec.ClusterName
 	key := manifestSyncKey(req.Desired.Machine, target)
 
@@ -795,7 +795,8 @@ func TalosEndpoint(address string) (string, bool) {
 // renderMachineConfig builds the machine configuration a TalosConfig describes with the
 // bootstrap provider's exported pkg/machineconfig: Generate for a generateType TalosConfig,
 // then ApplyPatches for the RFC 6902 configPatches and the strategicPatches, whose
-// templates are rendered with the metadata of metadataFrom and the templateVariables.
+// templates are rendered with the data pkg/machineconfig.TemplateData builds from the
+// metadata secret, the Cluster, the Machine and the templateVariables.
 // The hooks gather only the inputs - the Cluster, the cluster's Talos secrets bundle
 // and the metadata secret - and passes them, so the generated configuration and the
 // rendered templates are identical to what the bootstrap controller writes.
@@ -807,27 +808,26 @@ func TalosEndpoint(address string) (string, bool) {
 // UpdateMachine.
 //
 // Follows the bootstrap provider's reconcileGenerate
-// (controllers/talosconfig_controller.go:478-640), which calls the same
+// (controllers/talosconfig_controller.go:501-597), which calls the same
 // pkg/machineconfig.Generate and pkg/machineconfig.ApplyPatches, reached
 // through the go.mod replace.
-func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) ([]byte, bool, error) {
+func (h *Handler) renderMachineConfig(ctx context.Context, spec cabptv1beta1.TalosConfigSpec, machine clusterv1.Machine) ([]byte, bool, error) {
 	base, standardPatches, err := h.machineConfigBase(ctx, spec, machine)
 	if err != nil {
 		return nil, false, err
 	}
 
-	metadata, metadataPending, err := h.templateContext(ctx, spec, machine)
+	templateData, metadataPending, err := h.templateContext(ctx, spec, machine)
 	if err != nil {
 		return nil, false, err
 	}
 
 	config, err := machineconfig.ApplyPatches(base, machineconfig.PatchInput{
-		ConfigPatches:     machineConfigPatches(spec.ConfigPatches),
-		StrategicPatches:  spec.StrategicPatches,
-		StdPatches:        standardPatches,
-		Metadata:          metadata,
-		TemplateVariables: spec.TemplateVariables,
-		MetadataPending:   metadataPending,
+		ConfigPatches:    spec.ConfigPatches,
+		StrategicPatches: spec.StrategicPatches,
+		StdPatches:       standardPatches,
+		TemplateData:     templateData,
+		MetadataPending:  metadataPending,
 	})
 	if err != nil {
 		return nil, false, err

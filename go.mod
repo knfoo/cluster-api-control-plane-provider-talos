@@ -2,7 +2,7 @@ module github.com/siderolabs/cluster-api-control-plane-provider-talos
 
 go 1.26.5
 
-replace github.com/siderolabs/cluster-api-bootstrap-provider-talos => github.com/knfoo/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261121214632-08fd4dff053e
+replace github.com/siderolabs/cluster-api-bootstrap-provider-talos => github.com/knfoo/cluster-api-bootstrap-provider-talos v0.7.0-alpha.1.0.20261126095240-7fd37fab96e1
 
 require (
 	github.com/coreos/go-semver v0.3.1
