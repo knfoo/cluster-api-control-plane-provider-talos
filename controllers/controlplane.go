@@ -11,6 +11,8 @@ import (
 	"slices"
 
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
+	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
+	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -333,41 +335,34 @@ func MatchesControlPlaneConfig(talosConfigs map[string]*cabptv1.TalosConfig, tcp
 			return true
 		}
 
-		return reflect.DeepEqual(
-			withMetadataDefaults(tcp.Spec.ControlPlaneConfig.ControlPlaneConfig),
-			withMetadataDefaults(talosConfig.Spec),
-		)
+		tcpSpec, err := metadataDefaults(tcp.Spec.ControlPlaneConfig.ControlPlaneConfig, machine.Spec.InfrastructureRef.Name)
+		if err != nil {
+			return false
+		}
+
+		talosSpec, err := metadataDefaults(talosConfig.Spec, machine.Spec.InfrastructureRef.Name)
+		if err != nil {
+			return false
+		}
+
+		return reflect.DeepEqual(tcpSpec, talosSpec)
 	}
 }
 
-// withMetadataDefaults returns a copy of cfg with the metadataFrom defaults applied. The TalosConfig
-// CRD defines these defaults (metadataFrom.secretRef.key "metaData", metadataFrom.infrastructureMachine.dataKey
-// "metaData" and metadataFrom.infrastructureMachine.secretNameSuffix "-metadata") and the API server fills
-// them in when a TalosConfig is stored, while the TalosControlPlane CRD does not define them. Comparing the
-// two specs without normalising therefore reports every Machine as not up to date whenever metadataFrom is
-// set, which triggers an endless rollout.
-func withMetadataDefaults(cfg cabptv1.TalosConfigSpec) cabptv1.TalosConfigSpec {
-	out := *cfg.DeepCopy()
+// metadataDefaults returns cfg in the bootstrap provider's v1beta1 API with the metadataFrom defaults
+// its pkg/machineconfig.MetadataSecret applies. The TalosConfig CRD defines those defaults and the
+// TalosControlPlane CRD does not, so comparing the two specs unnormalised reports every Machine as
+// not up to date and rolls it out forever.
+func metadataDefaults(cfg cabptv1.TalosConfigSpec, infraRefName string) (cabptv1beta1.TalosConfigSpec, error) {
+	spec := cabptv1beta1.TalosConfigSpec{}
 
-	if out.MetadataFrom == nil {
-		return out
+	if err := cabptv1.Convert_v1alpha3_TalosConfigSpec_To_v1beta1_TalosConfigSpec(&cfg, &spec, nil); err != nil {
+		return spec, errors.Wrap(err, "converting the TalosConfig spec to apply the metadataFrom defaults")
 	}
 
-	if out.MetadataFrom.SecretRef != nil && out.MetadataFrom.SecretRef.Key == "" {
-		out.MetadataFrom.SecretRef.Key = "metaData"
-	}
+	_, _, err := machineconfig.MetadataSecret(&spec, infraRefName)
 
-	if out.MetadataFrom.InfrastructureMachine != nil {
-		if out.MetadataFrom.InfrastructureMachine.DataKey == "" {
-			out.MetadataFrom.InfrastructureMachine.DataKey = "metaData"
-		}
-
-		if out.MetadataFrom.InfrastructureMachine.SecretNameSuffix == "" {
-			out.MetadataFrom.InfrastructureMachine.SecretNameSuffix = "-metadata"
-		}
-	}
-
-	return out
+	return spec, err
 }
 
 // inPlaceUpdateResult computes the objects an in-place update of one Machine would write, the way

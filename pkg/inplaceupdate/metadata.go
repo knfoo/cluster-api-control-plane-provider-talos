@@ -22,6 +22,7 @@ import (
 
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
+	cabptv1beta1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1beta1"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/machineconfig"
 	"github.com/siderolabs/cluster-api-bootstrap-provider-talos/pkg/templatepatch"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
@@ -228,49 +229,18 @@ func (r *kubeMetadataReader) Secret(ctx context.Context, namespace, name string)
 	return secret.Data, nil
 }
 
-// metadataSecret locates the metadata secret a TalosConfig's metadataFrom points at.
-// The defaults (key "metaData", suffix "-metadata") are the ones the bootstrap
-// provider's API types define, so a Metal3/CAPM3 Metal3DataTemplate metadata secret
-// is found without any extra configuration.
-func metadataSecret(spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) (name, key string, err error) {
-	if spec.MetadataFrom == nil {
-		return "", "", errors.New("metadataFrom is not set")
+// metadataSecret resolves the metadata secret a TalosConfig's metadataFrom points at with the
+// bootstrap provider's exported pkg/machineconfig.MetadataSecret, so the hooks and the bootstrap
+// controller read the same secret with the same defaults. The hook request carries the spec in the
+// provider's v1alpha3 API; its generated conversion maps it to the v1beta1 spec MetadataSecret takes.
+func metadataSecret(spec cabptv1.TalosConfigSpec, machine clusterv1.Machine) (string, string, error) {
+	talosConfig := cabptv1beta1.TalosConfigSpec{}
+
+	if err := cabptv1.Convert_v1alpha3_TalosConfigSpec_To_v1beta1_TalosConfigSpec(&spec, &talosConfig, nil); err != nil {
+		return "", "", errors.Wrap(err, "converting the TalosConfig spec to read metadataFrom")
 	}
 
-	switch {
-	case spec.MetadataFrom.SecretRef != nil && spec.MetadataFrom.InfrastructureMachine != nil:
-		return "", "", errors.New("metadataFrom sets both secretRef and infrastructureMachine, only one is allowed")
-
-	case spec.MetadataFrom.SecretRef != nil:
-		name = spec.MetadataFrom.SecretRef.Name
-
-		key = spec.MetadataFrom.SecretRef.Key
-		if key == "" {
-			key = "metaData"
-		}
-
-	case spec.MetadataFrom.InfrastructureMachine != nil:
-		suffix := spec.MetadataFrom.InfrastructureMachine.SecretNameSuffix
-		if suffix == "" {
-			suffix = "-metadata"
-		}
-
-		name = machine.Spec.InfrastructureRef.Name + suffix
-
-		key = spec.MetadataFrom.InfrastructureMachine.DataKey
-		if key == "" {
-			key = "metaData"
-		}
-
-	default:
-		return "", "", errors.New("metadataFrom sets neither secretRef nor infrastructureMachine")
-	}
-
-	if name == "" {
-		return "", "", errors.New("metadataFrom names an empty metadata secret")
-	}
-
-	return name, key, nil
+	return machineconfig.MetadataSecret(&talosConfig, machine.Spec.InfrastructureRef.Name)
 }
 
 // secretsBundleSecretName is the name the bootstrap provider stores the cluster's
