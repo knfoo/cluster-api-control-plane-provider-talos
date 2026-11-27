@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 
+	jsonpatch "github.com/evanphx/json-patch/v5"
 	"github.com/pkg/errors"
 	cabptv1 "github.com/siderolabs/cluster-api-bootstrap-provider-talos/api/v1alpha3"
 	"github.com/siderolabs/cluster-api-control-plane-provider-talos/pkg/inplaceupdate"
@@ -68,6 +69,7 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 	if len(extensionHandlers) > 1 {
 		return false, errors.Errorf("found multiple CanUpdateMachine hooks (%s): only one hook is supported", strings.Join(extensionHandlers, ","))
 	}
+	handler := extensionHandlers[0]
 
 	reason, req, err := createCanUpdateMachineRequest(ctx, r.Client, machine, machineUpToDateResult)
 	if err != nil {
@@ -80,9 +82,19 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 		return false, nil
 	}
 
-	canUpdate, reasons, err := r.canExtensionsUpdateMachine(ctx, machine, req, extensionHandlers)
-	if err != nil {
+	resp := &runtimehooksv1.CanUpdateMachineResponse{}
+	if err := r.RuntimeClient.CallExtension(ctx, runtimehooksv1.CanUpdateMachine, machine, handler, req, resp); err != nil {
 		return false, err
+	}
+
+	// Apply the patches the extension returned to the current objects of the request.
+	if err := applyPatchesToRequest(req, resp); err != nil {
+		return false, errors.Wrapf(err, "failed to apply patches from extension %s to the CanUpdateMachine request", handler)
+	}
+
+	canUpdate, reasons, err := matchesMachine(req)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to compare current and desired objects after calling extension %s", handler)
 	}
 	if !canUpdate {
 		log.Info(fmt.Sprintf("Machine %s cannot be updated in-place by extensions", klog.KObj(machine)), "reason", strings.Join(reasons, ","))
@@ -91,43 +103,6 @@ func (r *TalosControlPlaneReconciler) canUpdateMachine(ctx context.Context, mach
 	}
 
 	return true, nil
-}
-
-// canExtensionsUpdateMachine calls the CanUpdateMachine extension and compares the patched current
-// objects with the desired ones, following KubeadmControlPlane's canExtensionsUpdateMachine.
-// A failed call is an error, as in KubeadmControlPlane.
-func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Context, machine *clusterv1.Machine, req *runtimehooksv1.CanUpdateMachineRequest, extensionHandlers []string) (bool, []string, error) {
-	log := ctrl.LoggerFrom(ctx)
-
-	var reasons []string
-	var err error
-
-	for _, extensionHandler := range extensionHandlers {
-		resp := &runtimehooksv1.CanUpdateMachineResponse{}
-
-		if err := r.RuntimeClient.CallExtension(ctx, runtimehooksv1.CanUpdateMachine, machine, extensionHandler, req, resp); err != nil {
-			return false, nil, err
-		}
-
-		// Apply the patches the extension returned to the current objects of the request.
-		if err := applyPatchesToRequest(req, resp); err != nil {
-			return false, nil, errors.Wrapf(err, "failed to apply patches from extension %s to the CanUpdateMachine request", extensionHandler)
-		}
-
-		var matches bool
-
-		matches, reasons, err = matchesMachine(req)
-		if err != nil {
-			return false, nil, errors.Wrapf(err, "failed to compare current and desired objects after calling extension %s", extensionHandler)
-		}
-		if matches {
-			return true, nil, nil
-		}
-
-		log.V(5).Info(fmt.Sprintf("Machine cannot be updated in-place yet after calling extension %s: %s", extensionHandler, strings.Join(reasons, ",")), "Machine", klog.KObj(&req.Current.Machine))
-	}
-
-	return false, reasons, nil
 }
 
 // createCanUpdateMachineRequest builds the CanUpdateMachine request from the current and desired
@@ -139,24 +114,21 @@ func (r *TalosControlPlaneReconciler) canExtensionsUpdateMachine(ctx context.Con
 // KubeadmControlPlane additionally runs a server-side apply dry-run on the Machine and the InfraMachine
 // to pick up defaulting. The TalosConfig has no defaulting webhook (no +kubebuilder:default in the
 // bootstrap provider's v1alpha3 API types), so this provider compares the TalosConfig as computed. The
-// InfraMachine is compared with the dry-run, like KubeadmControlPlane does: the
-// infrastructure provider writes fields - e.g. providerID - on the InfraMachine that the object computed
-// from the InfraMachine template does not have, and without the dry-run they read as a change the
-// in-place update would have to make.
+// InfraMachine is compared with the dry-run, like KubeadmControlPlane does: the infrastructure provider
+// writes fields - e.g. providerID - on the InfraMachine that the object computed from the InfraMachine
+// template does not have, and without the dry-run they read as a change the in-place update would have
+// to make.
 func createCanUpdateMachineRequest(ctx context.Context, c client.Client, machine *clusterv1.Machine, machineUpToDateResult UpToDateResult) (string, *runtimehooksv1.CanUpdateMachineRequest, error) {
-	currentMachine := cleanupMachine(machine.DeepCopy())
-	desiredMachine := cleanupMachine(machineUpToDateResult.DesiredMachine.DeepCopy())
-
 	currentTalosConfig := cleanupTalosConfig(machineUpToDateResult.CurrentTalosConfig)
 	desiredTalosConfig := cleanupTalosConfig(machineUpToDateResult.DesiredTalosConfig)
-
 	currentInfraMachine := machineUpToDateResult.CurrentInfraMachine.DeepCopy()
 	desiredInfraMachine := machineUpToDateResult.DesiredInfraMachine.DeepCopy()
 
 	// Sync the metadata the Machine controller writes from the desired to the current objects.
 	currentMetadata := currentTalosConfig["metadata"].(map[string]any)
-	currentMetadata["labels"] = desiredTalosConfig["metadata"].(map[string]any)["labels"]
-	currentMetadata["annotations"] = desiredTalosConfig["metadata"].(map[string]any)["annotations"]
+	desiredMetadata := desiredTalosConfig["metadata"].(map[string]any)
+	currentMetadata["labels"] = desiredMetadata["labels"]
+	currentMetadata["annotations"] = desiredMetadata["annotations"]
 	currentInfraMachine.SetLabels(desiredInfraMachine.GetLabels())
 	currentInfraMachine.SetAnnotations(desiredInfraMachine.GetAnnotations())
 
@@ -179,15 +151,12 @@ func createCanUpdateMachineRequest(ctx context.Context, c client.Client, machine
 		return "", nil, errors.Wrapf(err, "server side apply dry-run failed for desired InfraMachine")
 	}
 
-	currentInfraMachine = cleanupUnstructured(currentInfraMachine)
-	desiredInfraMachine = cleanupUnstructured(desiredInfraMachine)
-
 	req := &runtimehooksv1.CanUpdateMachineRequest{
 		Current: runtimehooksv1.CanUpdateMachineRequestObjects{
-			Machine: *currentMachine,
+			Machine: *cleanupMachine(machine.DeepCopy()),
 		},
 		Desired: runtimehooksv1.CanUpdateMachineRequestObjects{
-			Machine: *desiredMachine,
+			Machine: *cleanupMachine(machineUpToDateResult.DesiredMachine.DeepCopy()),
 		},
 	}
 
@@ -201,11 +170,11 @@ func createCanUpdateMachineRequest(ctx context.Context, c client.Client, machine
 	if err != nil {
 		return "", nil, err
 	}
-	req.Current.InfrastructureMachine, err = convertToRawExtension(currentInfraMachine)
+	req.Current.InfrastructureMachine, err = convertToRawExtension(cleanupUnstructured(currentInfraMachine))
 	if err != nil {
 		return "", nil, err
 	}
-	req.Desired.InfrastructureMachine, err = convertToRawExtension(desiredInfraMachine)
+	req.Desired.InfrastructureMachine, err = convertToRawExtension(cleanupUnstructured(desiredInfraMachine))
 	if err != nil {
 		return "", nil, err
 	}
@@ -247,22 +216,16 @@ func cleanupMachine(machine *clusterv1.Machine) *clusterv1.Machine {
 // cleanupTalosConfig mirrors KubeadmControlPlane's cleanupKubeadmConfig for the
 // TalosConfig of the bootstrap provider: the status is dropped and only the spec is sent.
 func cleanupTalosConfig(talosConfig *cabptv1.TalosConfig) map[string]any {
-	metadata := map[string]any{
-		"name":      talosConfig.Name,
-		"namespace": talosConfig.Namespace,
-	}
-	if talosConfig.Labels != nil {
-		metadata["labels"] = talosConfig.Labels
-	}
-	if talosConfig.Annotations != nil {
-		metadata["annotations"] = talosConfig.Annotations
-	}
-
 	return map[string]any{
 		"apiVersion": cabptv1.GroupVersion.String(),
 		"kind":       "TalosConfig",
-		"metadata":   metadata,
-		"spec":       talosConfig.Spec,
+		"metadata": map[string]any{
+			"name":        talosConfig.Name,
+			"namespace":   talosConfig.Namespace,
+			"labels":      talosConfig.Labels,
+			"annotations": talosConfig.Annotations,
+		},
+		"spec": talosConfig.Spec,
 	}
 }
 
@@ -295,23 +258,23 @@ func convertToRawExtension(obj any) (runtime.RawExtension, error) {
 }
 
 // applyPatchesToRequest applies the patches of the CanUpdateMachine response to the current objects
-// of the request, mirroring KubeadmControlPlane's applyPatchesToRequest. Only the
-// spec of an object may be patched, as the hook contract requires.
+// of the request, mirroring KubeadmControlPlane's applyPatchesToRequest. Only the spec of an object
+// may be patched, as the hook contract requires.
 func applyPatchesToRequest(req *runtimehooksv1.CanUpdateMachineRequest, resp *runtimehooksv1.CanUpdateMachineResponse) error {
 	if resp.MachinePatch.IsDefined() {
-		if err := applyPatchToMachine(&req.Current.Machine, resp.MachinePatch); err != nil {
+		if err := applySpecPatch(&req.Current.Machine, resp.MachinePatch); err != nil {
 			return err
 		}
 	}
 
 	if resp.BootstrapConfigPatch.IsDefined() {
-		if err := applyPatchToRawExtension(&req.Current.BootstrapConfig, resp.BootstrapConfigPatch); err != nil {
+		if err := applySpecPatch(&req.Current.BootstrapConfig, resp.BootstrapConfigPatch); err != nil {
 			return err
 		}
 	}
 
 	if resp.InfrastructureMachinePatch.IsDefined() {
-		if err := applyPatchToRawExtension(&req.Current.InfrastructureMachine, resp.InfrastructureMachinePatch); err != nil {
+		if err := applySpecPatch(&req.Current.InfrastructureMachine, resp.InfrastructureMachinePatch); err != nil {
 			return err
 		}
 	}
@@ -319,122 +282,69 @@ func applyPatchesToRequest(req *runtimehooksv1.CanUpdateMachineRequest, resp *ru
 	return nil
 }
 
-// applyPatchToMachine patches the spec of a typed object.
-func applyPatchToMachine(obj any, patch runtimehooksv1.Patch) error {
+// applySpecPatch applies a hook patch to the JSON of one of the request's current objects. A
+// runtime.RawExtension holds that JSON, a typed object is marshalled and unmarshalled around the
+// patch.
+func applySpecPatch(obj any, patch runtimehooksv1.Patch) error {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return errors.Wrap(err, "failed to marshal object before applying a patch")
 	}
 
-	object := map[string]any{}
-	if err := json.Unmarshal(data, &object); err != nil {
-		return errors.Wrap(err, "failed to decode object before applying a patch")
-	}
-
-	if err := checkPatchOnlyTouchesSpec(patch); err != nil {
-		return err
-	}
-
-	if err := applyPatch(object, patch); err != nil {
-		return err
-	}
-
-	patched, err := json.Marshal(object)
+	patched, err := patchJSON(data, patch)
 	if err != nil {
-		return errors.Wrap(err, "failed to marshal object after applying a patch")
+		return err
+	}
+
+	if raw, ok := obj.(*runtime.RawExtension); ok {
+		raw.Raw = patched
+		raw.Object = nil
+
+		return nil
 	}
 
 	return json.Unmarshal(patched, obj)
 }
 
-// applyPatchToRawExtension patches the object carried by a RawExtension.
-func applyPatchToRawExtension(raw *runtime.RawExtension, patch runtimehooksv1.Patch) error {
-	data := raw.Raw
-
-	if data == nil {
-		if raw.Object == nil {
-			return errors.New("the object to patch is empty")
-		}
-
-		var err error
-
-		data, err = json.Marshal(raw.Object)
+// patchJSON applies an RFC 6902 or RFC 7386 patch to a JSON document, rejecting the operations that
+// write outside the spec of the object, the restriction KubeadmControlPlane enforces with the allowed
+// paths of its patch helper.
+func patchJSON(document []byte, patch runtimehooksv1.Patch) ([]byte, error) {
+	switch patch.PatchType {
+	case runtimehooksv1.JSONPatchType:
+		rfcPatch, err := jsonpatch.DecodePatch(patch.Patch)
 		if err != nil {
-			return errors.Wrap(err, "failed to marshal object before applying a patch")
-		}
-	}
-
-	object := map[string]any{}
-	if err := json.Unmarshal(data, &object); err != nil {
-		return errors.Wrap(err, "failed to decode object before applying a patch")
-	}
-
-	if err := checkPatchOnlyTouchesSpec(patch); err != nil {
-		return err
-	}
-
-	if err := applyPatch(object, patch); err != nil {
-		return err
-	}
-
-	patched, err := json.Marshal(object)
-	if err != nil {
-		return errors.Wrap(err, "failed to marshal object after applying a patch")
-	}
-
-	raw.Raw = patched
-	raw.Object = nil
-
-	return nil
-}
-
-// applyPatch dispatches on the patch type, as the hook contract defines JSONPatchType and
-// JSONMergePatchType.
-func applyPatch(object map[string]any, patch runtimehooksv1.Patch) error {
-	switch patch.PatchType {
-	case runtimehooksv1.JSONPatchType:
-		return inplaceupdate.ApplyJSONPatch(object, patch.Patch)
-	case runtimehooksv1.JSONMergePatchType:
-		return inplaceupdate.ApplyJSONMergePatch(object, patch.Patch)
-	default:
-		return errors.Errorf("unsupported patch type %q", patch.PatchType)
-	}
-}
-
-// checkPatchOnlyTouchesSpec rejects patches that write outside the spec of an object, the restriction
-// KubeadmControlPlane enforces with the allowed paths of its patch helper.
-func checkPatchOnlyTouchesSpec(patch runtimehooksv1.Patch) error {
-	switch patch.PatchType {
-	case runtimehooksv1.JSONPatchType:
-		ops := []struct {
-			Path string `json:"path"`
-		}{}
-
-		if err := json.Unmarshal(patch.Patch, &ops); err != nil {
-			return errors.Wrap(err, "failed to decode JSON patch")
+			return nil, errors.Wrap(err, "failed to decode JSON patch")
 		}
 
-		for _, op := range ops {
-			if !strings.HasPrefix(op.Path, "/spec") {
-				return errors.Errorf("patch path %q is not allowed: only the spec of an object can be patched", op.Path)
+		for _, op := range rfcPatch {
+			path, err := op.Path()
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to decode JSON patch")
+			}
+
+			if !strings.HasPrefix(path, "/spec") {
+				return nil, errors.Errorf("patch path %q is not allowed: only the spec of an object can be patched", path)
 			}
 		}
+
+		return rfcPatch.Apply(document)
 	case runtimehooksv1.JSONMergePatchType:
 		merge := map[string]any{}
 		if err := json.Unmarshal(patch.Patch, &merge); err != nil {
-			return errors.Wrap(err, "failed to decode JSON merge patch")
+			return nil, errors.Wrap(err, "failed to decode JSON merge patch")
 		}
 
 		for key := range merge {
 			if key != "spec" {
-				return errors.Errorf("patch key %q is not allowed: only the spec of an object can be patched", key)
+				return nil, errors.Errorf("patch key %q is not allowed: only the spec of an object can be patched", key)
 			}
 		}
-	default:
-		return errors.Errorf("unsupported patch type %q", patch.PatchType)
-	}
 
-	return nil
+		return jsonpatch.MergePatch(document, patch.Patch)
+	default:
+		return nil, errors.Errorf("unsupported patch type %q", patch.PatchType)
+	}
 }
 
 // matchesMachine reports whether the patched current objects of the request equal the desired ones,
@@ -443,8 +353,7 @@ func matchesMachine(req *runtimehooksv1.CanUpdateMachineRequest) (bool, []string
 	var reasons []string
 
 	// The Machine spec is compared after cleanupMachineSpecForDiff, because fields the Machine
-	// controller writes (e.g. bootstrap.dataSecretName) are never the reason
-	// for an in-place update.
+	// controller writes (e.g. bootstrap.dataSecretName) are never the reason for an in-place update.
 	match, diff, err := specDiff(cleanupMachineSpecForDiff(&req.Current.Machine.Spec), cleanupMachineSpecForDiff(&req.Desired.Machine.Spec))
 	if err != nil {
 		return false, nil, errors.Wrapf(err, "failed to match Machine")
@@ -469,11 +378,7 @@ func matchesMachine(req *runtimehooksv1.CanUpdateMachineRequest) (bool, []string
 		reasons = append(reasons, fmt.Sprintf("InfraMachine cannot be updated in-place: %s", diff))
 	}
 
-	if len(reasons) > 0 {
-		return false, reasons, nil
-	}
-
-	return true, nil, nil
+	return len(reasons) == 0, reasons, nil
 }
 
 // cleanupMachineSpecForDiff mirrors Cluster API's CleanupMachineSpecForDiff, a helper of its
@@ -521,19 +426,8 @@ func matchRawExtensionSpec(patched, desired runtime.RawExtension) (bool, string,
 }
 
 func specOfRawExtension(raw runtime.RawExtension) (map[string]any, error) {
-	data := raw.Raw
-
-	if data == nil && raw.Object != nil {
-		var err error
-
-		data, err = json.Marshal(raw.Object)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to marshal object")
-		}
-	}
-
 	object := map[string]any{}
-	if err := json.Unmarshal(data, &object); err != nil {
+	if err := json.Unmarshal(raw.Raw, &object); err != nil {
 		return nil, errors.Wrap(err, "failed to decode object")
 	}
 
@@ -546,23 +440,13 @@ func specOfRawExtension(raw runtime.RawExtension) (map[string]any, error) {
 }
 
 func specDiff(patched, desired any) (bool, string, error) {
-	patchedJSON, err := json.Marshal(patched)
-	if err != nil {
-		return false, "", errors.Wrap(err, "failed to marshal patched spec")
-	}
-
-	desiredJSON, err := json.Marshal(desired)
-	if err != nil {
-		return false, "", errors.Wrap(err, "failed to marshal desired spec")
-	}
-
-	if string(patchedJSON) == string(desiredJSON) {
-		return true, "", nil
-	}
-
 	diff, err := inplaceupdate.JSONPatchBetween(patched, desired)
 	if err != nil {
 		return false, "", errors.Wrap(err, "failed to compute the diff between the patched and the desired spec")
+	}
+
+	if string(diff) == "[]" {
+		return true, "", nil
 	}
 
 	return false, string(diff), nil
