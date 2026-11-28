@@ -2,8 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
-// RFC 6902 JSON patch helpers for the in-place update hooks: applying the patches
-// returned by an extension to the objects of a hook request, diffing a Talos machine
+// RFC 6902 JSON patch helpers for the in-place update hooks: diffing a Talos machine
 // configuration, and rendering the patch the extension returns to Cluster API.
 package inplaceupdate
 
@@ -14,7 +13,6 @@ import (
 
 	"sigs.k8s.io/yaml"
 
-	evanphx "github.com/evanphx/json-patch/v5"
 	jsonpatch "gomodules.xyz/jsonpatch/v2"
 )
 
@@ -28,45 +26,6 @@ type jsonPatchOp struct {
 // patchOperation converts a jsonpatch/v2 operation to the patch operations used by the hooks.
 func patchOperation(op jsonpatch.Operation) jsonPatchOp {
 	return jsonPatchOp{Op: op.Operation, Path: op.Path, Value: op.Value}
-}
-
-// ApplyJSONPatch applies an RFC 6902 patch document to a decoded object. The control plane
-// controller uses it to apply the patches a CanUpdateMachine extension returns to the objects
-// of its request, the way KubeadmControlPlane's patch helper does: decode the patch with
-// github.com/evanphx/json-patch/v5 and apply it to the marshalled object.
-func ApplyJSONPatch(object map[string]any, patch []byte) error {
-	current, err := json.Marshal(object)
-	if err != nil {
-		return fmt.Errorf("decoding object: %w", err)
-	}
-
-	rfcPatch, err := evanphx.DecodePatch(patch)
-	if err != nil {
-		return fmt.Errorf("decoding JSON patch: %w", err)
-	}
-
-	patched, err := rfcPatch.Apply(current)
-	if err != nil {
-		return fmt.Errorf("applying JSON patch: %w", err)
-	}
-
-	return loadPatchedObject(object, patched)
-}
-
-// ApplyJSONMergePatch applies an RFC 7396 JSON merge patch to a decoded object, as the patch
-// helper of KubeadmControlPlane does with jsonpatch.MergePatch.
-func ApplyJSONMergePatch(object map[string]any, patch []byte) error {
-	current, err := json.Marshal(object)
-	if err != nil {
-		return fmt.Errorf("decoding object: %w", err)
-	}
-
-	patched, err := evanphx.MergePatch(current, patch)
-	if err != nil {
-		return fmt.Errorf("applying JSON merge patch: %w", err)
-	}
-
-	return loadPatchedObject(object, patched)
 }
 
 // JSONPatchBetween returns the RFC 6902 operations that turn current into desired, as a patch
@@ -121,25 +80,6 @@ func objectPatch(prefix string, current, desired map[string]any) ([]byte, error)
 	}
 
 	return json.Marshal(ops)
-}
-
-// loadPatchedObject writes the patched JSON back into the object of the hook request. It mutates
-// the map in place so the controller sees the updated object.
-func loadPatchedObject(object map[string]any, patched []byte) error {
-	var result map[string]any
-	if err := json.Unmarshal(patched, &result); err != nil {
-		return fmt.Errorf("decoding patched object: %w", err)
-	}
-
-	for key := range object {
-		delete(object, key)
-	}
-
-	for key, value := range result {
-		object[key] = value
-	}
-
-	return nil
 }
 
 // jsonPatch renders operations as a JSON patch document.

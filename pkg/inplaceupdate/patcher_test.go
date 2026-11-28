@@ -8,58 +8,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	evanphx "github.com/evanphx/json-patch/v5"
 	. "github.com/onsi/gomega"
 )
-
-// TestApplyJSONPatch checks the RFC 6902 patch the hooks return, applied to the objects of
-// a hook request: replace, add and remove, with the list indices machine configuration
-// values such as machine/files use.
-func TestApplyJSONPatch(t *testing.T) {
-	g := NewWithT(t)
-
-	object := map[string]any{
-		"spec": map[string]any{
-			"data":    "current config",
-			"files":   []any{map[string]any{"path": "/etc/inplace/current"}},
-			"removed": "gone",
-		},
-	}
-
-	patch, err := json.Marshal([]jsonPatchOp{
-		{Op: "replace", Path: "/spec/data", Value: "desired config"},
-		{Op: "add", Path: "/spec/files/1", Value: map[string]any{"path": "/etc/inplace/added"}},
-		{Op: "remove", Path: "/spec/removed"},
-	})
-	g.Expect(err).NotTo(HaveOccurred())
-
-	g.Expect(ApplyJSONPatch(object, patch)).To(Succeed())
-
-	spec := object["spec"].(map[string]any)
-	g.Expect(spec["data"]).To(Equal("desired config"))
-	g.Expect(spec["files"]).To(ContainElement(map[string]any{"path": "/etc/inplace/added"}))
-	g.Expect(spec).NotTo(HaveKey("removed"))
-
-	g.Expect(ApplyJSONPatch(object, []byte(`[{"op":"replace","path":"/spec/missing"}]`))).ToNot(Succeed())
-}
-
-// TestApplyJSONMergePatch checks the RFC 7396 merge patch of a hook response: a key set to
-// null is deleted, nested objects are merged.
-func TestApplyJSONMergePatch(t *testing.T) {
-	g := NewWithT(t)
-
-	object := map[string]any{
-		"spec": map[string]any{
-			"data":     "current config",
-			"obsolete": "gone",
-		},
-	}
-
-	g.Expect(ApplyJSONMergePatch(object, []byte(`{"spec":{"data":"desired config","obsolete":null}}`))).To(Succeed())
-
-	spec := object["spec"].(map[string]any)
-	g.Expect(spec["data"]).To(Equal("desired config"))
-	g.Expect(spec).NotTo(HaveKey("obsolete"))
-}
 
 // TestJSONPatchBetween checks the patch the controller reports when the objects of a hook
 // request still differ after the extension patches were applied: applying it to the current
@@ -77,8 +28,18 @@ func TestJSONPatchBetween(t *testing.T) {
 	g.Expect(json.Unmarshal(patch, &ops)).To(Succeed())
 	g.Expect(ops).NotTo(BeEmpty())
 
-	g.Expect(ApplyJSONPatch(current, patch)).To(Succeed())
-	g.Expect(equalJSON(current, desired)).To(BeTrue())
+	rfcPatch, err := evanphx.DecodePatch(patch)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	currentJSON, err := json.Marshal(current)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	patched, err := rfcPatch.Apply(currentJSON)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var patchedObject any
+	g.Expect(json.Unmarshal(patched, &patchedObject)).To(Succeed())
+	g.Expect(equalJSON(patchedObject, desired)).To(BeTrue())
 
 	noChange, err := JSONPatchBetween(current, current)
 	g.Expect(err).NotTo(HaveOccurred())
